@@ -429,7 +429,7 @@ Examples:
   wv query status=active
   wv query edge-type=blocks                        # nodes with blocking edges
   wv query edge-type=blocks --order=connections    # hub blockers first
-  wv query type=finding stale>=7 --include=finding
+  wv query type=finding 'stale>=7' --include=finding   # quote <, > and !=
   wv query HAS learning --order=recent --limit=20 --include=learning
   wv query MATCH "sqlite" status=done --order=relevance --limit=10
   wv query status!=done type=task --format=json

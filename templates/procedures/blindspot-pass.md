@@ -2,7 +2,8 @@
 id: blindspot-pass
 description:
   "Run a bounded unknown-taxonomy pass before implementation; separate facts, known gaps, prior
-  learnings, and candidate blind spots."
+  learnings, candidate blind spots, and the plan's own assumptions, verified before building on
+  them. Use when requirements, environment, or prior conclusions are uncertain."
 fallback: "wv guide --procedure=blindspot-pass"
 adapters: [claude, codex, copilot]
 visibility: shared
@@ -25,15 +26,44 @@ cross-surface risk.
    - `known_unknowns`: explicit blockers, risks, and related open findings.
    - `unknown_knowns`: prior decisions, patterns, and pitfalls from graph memory.
    - `unknown_unknown_candidates`: impact-derived or heuristic candidates that need probes.
-5. Probe candidates cheaply before promoting them. Do not create a blocking finding from a candidate
+5. List the plan's own assumptions, which the graph cannot see: code ("function X exists and does
+   Y"), API shape, behaviour, environment ("service Z is reachable") and data ("table has column
+   A"). Tag each one:
+
+   | Tag          | Meaning                                   | Action                        |
+   | ------------ | ----------------------------------------- | ----------------------------- |
+   | `verified`   | confirmed by reading code, docs or a test | none                          |
+   | `unverified` | believed true, not checked                | check before building on it   |
+   | `uncertain`  | more than one possibility                 | resolve before building on it |
+   | `falsified`  | checked and found false                   | change the plan               |
+
+   Check each `unverified` one with the cheapest probe that would fail if it were false (a search,
+   `wv show <id>`, `git log` of the area, a canary run). Never build a critical path (auth, data,
+   external services) on an unverified assumption, and never state a guess with the confidence of a
+   verified fact. Record the result (`--metadata` merges):
+
+   ```bash
+   wv update <id> --metadata='{
+     "assumptions": [
+       {"claim": "Auth middleware exists", "status": "verified", "evidence": "src/middleware/auth.ts"},
+       {"claim": "Tokens expire in 1h", "status": "unverified", "check": "read the auth config"}
+     ],
+     "confidence": "medium"
+   }'
+   ```
+
+   Confidence is `high` when every key assumption is verified, `medium` when only low-risk ones are
+   not, and `low` when a critical one is unverified: investigate before implementing.
+
+6. Probe candidates cheaply before promoting them. Do not create a blocking finding from a candidate
    unless evidence lands.
    - When the task fixes a failure that has gone on for a long time, list every step that runs after
      the failure point. None of them has run since the failure began: each is a candidate. Run each
      one unstubbed, under adverse conditions (an unreachable remote, the host's time budget, a cold
      cache), before closing. See the long-standing failure example below.
-6. If evidence confirms a real defect or risk, promote it to `type=finding` metadata and use a
+7. If evidence confirms a defect or risk, promote it to `type=finding` metadata and use a
    `blocks` edge only after the finding has meaning, probe, evidence, and valid `finding.*` fields.
-7. Close with a learning that records the transition: dismissed, promoted to finding, resolved, or
+8. Close with a learning that records the transition: dismissed, promoted to finding, resolved, or
    promoted to procedure.
 
 ## Release Example

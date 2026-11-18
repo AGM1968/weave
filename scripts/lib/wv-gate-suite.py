@@ -26,7 +26,10 @@ import sys
 import tempfile
 from typing import Any
 
-# The paths that make a tree Weave's own source, as both hooks test them.
+# The committed gate source pair: the paths whose presence at the base makes
+# the pre-commit gate run from the protected committed tree (pre-push names its
+# own hook). The loader follows pre-commit because it provisions that gate's
+# suites; tests/test-self-host-markers.sh pins every copy (wv-225efc).
 SELF_HOST_MARKERS = frozenset({"scripts/hooks/pre-commit-weave.sh", "scripts/wv"})
 
 
@@ -398,7 +401,7 @@ exit "$rc"
         if checked.returncode:
             raise SuiteError(retirement_refusal(checked.returncode, sorted(removed) if candidate else [],
                                                 checked.stdout.strip()))
-    # Weave's own tree, by the hooks' K1 test (wv-9da519): the hook AND
+    # Committed gate source, by the hooks' K1 test (wv-9da519): the hook AND
     # scripts/wv. A consumer that vendors the hook sources has no scripts/wv
     # and runs its suites in checkout mode (wv-981f92).
     legacy = old is None and SELF_HOST_MARKERS <= tree_entries(repo, baseline, env).keys()

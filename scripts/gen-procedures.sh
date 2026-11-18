@@ -34,15 +34,17 @@ path_unsafe() {
 # safe, exists beside the source, and flat. The download installer enumerates
 # canonical files through GitHub's non-recursive contents API, and the Claude
 # projection directory is flat, so resource subdirectories are not supported.
+# Every resources parser stops at the frontmatter's closing ---, so a list in
+# the procedure body is never read as a resource item (wv-8cd9d9).
 validate_resources() {
     local file="$1" dir res seen=" " base bad
     dir=$(dirname "$file")
     # executable values must be boolean
-    bad=$(awk '/^resources:/{i=1; next} i && /^[a-z_]+:/{i=0}
+    bad=$(awk 'NR > 1 && /^---$/{exit} /^resources:/{i=1; next} i && /^[a-z_]+:/{i=0}
         i && /^[[:space:]]*executable:/{v=$0; sub(/.*executable:[[:space:]]*/, "", v); if (v != "true" && v != "false") print NR": "v}' "$file")
     [ -z "$bad" ] || { echo "procedure $file: executable must be true or false ($bad)" >&2; return 1; }
     # every list item under resources must be a non-empty 'path:'
-    bad=$(awk '/^resources:/{i=1; next} i && /^[a-z_]+:/{i=0}
+    bad=$(awk 'NR > 1 && /^---$/{exit} /^resources:/{i=1; next} i && /^[a-z_]+:/{i=0}
         i && /^[[:space:]]*-[[:space:]]/{p=$0; sub(/.*path:[[:space:]]*/, "", p); if ($0 !~ /-[[:space:]]*path:/ || p == "") print NR}' "$file")
     [ -z "$bad" ] || { echo "procedure $file: malformed resource item (line $bad); each must be '- path: <file>'" >&2; return 1; }
     while IFS= read -r res; do
@@ -53,7 +55,7 @@ validate_resources() {
         base=$(basename "$res")
         case "$seen" in *" $base "*) echo "procedure $file: resource basename collision '$base'" >&2; return 1 ;; esac
         seen="$seen$base "
-    done < <(awk '/^resources:/{inside=1; next} inside && /^[a-z_]+:/{inside=0} inside && /^[[:space:]]*-[[:space:]]*path:/{sub(/.*path:[[:space:]]*/, ""); print}' "$file")
+    done < <(awk 'NR > 1 && /^---$/{exit} /^resources:/{inside=1; next} inside && /^[a-z_]+:/{inside=0} inside && /^[[:space:]]*-[[:space:]]*path:/{sub(/.*path:[[:space:]]*/, ""); print}' "$file")
 }
 
 # Extract the (possibly block-scalar, prettier-wrapped) description as one line.

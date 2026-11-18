@@ -490,7 +490,7 @@ _health_collect_quality() {
     local _hz_args=()
     if [ -n "$WV_HOT_ZONE" ]; then _hz_args=("--hot-zone" "$WV_HOT_ZONE"); fi
     quality_json=$(_wv_quality_python "${_hz_args[@]}" health-info 2>/dev/null || echo '{"available":false}')
-    if echo "$quality_json" | jq -e '.available' >/dev/null 2>&1; then
+    if echo "$quality_json" | jq -se 'length == 1 and (.[0] | .available)' >/dev/null 2>&1; then
         _h_quality_available=$(echo "$quality_json" | jq -r '.available')
         if [ "$_h_quality_available" = "true" ]; then
             _h_quality_score=$(echo "$quality_json" | jq -r '.score')

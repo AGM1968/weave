@@ -7,6 +7,10 @@
 .weave/edges.jsonl merge=ours -diff linguist-generated
 .weave/quality-adjudications.jsonl merge=union
 .weave/breadcrumbs.md merge=ours
+# Session trails: notes and completion records from both sides are kept, the
+# generated sections are ours until the next save regenerates them (wv-8595fb).
+# Requires: git config merge.wv-trails.driver (done by wv-init-repo)
+.weave/trails.md merge=wv-trails
 # Causal cutover marker (wv-2448dd): an operator declaration stamped once when
 # every agent has synced. merge=ours keeps the local stamp rather than halting a
 # merge; concurrent stamping is operator error the coordination gate guards.

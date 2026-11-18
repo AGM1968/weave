@@ -1329,11 +1329,14 @@ CODEXFAKE
     assert_contains "$codex_hooks_detail" "Stop dispatch without --format=host" \
         "doctor --agent flags a Codex Stop hook that cannot block"
 
-    printf '%s\n' '{"hooks":{"SessionStart":[{}],"PreToolUse":[{}],"PostToolUse":[{}],"PreCompact":[{}],"Stop":[{}]}}' > .codex/hooks.json
-    doctor_json=$("$WV" doctor --agent --json 2>&1)
+    # A complete config with no trust entry in an empty Codex config is pending
+    # trust per event; the trust cases themselves are tests/test-doctor-codex-trust.sh
+    # (wv-f838ba).
+    printf '%s\n' '{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"x --format=host"}]}],"PreToolUse":[{"hooks":[{"type":"command","command":"x --format=host"}]}],"PostToolUse":[{"hooks":[{"type":"command","command":"x"}]}],"PreCompact":[{"hooks":[{"type":"command","command":"x"}]}],"Stop":[{"hooks":[{"type":"command","command":"x --format=host"}]}]}}' > .codex/hooks.json
+    doctor_json=$(CODEX_HOME="$(mktemp -d)" "$WV" doctor --agent --json 2>&1)
     codex_hooks_detail=$(echo "$doctor_json" | jq -r '.checks[] | select(.check=="codex hooks") | .detail // empty' 2>/dev/null || echo "")
-    assert_contains "$codex_hooks_detail" "pending trust" \
-        "doctor --agent reports pending-trust for a complete Codex hooks config"
+    assert_contains "$codex_hooks_detail" "pending trust for: SessionStart" \
+        "doctor --agent reports pending trust per event for an untrusted Codex hooks config"
     rm -rf .codex
 }
 
@@ -1718,9 +1721,12 @@ test_update_metadata_portability() {
 
     local live_meta projected_meta delta_text
     live_meta=$(cd "$source_repo" && "${source_env[@]}" "$WV" show "$id" --json-v2 | jq -c '.[0].metadata')
+    delta_text=$(find "$source_repo/.weave/deltas" -name '*.sql' -type f -exec cat {} + 2>/dev/null || true)
+    # A write publishes its delta; the tracked snapshot is rewritten by wv sync,
+    # a checkpoint or a load (wv-8595fb), so the projection is read after one.
+    (cd "$source_repo" && "${source_env[@]}" "$WV" sync >/dev/null 2>&1)
     projected_meta=$(jq -c --arg id "$id" 'select(.id == $id) | (.metadata | fromjson)' \
         "$source_repo/.weave/nodes.jsonl")
-    delta_text=$(find "$source_repo/.weave/deltas" -name '*.sql' -type f -exec cat {} + 2>/dev/null || true)
 
     assert_contains "$live_meta" '"base":{"kept":true}' "live merge preserves unrelated metadata"
     assert_contains "$live_meta" '"receipt":"kept"' "second merge adds nested metadata"
@@ -1728,9 +1734,9 @@ test_update_metadata_portability() {
         "RFC-7396 null removes a nested metadata key"
     assert_equals "false" "$(jq -r 'has("temporary")' <<< "$live_meta")" \
         "--remove-key removes top-level metadata before persistence"
-    assert_equals "$live_meta" "$projected_meta" "nodes.jsonl immediately matches live metadata"
+    assert_equals "$live_meta" "$projected_meta" "nodes.jsonl matches live metadata after wv sync"
     assert_contains "$(grep -a 'breadcrumbs' "$source_repo/.weave/state.sql" || true)" "breadcrumbs" \
-        "state.sql immediately contains nested metadata"
+        "state.sql contains nested metadata after wv sync"
     assert_contains "$delta_text" "breadcrumbs" "metadata update emits a replayable delta inside throttle window"
 
     # Snapshot round trip: copy only portable graph state into a fresh repository.

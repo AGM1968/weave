@@ -32,6 +32,21 @@ if printf '%s' '{"tool_name":"Edit","tool_input":{"file_path":"README.md"}}' \
     exit 1
 fi
 
+# The hook-events-v1 kinds are the neutral entry and route to the same handlers
+# as the host aliases (wv-b25ebb): before_edit refuses what PreToolUse refuses.
+"$WV" hook dispatch --event=session_start --json </dev/null | jq -e \
+    '.decision == "allow" and .event == "SessionStart"' >/dev/null
+if printf '%s' '{"tool_name":"Edit","tool_input":{"file_path":"README.md"}}' \
+    | "$WV" hook dispatch --event=before_edit --json >/dev/null; then
+    echo "before_edit allowed an edit without an active node" >&2
+    exit 1
+fi
+if "$WV" hook dispatch --event=tool_call --json </dev/null 2>"$TEST_DIR/kind.err"; then
+    echo "hook dispatch accepted an event name outside the contract and the alias table" >&2
+    exit 1
+fi
+grep -q "hook-events-v1 kind" "$TEST_DIR/kind.err"
+
 # stdout carries only the new id; the "✓ wv-…: text" line is on stderr.
 # Merging them with 2>&1 made the last line a race between the two streams,
 # and under load it was the ✓ line, which then never matched active_node:
@@ -53,9 +68,14 @@ expect_active() {
 }
 expect_active PreToolUse '{"tool_name":"Edit","tool_input":{"file_path":"README.md"}}'
 expect_active PostToolUse "{\"tool_name\":\"Edit\",\"tool_input\":{\"file_path\":\"$TEST_DIR/README.md\"}}"
+expect_active before_edit '{"tool_name":"Edit","tool_input":{"file_path":"README.md"}}'
+expect_active after_edit "{\"tool_name\":\"Edit\",\"tool_input\":{\"file_path\":\"$TEST_DIR/README.md\"}}"
 grep -qx "README.md" <<< "$(sqlite3 "$WV_DB" "SELECT path FROM node_files WHERE node_id='$node';")"
 
 "$WV" update "$node" --status=done >/dev/null
 "$WV" hook dispatch --event=Stop --json </dev/null | jq -e '.decision == "allow"' >/dev/null
+"$WV" hook dispatch --event=session_stop --json </dev/null | jq -e '.decision == "allow" and .event == "Stop"' >/dev/null
+"$WV" hook dispatch --event=session_end --json </dev/null | jq -e '.decision == "allow" and .event == "SessionEnd"' >/dev/null
+"$WV" hook dispatch --event=recovery --json </dev/null | jq -e '.decision == "allow" and .event == "PreCompact"' >/dev/null
 
 echo "hook dispatch: passed"

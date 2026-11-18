@@ -1,0 +1,9 @@
+# Ceiling for the top-level line count of scripts/hooks/pre-commit-weave.sh
+# (wv-3ce219, owner ruling (c) on wv-562ed6): non-blank, non-comment lines
+# outside function bodies, as tests/test-hook-body-ratchet.sh counts them.
+# Each wv-0e2998 commit that moves code out of the hook body lowers it to the
+# new count; nothing raises it while wv-0e2998 is open.
+# mode: advisory (report only) until wv-0e2998 had a passing commit; enforced
+# since wv-a25168 (a count above or below the ceiling fails).
+ceiling=928
+mode=enforced

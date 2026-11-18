@@ -1,0 +1,277 @@
+{
+  "version": 1,
+  "host": "claude-code",
+  "node": "wv-3f70a7",
+  "read_by": [
+    "tests/test-host-adapter-parity.sh",
+    "tests/test-hooks.sh"
+  ],
+  "description": "Claude Code hook adapter manifest: each .claude/hooks script, the host event it is registered for, and the one call it makes (a scripts/lib wv_* function or wv hook dispatch). A hook body must equal its named template once comments and blank lines are dropped and the placeholders are filled; the templates hold the only approved fail-closed fallbacks (owner ruling 2026-11-16, H2/H3). The survey wv-279e7b reads this as the Claude row of the hook/event surface.",
+  "placeholders": {
+    "@LIB@": "hook.lib",
+    "@FN@": "hook.function",
+    "@ENV@": "hook.env plus one space, or empty",
+    "@DIR@": "libs[hook.lib].loop_var",
+    "@GUARD@": "libs[hook.lib].guard",
+    "@EVENT@": "hook.events[0]"
+  },
+  "libs": {
+    "wv-pre-tool-use.sh": {
+      "loop_var": "_ptu_dir",
+      "guard": "_WV_PRE_TOOL_USE_LOADED"
+    },
+    "wv-post-tool-use.sh": {
+      "loop_var": "_potu_dir",
+      "guard": "_WV_POST_TOOL_USE_LOADED"
+    },
+    "wv-lifecycle-end.sh": {
+      "loop_var": "_le_dir",
+      "guard": "_WV_LIFECYCLE_END_LOADED"
+    }
+  },
+  "templates": {
+    "lib": [
+      "INPUT=$(cat)",
+      "HOOK_DIR=\"${BASH_SOURCE[0]:-$0}\"",
+      "case \"$HOOK_DIR\" in */*) HOOK_DIR=\"${HOOK_DIR%/*}\" ;; *) HOOK_DIR=. ;; esac",
+      "for @DIR@ in \"$HOOK_DIR/../lib\" \"$HOOK_DIR/../../scripts/lib\" \"${HOME}/.config/weave/lib\"; do",
+      "[ -r \"$@DIR@/@LIB@\" ] || continue",
+      "@ENV@. \"$@DIR@/@LIB@\" 2>/dev/null && declare -F @FN@ >/dev/null && break",
+      "unset @GUARD@",
+      "done",
+      "declare -F @FN@ >/dev/null || exit 0",
+      "@FN@ \"$INPUT\"",
+      "exit $?"
+    ],
+    "lib-fail-closed-edit": [
+      "INPUT=$(cat)",
+      "HOOK_DIR=\"${BASH_SOURCE[0]:-$0}\"",
+      "case \"$HOOK_DIR\" in */*) HOOK_DIR=\"${HOOK_DIR%/*}\" ;; *) HOOK_DIR=. ;; esac",
+      "for @DIR@ in \"$HOOK_DIR/../lib\" \"$HOOK_DIR/../../scripts/lib\" \"${HOME}/.config/weave/lib\"; do",
+      "[ -r \"$@DIR@/@LIB@\" ] || continue",
+      "@ENV@. \"$@DIR@/@LIB@\" 2>/dev/null && declare -F @FN@ >/dev/null && break",
+      "unset @GUARD@",
+      "done",
+      "if ! declare -F @FN@ >/dev/null; then",
+      "_pa_tool=$(printf '%s' \"$INPUT\" | jq -r '.tool_name // empty' 2>/dev/null)",
+      "_pa_path=$(printf '%s' \"$INPUT\" | jq -r '.tool_input | (.file_path // .filePath // .notebook_path // .path // empty)' 2>/dev/null)",
+      "_pa_dir=$(dirname -- \"${_pa_path:-.}\")",
+      "while [ ! -d \"$_pa_dir\" ] && [ \"$_pa_dir\" != / ]; do _pa_dir=$(dirname -- \"$_pa_dir\"); done",
+      "_pa_root=$(git -C \"$_pa_dir\" rev-parse --show-toplevel 2>/dev/null)",
+      "case \"$_pa_tool\" in",
+      "Edit|Write|MultiEdit|NotebookEdit)",
+      "if [ -n \"$_pa_root\" ] && [ -d \"$_pa_root/.weave\" ]; then",
+      "echo \"🛑 Weave edit guard could not run: @LIB@ could not be loaded.\" >&2",
+      "echo \"   Edits in $_pa_root are blocked until it can. Fix: ./install.sh, or wv self-update then wv init-repo --update (wv-187945).\" >&2",
+      "exit 2",
+      "fi ;;",
+      "esac",
+      "echo \"⚠ Weave guard inactive: @LIB@ could not be loaded — run ./install.sh\" >&2",
+      "exit 0",
+      "fi",
+      "@FN@ \"$INPUT\"",
+      "exit $?"
+    ],
+    "lib-lifecycle-optional-stdin": [
+      "INPUT='{}'",
+      "[ -t 0 ] || INPUT=$(cat)",
+      "HOOK_DIR=\"${BASH_SOURCE[0]:-$0}\"",
+      "case \"$HOOK_DIR\" in */*) HOOK_DIR=\"${HOOK_DIR%/*}\" ;; *) HOOK_DIR=. ;; esac",
+      "for @DIR@ in \"$HOOK_DIR/../lib\" \"$HOOK_DIR/../../scripts/lib\" \"${HOME}/.config/weave/lib\"; do",
+      "[ -r \"$@DIR@/@LIB@\" ] || continue",
+      "@ENV@. \"$@DIR@/@LIB@\" 2>/dev/null && declare -F @FN@ >/dev/null && break",
+      "unset @GUARD@",
+      "done",
+      "declare -F @FN@ >/dev/null || exit 0",
+      "@FN@ \"$INPUT\" || true",
+      "exit 0"
+    ],
+    "lib-lifecycle": [
+      "INPUT=$(cat)",
+      "HOOK_DIR=\"${BASH_SOURCE[0]:-$0}\"",
+      "case \"$HOOK_DIR\" in */*) HOOK_DIR=\"${HOOK_DIR%/*}\" ;; *) HOOK_DIR=. ;; esac",
+      "for @DIR@ in \"$HOOK_DIR/../lib\" \"$HOOK_DIR/../../scripts/lib\" \"${HOME}/.config/weave/lib\"; do",
+      "[ -r \"$@DIR@/@LIB@\" ] || continue",
+      "@ENV@. \"$@DIR@/@LIB@\" 2>/dev/null && declare -F @FN@ >/dev/null && break",
+      "unset @GUARD@",
+      "done",
+      "declare -F @FN@ >/dev/null || exit 0",
+      "@FN@ \"$INPUT\" || true",
+      "exit 0"
+    ],
+    "dispatch": [
+      "HOOK_DIR=\"$(cd \"$(dirname \"${BASH_SOURCE[0]:-$0}\")\" && pwd)\"",
+      "source \"$HOOK_DIR/../lib/wv-resolve-project.sh\" 2>/dev/null \\",
+      "|| source \"$HOOK_DIR/../../scripts/lib/wv-resolve-project.sh\" 2>/dev/null \\",
+      "|| source \"${HOME}/.config/weave/lib/wv-resolve-project.sh\" 2>/dev/null \\",
+      "|| exit 0",
+      "source \"$HOOK_DIR/../lib/wv-hook-common.sh\" 2>/dev/null \\",
+      "|| source \"$HOOK_DIR/../../scripts/lib/wv-hook-common.sh\" 2>/dev/null \\",
+      "|| source \"${HOME}/.config/weave/lib/wv-hook-common.sh\" 2>/dev/null \\",
+      "|| true",
+      "command -v _hc_refresh >/dev/null 2>&1 && _hc_refresh",
+      "if [ ! -x \"${WV:-}\" ]; then",
+      "echo \"wv CLI not found\"",
+      "exit 0",
+      "fi",
+      "export WV WV_PROJECT_DIR",
+      "payload='{}'",
+      "if [ ! -t 0 ]; then",
+      "payload=$(cat)",
+      "[ -n \"$payload\" ] || payload='{}'",
+      "fi",
+      "output=$(printf '%s' \"$payload\" | \"$WV\" hook dispatch --event=@EVENT@ --format=host 2>/dev/null) || true",
+      "if printf '%s' \"$output\" | jq -se 'length == 1 and (.[0] | .hookSpecificOutput.hookEventName == \"@EVENT@\")' >/dev/null 2>&1; then",
+      "printf '%s\\n' \"$output\"",
+      "else",
+      "jq -n '{hookSpecificOutput: {hookEventName: \"@EVENT@\",",
+      "additionalContext: \"Weave: session start unavailable (wv hook dispatch failed); run wv bootstrap --json\"}}'",
+      "fi",
+      "exit 0"
+    ],
+    "lib-fail-closed-stop": [
+      "INPUT=$(cat)",
+      "HOOK_DIR=\"${BASH_SOURCE[0]:-$0}\"",
+      "case \"$HOOK_DIR\" in */*) HOOK_DIR=\"${HOOK_DIR%/*}\" ;; *) HOOK_DIR=. ;; esac",
+      "for @DIR@ in \"$HOOK_DIR/../lib\" \"$HOOK_DIR/../../scripts/lib\" \"${HOME}/.config/weave/lib\"; do",
+      "[ -r \"$@DIR@/@LIB@\" ] || continue",
+      "@ENV@. \"$@DIR@/@LIB@\" 2>/dev/null && declare -F @FN@ >/dev/null && break",
+      "unset @GUARD@",
+      "done",
+      "if ! declare -F @FN@ >/dev/null; then",
+      "echo \"weave stop guard: @LIB@ could not be loaded from $HOOK_DIR/../lib, $HOOK_DIR/../../scripts/lib or ${HOME}/.config/weave/lib; active work was not checked (re-run ./install.sh)\" >&2",
+      "case \"$INPUT\" in",
+      "*'\"stop_hook_active\"'*:*true*) exit 0 ;;",
+      "esac",
+      "printf '%s\\n' '{\"decision\":\"block\",\"reason\":\"The Weave stop guard could not load @LIB@, so active work was not checked. Run wv status: close or hand off any active node you own, then stop again (the next stop is allowed). Re-run ./install.sh to repair the guard.\"}'",
+      "exit 0",
+      "fi",
+      "@FN@ \"$INPUT\"",
+      "exit $?"
+    ]
+  },
+  "hooks": {
+    "bash-dedup-post.sh": {
+      "kind": "lib",
+      "events": [
+        "PostToolUse",
+        "PostToolUseFailure"
+      ],
+      "template": "lib",
+      "lib": "wv-post-tool-use.sh",
+      "function": "wv_potu_dedup_release_guard",
+      "env": "WV_POTU_ONLY=dedup_release"
+    },
+    "bash-dedup.sh": {
+      "kind": "lib",
+      "events": [
+        "PreToolUse"
+      ],
+      "template": "lib",
+      "lib": "wv-pre-tool-use.sh",
+      "function": "wv_ptu_dedup_guard"
+    },
+    "post-edit-lint.sh": {
+      "kind": "lib",
+      "events": [
+        "PostToolUse"
+      ],
+      "template": "lib",
+      "lib": "wv-post-tool-use.sh",
+      "function": "wv_potu_lint_guard",
+      "env": "WV_POTU_ONLY=lint"
+    },
+    "post-memory-capture.sh": {
+      "kind": "lib",
+      "events": [
+        "PostToolUse"
+      ],
+      "template": "lib",
+      "lib": "wv-post-tool-use.sh",
+      "function": "wv_potu_memory_guard",
+      "env": "WV_POTU_ONLY=memory"
+    },
+    "pre-action.sh": {
+      "kind": "lib",
+      "events": [
+        "PreToolUse"
+      ],
+      "template": "lib-fail-closed-edit",
+      "lib": "wv-pre-tool-use.sh",
+      "function": "wv_ptu_edit_guard",
+      "env": "WV_PTU_EDIT_ONLY=1"
+    },
+    "pre-claim-skills.sh": {
+      "kind": "lib",
+      "events": [
+        "PreToolUse"
+      ],
+      "template": "lib",
+      "lib": "wv-pre-tool-use.sh",
+      "function": "wv_ptu_claim_guard"
+    },
+    "pre-close-verification.sh": {
+      "kind": "lib",
+      "events": [
+        "PreToolUse"
+      ],
+      "template": "lib",
+      "lib": "wv-pre-tool-use.sh",
+      "function": "wv_ptu_close_guard"
+    },
+    "pre-compact-context.sh": {
+      "kind": "lib",
+      "events": [
+        "PreCompact"
+      ],
+      "template": "lib-lifecycle-optional-stdin",
+      "lib": "wv-lifecycle-end.sh",
+      "function": "wv_pre_compact_context"
+    },
+    "session-end-sync.sh": {
+      "kind": "lib",
+      "events": [
+        "SessionEnd"
+      ],
+      "template": "lib-lifecycle",
+      "lib": "wv-lifecycle-end.sh",
+      "function": "wv_session_end_sync"
+    },
+    "session-start-context.sh": {
+      "kind": "dispatch",
+      "events": [
+        "SessionStart"
+      ],
+      "template": "dispatch"
+    },
+    "stop-check.sh": {
+      "kind": "lib",
+      "events": [
+        "Stop"
+      ],
+      "template": "lib-fail-closed-stop",
+      "lib": "wv-lifecycle-end.sh",
+      "function": "wv_stop_guard"
+    },
+    "wv-budget-tally.sh": {
+      "kind": "lib",
+      "events": [
+        "PostToolUse"
+      ],
+      "template": "lib",
+      "lib": "wv-post-tool-use.sh",
+      "function": "wv_potu_budget_guard",
+      "env": "WV_POTU_ONLY=budget"
+    },
+    "wv-touched-files.sh": {
+      "kind": "lib",
+      "events": [
+        "PostToolUse"
+      ],
+      "template": "lib",
+      "lib": "wv-post-tool-use.sh",
+      "function": "wv_potu_touched_guard",
+      "env": "WV_POTU_ONLY=touched"
+    }
+  }
+}

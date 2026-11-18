@@ -179,6 +179,33 @@ wv_gate_hold_status() {
     return 0
 }
 
+# wv_gate_hold_foreign_status [<root>] — the record of a live gate holding
+# ANOTHER worktree of this repository, or nothing (wv-8abb6a). Each worktree's
+# lock and record sit under its own git dir: the main worktree's in the common
+# dir, a linked one's in <common>/worktrees/<name>/. wv_gate_hold_status sees
+# only its own. Same liveness test (pid plus start time), so a dead holder's
+# leftover record reads as nothing.
+wv_gate_hold_foreign_status() {
+    local root="${1:-.}" common own rec holder
+    common=$(git -C "$root" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || {
+        common=$(git -C "$root" rev-parse --git-common-dir 2>/dev/null) || return 0
+        case "$common" in /*) ;; *) common="$(cd "$root" && pwd)/$common" ;; esac
+    }
+    own=$(cd "$root" 2>/dev/null && _wv_gate_hold_path weave-gate.holder.json) || own=""
+    case "$own" in '' | /*) ;; *) own="$(cd "$root" && pwd)/$own" ;; esac
+    own=$(realpath -m "$own" 2>/dev/null || printf '%s' "$own")
+    for rec in "$common/weave-gate.holder.json" "$common"/worktrees/*/weave-gate.holder.json; do
+        [ -f "$rec" ] || continue
+        [ "$(realpath -m "$rec" 2>/dev/null || printf '%s' "$rec")" != "$own" ] || continue
+        holder=$(cat "$rec" 2>/dev/null) || continue
+        if [ -n "$holder" ] && _wv_gate_hold_alive "$holder"; then
+            printf '%s\n' "$holder"
+            return 0
+        fi
+    done
+    return 0
+}
+
 # wv_gate_push_outcome <state> [detail] [exit] — record this push's state:
 # running when its gate starts, passed or failed when it ends.
 wv_gate_push_outcome() {

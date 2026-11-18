@@ -24,7 +24,7 @@ _mcp_scope_statuses() { # contract_path process_lines
     if [ -z "$contract_path" ] || [ ! -f "$contract_path" ]; then
         return 1
     fi
-    if ! jq -e '.scopes | type == "object"' "$contract_path" >/dev/null 2>&1; then
+    if ! jq -se 'length == 1 and (.[0] | .scopes | type == "object")' "$contract_path" >/dev/null 2>&1; then
         return 1
     fi
 
@@ -186,7 +186,7 @@ cmd_mcp_status() {
         startup_rc=0
         startup_json=$(node "$mcp_js" --scope=lite --health-check 2>/dev/null) || startup_rc=$?
         startup_rc=${startup_rc:-0}
-        if [ "$startup_rc" -eq 0 ] && command -v jq >/dev/null 2>&1 && printf '%s' "$startup_json" | jq -e '.schema == "weave-mcp-startup.v1"' >/dev/null 2>&1; then
+        if [ "$startup_rc" -eq 0 ] && command -v jq >/dev/null 2>&1 && printf '%s' "$startup_json" | jq -se 'length == 1 and (.[0] | .schema == "weave-mcp-startup.v1")' >/dev/null 2>&1; then
             startup_status=$(printf '%s' "$startup_json" | jq -r '.status')
             startup_scope=$(printf '%s' "$startup_json" | jq -r '.scope')
             startup_tools=$(printf '%s' "$startup_json" | jq -r '.tools')

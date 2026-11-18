@@ -66,7 +66,7 @@ wv_checkpoint_generation_stage() {
 wv_checkpoint_stage_transition() {
     local journal="$1" next="$2" selector="${3:-}"
     command -v jq >/dev/null 2>&1 || return 1
-    jq -e '
+    jq -se 'length == 1 and (.[0] |
       type == "object" and
       (keys_unsorted | sort) == ["format","generation","manifest_sha256","state","state_sha256"] and
       .format == "weave.checkpoint-stage.v1" and
@@ -74,19 +74,19 @@ wv_checkpoint_stage_transition() {
       (.generation | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")) and
       (.state_sha256 | type == "string" and test("^[a-f0-9]{64}$")) and
       (.manifest_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
-    ' "$journal" >/dev/null || { echo "checkpoint stage: invalid journal" >&2; return 1; }
+    )' "$journal" >/dev/null || { echo "checkpoint stage: invalid journal" >&2; return 1; }
     local current generation selected
     current=$(jq -r '.state' "$journal") || return 1
     generation=$(jq -r '.generation' "$journal") || return 1
     if [ "$current" = "published" ] && { [ "$next" = "selected" ] || [ "$next" = "aborted" ]; }; then
         [ -n "$selector" ] || { echo "checkpoint stage: selector required for published recovery" >&2; return 1; }
         [ -f "$selector" ] || { echo "checkpoint stage: missing selector" >&2; return 1; }
-        jq -e '
+        jq -se 'length == 1 and (.[0] |
           type == "object" and
           (keys_unsorted | sort) == ["format","generation"] and
           .format == "weave.checkpoint-current.v1" and
           (.generation | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"))
-        ' "$selector" >/dev/null || { echo "checkpoint stage: invalid selector" >&2; return 1; }
+        )' "$selector" >/dev/null || { echo "checkpoint stage: invalid selector" >&2; return 1; }
         selected=$(jq -r '.generation' "$selector") || return 1
         if [ "$selected" = "$generation" ]; then next="selected"; else next="aborted"; fi
     fi

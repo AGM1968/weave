@@ -31,6 +31,13 @@ service implementation and it does not advertise mutation support.
   checkpoint pairs and their selector.
 - `checkpoint-stage-v1.schema.json` defines the durable staged/published/selected recovery journal.
 - `ownership-v1.json` states Git ownership independently of schema vocabulary.
+- `host-hook-manifest-v1.json` is the Claude Code row of the host hook surface: each `.claude/hooks`
+  script, the events it is registered for, and the one call it makes (a `scripts/lib` `wv_*`
+  function or `wv hook dispatch`). Each hook body must equal its named template, and the templates
+  hold the only approved fail-closed fallbacks (`wv-3f70a7`).
+- `host-skill-allowlist-v1.json` admits a hand-written Claude Code skill beside the procedure
+  projections, one node-linked entry per skill; it is empty. `tests/test-host-adapter-parity.sh`
+  checks both files.
 
 The current artifacts cover the bounded static contract: CLI observations exactly match mapped
 operations and argv templates, bounded result cardinality is correlated to requests, and hook

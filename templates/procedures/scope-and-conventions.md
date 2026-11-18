@@ -1,0 +1,76 @@
+---
+id: scope-and-conventions
+description:
+  "Enforces scope boundaries and codebase conventions during implementation to prevent side-quests
+  and pattern mismatches. Use when executing tasks in established codebases."
+fallback: "wv guide --procedure=scope-and-conventions"
+adapters: [claude, codex, copilot]
+visibility: shared
+status: ready
+claude_skill: wv-guard-scope
+---
+
+# Scope and Conventions
+
+Keep a change inside its node and consistent with the code around it. Two kinds of extra work look
+alike and are handled in opposite ways:
+
+- **An addition** (a feature, refactor, new library or modernisation nobody asked for) is not done
+  in this node. It becomes its own node, or is not done at all.
+- **A defect that surfaces** (an error, a failing check, a broken gate, wrong behaviour) is never
+  deferred, even when it is pre-existing, in lines this change did not touch, or under a node
+  another agent has claimed. It is fixed under a tracked node, and its class is widened.
+
+Run this check when tempted to add "one more thing", refactor unrelated code, bring in a new pattern
+or library, or "modernise" code while fixing it, and whenever something unexpected breaks.
+
+## Steps
+
+1. **Read the node's scope.** `wv show <id>`: the text, `done_criteria` and any `non_goals`. A
+   change that serves none of them is outside scope.
+2. **Classify the extra work.** Is it an addition, or a defect that surfaced? A defect is anything
+   wrong now: an error message, a failing suite, a gate that passed what it should refuse, behaviour
+   that contradicts the code's own contract. Preference ("this function is messy", "date-fns is
+   nicer") is an addition.
+3. **An addition goes out of the node.** It is scope expansion, handled as the WORKFLOW Work Loop's
+   scope-expansion row says; this procedure does not restate it.
+4. **A defect is fixed now, under a tracked node.** If it blocks the current node, fix it there.
+   Otherwise create a repair node as the WORKFLOW Repair Workflow describes and fix it in the same
+   session. Pre-existing errors are not exempt: the defect is the finding. Then widen it: write the
+   defect class in one line, search scripts, hooks, tests and the installer for it, triage every hit
+   (fix it, or record why it is not an instance), ask why no gate caught it and fix the gate. A node
+   claimed by another agent or a stale host is not a reason to skip it: take it with
+   `wv work <id> --force`.
+5. **Match the codebase's conventions.** Before writing new code, read how the surrounding code
+   names things, handles errors, imports, which libraries it already uses for this job, and where
+   similar features live. Follow that, even where another style seems better. Proposing a different
+   convention is an addition (step 3), not part of this change.
+6. **Record the call.** A convention choice that is not obvious, or a defect fixed outside the
+   node's original text, goes in the commit message and the node's learning.
+
+## Report shape
+
+```text
+Node: wv-XXXXXX: fix login timeout
+Extra work: add password strength validation
+Kind: addition (not in done_criteria; listed in non_goals)
+Action: new node wv-YYYYYY; continue the timeout fix
+
+Extra work: suite test-auth fails on HEAD in a file this change did not touch
+Kind: defect (pre-existing)
+Action: repair node wv-ZZZZZZ, fixed this session; class "fixture writes to the real HOME"
+        widened: 3 hits, 2 fixed, 1 not an instance (reads only)
+```
+
+## Rules
+
+- Never add features, refactors or libraries the node did not ask for; they become nodes.
+- Never modernise working code "while you're there".
+- Never defer a defect because it was there before, is outside the touched lines, or is claimed by
+  another agent; fix it under a tracked node and widen its class.
+- Always check `done_criteria` before adding anything.
+- Always match the existing conventions, and propose a change of convention as its own node.
+- A security or data-loss risk is fixed first, whichever node it surfaced under.
+
+Pairs with `wv guide --procedure=clarify-spec` (what the node's scope is) and
+`wv guide --procedure=quality-gate` (done criteria before claim).

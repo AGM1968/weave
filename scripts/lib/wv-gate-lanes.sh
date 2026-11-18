@@ -5,8 +5,9 @@
 #
 # Sourced by: scripts/hooks/pre-commit-weave.sh, in the protected lane only
 # (the copy of HEAD's scripts/ the S2a dispatcher runs). The caller provides
-# hook_progress, hook_duration_ms, hook_gate_jobs (wv-gate-pool.sh) and the
-# frozen candidate (wv-gate-snapshot.sh).
+# hook_progress, hook_gate_jobs (wv-gate-pool.sh) and the frozen candidate
+# (wv-gate-snapshot.sh); the clock readings come from wv-clock.sh, sourced
+# here beside this file (wv-b17a85).
 #
 # The contract, scripts/hooks/gate-roles.json, is read from the base, never the
 # candidate: a commit cannot reassign roles for itself. It names
@@ -51,6 +52,8 @@
 # file that needs another file changed in the same commit fails in its lane,
 # and that file lands first (D4).
 
+# shellcheck source=scripts/lib/wv-clock.sh
+source "$(dirname "${BASH_SOURCE[0]}")/wv-clock.sh"
 GATE_ROLES_PATH="scripts/hooks/gate-roles.json"
 GATE_REPAIRS_DIR=".weave/gate-repairs"
 
@@ -60,7 +63,7 @@ GATE_REPAIRS_DIR=".weave/gate-repairs"
 # contract naming another file pre-commit is not valid (S2b review N2,
 # wv-3b601f).
 _gate_roles_valid() {
-    jq -e '
+    jq -se 'length == 1 and (.[0] |
         def root:
             type == "string" and length > 0
             and (contains("\\") | not) and (test("[[:cntrl:]]") | not)
@@ -83,7 +86,7 @@ _gate_roles_valid() {
                  "post-index-change"))
              and ([to_entries[] | select(.value == "pre-commit") | .key]
                   | . == [] or . == ["scripts/hooks/pre-commit-weave.sh"]))
-    ' >/dev/null 2>&1
+    )' >/dev/null 2>&1
 }
 
 # _GATE_AUTHORITY_JQ — jq definition of `authority`: the contract's
@@ -106,7 +109,7 @@ _GATE_AUTHORITY_JQ='def authority:
 # _gate_authority_note <json> <whose> — say when a contract carries a
 # check_authority the gate ignores.
 _gate_authority_note() {
-    if jq -e "$_GATE_AUTHORITY_JQ"' .check_authority != null and authority != .check_authority' \
+    if jq -se "length == 1 and (.[0] | $_GATE_AUTHORITY_JQ"' .check_authority != null and authority != .check_authority)' \
         >/dev/null 2>&1 <<< "$1"; then
         echo "⚠ Weave pre-commit: $2 gate role contract's check_authority is malformed, so it is ignored: every external enforcement file reruns every suite (wv-a75d98)" >&2
     fi
@@ -264,12 +267,12 @@ gate_repair_record() {
             *) continue ;;
         esac
         json=$(gate_show base "$rec") || return 2
-        jq -e --arg p "$path" --arg o "$old" --arg n "$new" --arg bm "$bm" --arg rm "$rm" --arg k "$kind" '
+        jq -se --arg p "$path" --arg o "$old" --arg n "$new" --arg bm "$bm" --arg rm "$rm" --arg k "$kind" 'length == 1 and (.[0] |
             .version == 2 and .kind == $k and .path == $p
             and .baseline == $o and .replacement == $n
             and .baseline_mode == $bm and .replacement_mode == $rm
             and (.reason | type == "string" and length > 0)
-            and (.verification | type == "string" and length > 0)' >/dev/null 2>&1 <<< "$json" || continue
+            and (.verification | type == "string" and length > 0))' >/dev/null 2>&1 <<< "$json" || continue
         [ "$(git rev-parse --is-shallow-repository 2>/dev/null)" = false ] || return 3
         # A partial clone says so as extensions.partialClone or, from git 2.4x,
         # only as remote.<name>.promisor.
@@ -526,7 +529,7 @@ gate_roles_check() {
                     _GATE_ROLES_WHY="$file names $ref, an enforcement path the $label tree does not have (unresolved)"
                     return 1
                 fi
-            elif ! jq -e --arg r "$ref" '.external | has($r)' >/dev/null 2>&1 <<< "$base_json"; then
+            elif ! jq -se --arg r "$ref" 'length == 1 and (.[0] | .external | has($r))' >/dev/null 2>&1 <<< "$base_json"; then
                 _GATE_ROLES_WHY="$file names $ref ($label), which HEAD's gate role contract does not declare; declare it in $GATE_ROLES_PATH in an earlier commit"
                 return 1
             fi
@@ -638,11 +641,11 @@ _gate_lane_build() {
 }
 
 gate_lanes_run() {
-    local work=$1 root t0 jobs i n=0 running=0 failed=0 reuse f ev tree saved _gl_pid=""
+    local work=$1 root t0 c0 k0 jobs i n=0 running=0 failed=0 reuse f ev tree saved _gl_pid=""
     local logs=""
     shift
     local -a files=() pids=() reuses=()
-    _GATE_LANES_DONE="" _GATE_LANES_RUNS="" _GATE_LANES_MS="" _GATE_LANES_T0=""
+    _GATE_LANES_DONE="" _GATE_LANES_RUNS="" _GATE_LANES_MS="" _GATE_LANES_T0="" _GATE_LANES_CLOCK=""
     _gate_read_paths files gate_lanes_changed \
         || { echo "✗ Weave pre-commit: could not list the changed gate files (admission, status $?) — refusing" >&2; return 1; }
     [ "${#files[@]}" -gt 0 ] || return 0
@@ -660,7 +663,10 @@ gate_lanes_run() {
     done
     files=(${_GATE_EP_LANES[@]+"${_GATE_EP_LANES[@]}"})
     [ "${#files[@]}" -gt 0 ] || return 0
+    # t0 is when the lanes started (an epoch stamp for the gate record); their
+    # total is measured on wv-clock.sh's clock, which leaves out a suspend.
     t0=$(date +%s%N 2>/dev/null || echo 0)
+    wv_clock_ms c0 k0
     root=$(mktemp -d "$work/lanes.XXXXXX") || { echo "gate_lanes_run: allocate lanes under $work (status $?) — refusing" >&2; return 1; }
     tree=$(gate_side_tree auth) || { echo "gate_lanes_run: resolve auth tree (status $?) — refusing" >&2; return 1; }
     _pc_gate_archive "$tree" "$root/gate.tar" || { echo "gate_lanes_run: archive auth tree $tree (status $?) — refusing" >&2; return 1; }
@@ -689,9 +695,9 @@ gate_lanes_run() {
         # reruns (N6, wv-a75d98).
         reuse=0
         case "$f" in
-            scripts/*) jq -e --arg f "$f" '.invoking | index($f) == null' ;;
-            *) jq -e --arg f "$f" "$_GATE_AUTHORITY_JQ"' (.invoking | index($f) == null)
-                    and ([authority[][]] | index($f) != null)' ;;
+            scripts/*) jq -se --arg f "$f" 'length == 1 and (.[0] | .invoking | index($f) == null)' ;;
+            *) jq -se --arg f "$f" "length == 1 and (.[0] | $_GATE_AUTHORITY_JQ"' (.invoking | index($f) == null)
+                    and ([authority[][]] | index($f) != null))' ;;
         esac >/dev/null 2>&1 <<< "$_GATE_ROLES_JSON" && reuse=1
         # The lane mark is history (HEAD); a recovery run's lanes also carry
         # its execution tree, the code they were built from.
@@ -714,12 +720,19 @@ gate_lanes_run() {
         fi
         (
             lt0=$(date +%s%N 2>/dev/null || echo 0)
+            WV_GATE_ELAPSED="$root/$i/elapsed" \
             gate_run_bounded "candidate lane ${files[$i]}" "${WV_GATE_LANE_TIMEOUT:-7200}" \
-                env -u WV_LIB_DIR -u WV_CLI -u WV_PRECOMMIT_RUNNING -u WV_SKIP_PRECOMMIT WV_HOOK_REEXEC=1 \
+                env -u WV_LIB_DIR -u WV_CLI -u WV_PRECOMMIT_RUNNING -u WV_SKIP_PRECOMMIT -u WV_GATE_ELAPSED WV_HOOK_REEXEC=1 \
                 WV_GATE_LANE_JOBS="$jobs" WV_GATE_SLOTS="$root/slots" WV_GATE_SC_LOCK="$root/shellcheck.lock" \
                 bash "$root/$i/tree/scripts/hooks/pre-commit-weave.sh" "$@" > "$root/$i/out" 2>&1
             echo "$?" > "$root/$i/rc"
-            hook_duration_ms "$lt0" > "$root/$i/ms"
+            # The supervisor's monotonic reading leaves out a suspend (wv-b17a85).
+            if read -r lel lkind < "$root/$i/elapsed" 2>/dev/null \
+                && [ "$lkind" = monotonic ] && [[ "$lel" =~ ^[0-9]+$ ]]; then
+                echo "$lel" > "$root/$i/ms"; echo monotonic > "$root/$i/clock"
+            else
+                hook_duration_ms "$lt0" > "$root/$i/ms"; echo wall > "$root/$i/clock"
+            fi
         ) &
         pids+=("$!")
         running=$((running + 1))
@@ -754,7 +767,7 @@ gate_lanes_run() {
             sed 's/\x1b\[[0-9;]*m//g' "$root/$i/out" 2>/dev/null | grep -v '^Weave pre-commit: ' | grep . | tail -20 | sed 's/^/    /'
         } >&2
     done
-    _GATE_LANES_MS=$(hook_duration_ms "$t0")
+    wv_clock_since _GATE_LANES_MS _GATE_LANES_CLOCK "$c0" "$k0"
     hook_progress "candidate lanes: $((n - failed)) of $n admitted in ${_GATE_LANES_MS}ms"
     # For the gate record (wv-3dbc11): lanes write no suite rows of their own,
     # so without this their time is the unattributed tail of the gate's wall
@@ -763,8 +776,9 @@ gate_lanes_run() {
     _GATE_LANES_RUNS=$(for i in "${!files[@]}"; do
         jq -cn --arg path "${files[$i]}" --arg reused "${reuses[$i]}" --arg ms "$(cat "$root/$i/ms" 2>/dev/null)" \
             --arg jobs "$jobs" --arg rc "$(cat "$root/$i/rc" 2>/dev/null)" --arg sched "$GATE_LANES_SCHEDULER" \
+            --arg clock "$(cat "$root/$i/clock" 2>/dev/null || echo unknown)" \
             '{path:$path, reused:($reused == "1"), ms:($ms | tonumber? // null),
-              jobs:($jobs | tonumber? // null), rc:($rc | tonumber? // null), scheduler:$sched}'
+              jobs:($jobs | tonumber? // null), rc:($rc | tonumber? // null), scheduler:$sched, clock:$clock}'
     done | jq -cs '.' 2>/dev/null) || _GATE_LANES_RUNS=""
     rm -rf "$root"
     [ "$failed" -eq 0 ]

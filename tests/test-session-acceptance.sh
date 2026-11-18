@@ -44,9 +44,11 @@ HOST=$(hostname); ME=$(whoami)
 # WV and WV_CLI too: an inherited one (the gate's suite pool runs under HEAD's
 # wv, whose scripts/wv exports WV_CLI) would make the hooks judge with that copy
 # instead of the code under test (wv-a6b930).
+# AMP_CURRENT_THREAD_ID and PI_SESSION_ID are markers since wv-55a24d: an Amp
+# or pi session running this suite would otherwise change who owns what.
 IDVARS=(-u WV_AGENT_ID -u CLAUDECODE -u AI_AGENT -u CLAUDE_CODE_SSE_PORT -u CLAUDE_CODE_SESSION_ID -u CODEX_THREAD_ID
     -u CODEX_CI -u COPILOT_AGENT -u WV_SESSION_ID -u WV_SESSION_IDENTITY -u WV_PRIMARY_FILE -u WV_ACTIVE
-    -u WV -u WV_CLI)
+    -u AMP_CURRENT_THREAD_ID -u PI_SESSION_ID -u WV -u WV_CLI)
 FIXENV=(WEAVE_DIR="$R/.weave" WV_HOT_ZONE="$HOT" WV_DB="$HOT/brain.db" WV_CONFIG_DIR="$TMP/cfg"
     WV_PROJECT_DIR="$R" CLAUDE_PROJECT_DIR="$R")
 # as <env...> -- <wv args...>: wv as one session. Stdin passes through.
@@ -146,6 +148,39 @@ out=$(commit_as "${CX[@]}"); rc=$?
 out=$(commit_as "${CXF[@]}"); rc=$?
 [ "$rc" = 1 ] && ok "a forked Codex thread (new thread id, same millisecond) is refused" || bad "Codex fork refused" "rc=$rc ${out: -300}"
 release "$n2"
+# Amp (wv-e70606): AI_AGENT=amp and AMP_CURRENT_THREAD_ID, observed 2026-11-04.
+# Its work of 2026-10-09..22 was recorded as Claude Code's, so these cases pin
+# that an Amp thread owns its own claim, also when started from a Claude shell.
+AMPID=T-01a1a749-e3b6-723b-bd6c-86427007bbbe
+AMP=(AI_AGENT=amp "AMP_CURRENT_THREAD_ID=$AMPID")
+AMPO=(AI_AGENT=amp AMP_CURRENT_THREAD_ID=T-01a1a755-4c7b-77b4-9982-053d0b097bbb)
+n2a=$(node "case 2 amp")
+as "${AMP[@]}" -- work "$n2a" </dev/null >/dev/null 2>&1
+[ "$(holder "$n2a")" = "$(owner_of amp "$AMPID")" ] && ok "an Amp thread claims under its thread id" \
+    || bad "Amp claim" "got: $(holder "$n2a")"
+out=$(commit_as "${AMP[@]}"); rc=$?
+[ "$rc" = 0 ] && ok "the same Amp thread is admitted" || bad "Amp same thread admitted" "rc=$rc ${out: -300}"
+out=$(commit_as "${AMPO[@]}"); rc=$?
+[ "$rc" = 1 ] && ok "another Amp thread is refused" || bad "Amp other thread refused" "rc=$rc ${out: -300}"
+release "$n2a"
+# Amp started inside a Claude Code shell inherits CLAUDECODE and the Claude
+# session id; AI_AGENT, set by the innermost agent, makes the claim Amp's.
+AMPC=(CLAUDECODE=1 "CLAUDE_CODE_SESSION_ID=$SID_A" AI_AGENT=amp "AMP_CURRENT_THREAD_ID=$AMPID")
+n2b=$(node "case 2 amp inside claude")
+as "${AMPC[@]}" -- work "$n2b" </dev/null >/dev/null 2>&1
+[ "$(holder "$n2b")" = "$(owner_of amp "$AMPID")" ] && ok "Amp started from a Claude shell owns its own claim" \
+    || bad "Amp-in-Claude claim" "got: $(holder "$n2b")"
+out=$(commit_as "${A[@]}"); rc=$?
+[ "$rc" = 1 ] && ok "the Claude session that launched Amp is refused Amp's commit" || bad "launching Claude refused" "rc=$rc ${out: -300}"
+out=$(commit_as "${AMPC[@]}"); rc=$?
+[ "$rc" = 0 ] && ok "Amp inside the Claude shell is admitted for its own claim" || bad "Amp-in-Claude admitted" "rc=$rc ${out: -300}"
+release "$n2b"
+# Without AI_AGENT the thread variable is the fallback marker (wv-55a24d).
+n2c=$(node "case 2 amp fallback")
+as "AMP_CURRENT_THREAD_ID=$AMPID" -- work "$n2c" </dev/null >/dev/null 2>&1
+[ "$(holder "$n2c")" = "$(owner_of amp "$AMPID")" ] && ok "an Amp thread without AI_AGENT still claims as amp" \
+    || bad "Amp fallback claim" "got: $(holder "$n2c")"
+release "$n2c"
 
 echo "=== 3. MCP claim then shell commit agrees ==="
 if [ ! -f "$MCP_DIST" ]; then

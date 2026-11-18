@@ -36,6 +36,12 @@ export WV_DB="$TEST_DIR/hot/brain.db"
 export WV_REQUIRE_LEARNING=0
 export WV_AUTO_SYNC=0
 export WV_AUTO_CHECKPOINT=0
+# No session identity from the parent: the cases below test the flat session
+# files, and an inherited harness session id would move them to per-session
+# names (wv-9a867a). WV_SESSION_IDENTITY=0 gives the coarse owner, so claims
+# still work; the two-session section turns identity on per command.
+unset WV_SESSION_ID CLAUDE_CODE_SESSION_ID CODEX_THREAD_ID PI_SESSION_ID AMP_CURRENT_THREAD_ID
+export WV_SESSION_IDENTITY=0
 
 SENTINEL="$WV_HOT_ZONE/.session_sentinel"
 HOOKS_DIR="$PROJECT_ROOT/.claude/hooks"
@@ -487,6 +493,55 @@ assert_contains "$RECOVER_OUTPUT" "Benchmark task A" "BM4: Orphaned node surface
 # Criterion 5: Sentinel cleared on clean exit
 echo '{"reason":"user_ended"}' | bash "$HOOKS_DIR/session-end-sync.sh" 2>/dev/null || true
 assert_file_absent "$SENTINEL" "BM5: Sentinel cleared on clean exit"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Two sessions on one hot zone (wv-9a867a)
+# ═══════════════════════════════════════════════════════════════════════════
+# 2026-11-17: a second session started in the same checkout overwrote the
+# first's epoch (its own node was then refused as stale), read its live
+# heartbeat as a dead session and deleted it. Session files are now per session,
+# and a live harness process in the checkout is a peer, not a crash.
+
+echo ""
+echo "═══ Two sessions on one hot zone ═══"
+digest() { printf '%s' "$1" | sha256sum | cut -c1-16; }
+DA=$(digest sess-A); DB=$(digest sess-B)
+setup_test_env
+echo "hot/" >> .gitignore
+WV_SESSION_IDENTITY=1 WV_SESSION_ID=sess-A bash "$HOOKS_DIR/session-start-context.sh" <<< '{}' >/dev/null 2>&1 || true
+assert_file_exists "$WV_HOT_ZONE/.session_sentinel.$DA" "session A writes its own sentinel"
+assert_file_exists "$WV_HOT_ZONE/.session_epoch.$DA" "session A writes its own epoch"
+assert_file_absent "$SENTINEL" "no flat sentinel when the session is known"
+WV_SESSION_IDENTITY=1 WV_SESSION_ID=sess-A bash "$HOOKS_DIR/pre-action.sh" <<< '{"tool_name":"Read","tool_input":{"file_path":"/dev/null"}}' >/dev/null 2>&1 || true
+assert_file_exists "$WV_HOT_ZONE/.session_heartbeat.$DA" "session A's tool call writes its own heartbeat"
+EPOCH_A=$(cat "$WV_HOT_ZONE/.session_epoch.$DA" 2>/dev/null)
+
+# A live peer: a harness process (comm "codex") working in this checkout.
+# shellcheck source=tests/lib/fake-agent-bin.sh
+source "$PROJECT_ROOT/tests/lib/fake-agent-bin.sh"
+fake_agent_bin "$TEST_DIR/bin/codex"
+(cd "$TEST_DIR" && exec "$TEST_DIR/bin/codex" 300) & PEER_PID=$!
+sleep 1
+OUTPUT=$(WV_SESSION_IDENTITY=1 WV_SESSION_ID=sess-B bash "$HOOKS_DIR/session-start-context.sh" <<< '{}' 2>/dev/null || true)
+assert_contains "$OUTPUT" "another session is live in this checkout" "a session starting beside a live peer reports the peer"
+if grep -qE 'ended without SessionEnd|CRASH DETECTED|died mid-turn' <<< "$OUTPUT"; then
+    echo -e "${RED}✗${NC} a live peer is not reported as a crashed or ended session"
+    TESTS_RUN=$((TESTS_RUN + 1)); TESTS_FAILED=$((TESTS_FAILED + 1))
+else
+    echo -e "${GREEN}✓${NC} a live peer is not reported as a crashed or ended session"
+    TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1))
+fi
+assert_file_exists "$WV_HOT_ZONE/.session_sentinel.$DA" "the peer's sentinel is left alone"
+assert_file_exists "$WV_HOT_ZONE/.session_heartbeat.$DA" "the peer's heartbeat is left alone"
+assert_equals "$EPOCH_A" "$(cat "$WV_HOT_ZONE/.session_epoch.$DA" 2>/dev/null)" "the peer's epoch is unchanged by the second start"
+assert_file_exists "$WV_HOT_ZONE/.session_sentinel.$DB" "session B writes its own sentinel"
+kill "$PEER_PID" 2>/dev/null || true; wait "$PEER_PID" 2>/dev/null || true
+
+# No live peer now: A's sentinel is an ended session (activity, no stop).
+OUTPUT=$(WV_SESSION_IDENTITY=1 WV_SESSION_ID=sess-C bash "$HOOKS_DIR/session-start-context.sh" <<< '{}' 2>/dev/null || true)
+assert_contains "$OUTPUT" "died mid-turn" "with no live peer, an ended session is still labelled"
+assert_file_absent "$WV_HOT_ZONE/.session_sentinel.$DA" "an ended session's sentinel is removed"
+assert_file_absent "$WV_HOT_ZONE/.session_heartbeat.$DA" "an ended session's heartbeat is removed"
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Summary

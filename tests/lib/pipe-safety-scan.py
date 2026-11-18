@@ -284,7 +284,19 @@ def scan(roots: list[str]) -> list[tuple[str, int, str]]:
 
 
 def main(argv: list[str]) -> int:
-    """Report every hit in the given paths; exit 1 if there are any."""
+    """Report every hit in the given paths; exit 1 if there are any.
+
+    A root that does not exist exits 2 before scanning: reporting it as zero
+    hits would let a typo or a rename shrink the scope while the caller's
+    clean-repo claim still passed (wv-db7ec6).
+    """
+    if not argv:
+        print("pipe-safety-scan: no paths given", file=sys.stderr)
+        return 2
+    missing = [r for r in argv if not os.path.exists(r)]
+    if missing:
+        print(f"pipe-safety-scan: no such path: {' '.join(missing)}", file=sys.stderr)
+        return 2
     hits = scan(argv)
     for path, line, text in hits:
         print(f"{path}:{line}: {text[:120]}")

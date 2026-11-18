@@ -38,8 +38,8 @@ a node structural with `wv update <id> --metadata '{"structural": true}'`.
 
 **Sandbox shells:** if `wv` is not on PATH (e.g. Codex sandboxes omit `~/.local/bin`), use the
 repo-local `./scripts/wv` wrapper — it appends `$HOME/.local/bin` and `$HOME/.cargo/bin` itself. The
-Weave Makefile targets apply the same PATH fallback, so `make wv-*` and `make check` work without
-shell configuration.
+Weave Makefile targets apply the same PATH fallback: `make wv-*` and `make check` work without shell
+configuration.
 
 **Step 4 — commit attribution:** The `prepare-commit-msg` git hook (installed by `wv-init-repo`)
 appends `Weave-ID: <id>` to every commit message automatically. `wv done` verifies this attribution
@@ -97,7 +97,7 @@ This table is generated from `templates/workflow-classes.conf`. The pre-action h
 | `wv guide`                 | Workflow quick reference (in-terminal cheat sheet)                                                                     | `--topic=workflow\|github\|learnings\|context\|routing\|mcp\|verification\|instrumentation\|config\|discovery` |
 | `wv reindex`               | Rebuild the full-text search index                                                                                     |                                                                                                                |
 | `wv sync`                  | Dump to `.weave/state.sql`                                                                                             | `--gh` for GH sync, `--mode=fast\|full\|repair`, `--node=<id>`, `--dry-run`                                    |
-| `wv load`                  | Restore from `.weave/state.sql`                                                                                        | Run by session start hook                                                                                      |
+| `wv load`                  | Restore from `.weave/state.sql`, then replay `.weave/deltas/`                                                          | Run by session start hook                                                                                      |
 | `wv prune`                 | Archive done nodes >48h                                                                                                | `--age=`, `--orphans-only`, `--dry-run`                                                                        |
 | `wv unarchive <id>`        | Restore a pruned node from `.weave/archive/` to live graph                                                             | `--dry-run`                                                                                                    |
 | `wv quality scan`          | Scan repo for complexity + churn                                                                                       | `--exclude=`, `--json`                                                                                         |
@@ -148,6 +148,43 @@ Run `wv context <id> --json` before starting complex work:
 - **Limited output** — top 5 related, top 3 pitfalls (prevents context explosion)
 - **Nested learnings** — ancestors include decision/pattern/pitfall from metadata
 
+## Work Loop
+
+Tracked work runs four phases: intake, context, execute, close.
+
+- **Intake.** Work a named node (`wv work <id>`), create one from a description, or pick from
+  `wv bootstrap --json` / `wv ready --json`. A `todo` or `blocked` node is claimable; claiming an
+  `active` one warns; a `done` one needs `wv work <id> --reopen`. A GitHub issue is read with
+  `gh issue view <n>` and worked through its linked node, created with `wv add --gh` when it has
+  none. A description too vague to act on (under five words, no action verb) is clarified before the
+  node is created (`wv guide --procedure=clarify-spec`).
+- **Context.** `wv context <id> --json` before planning or coding. A contradiction is a hard stop:
+  resolve it with `wv resolve` first. An unresolved blocker is a stop: work the blocker or remove
+  the dependency. Read the ancestors, related nodes and pitfalls it surfaces. Done criteria are set
+  before the claim (`wv guide --procedure=quality-gate`); a non-trivial change gets its risks named
+  first (`wv guide --procedure=pre-mortem`).
+- **Execute.** Edges say what to read: a `references` edge of weight 0.7 or more is read before
+  editing, an `implements` edge is the spec to verify against, and a `supersedes` or `obsoletes`
+  edge means stop unless the override is deliberate. Locate code with a bounded search
+  (`wv guide --procedure=code-search`) and check the plan's assumptions before building on them
+  (`wv guide --procedure=blindspot-pass`). Record progress between larger steps with
+  `wv touch <id> --intent="..."` instead of re-emitting context.
+- **Close.** Show the fix holds (`wv guide --procedure=verify-before-fixed`), commit, then `wv done`
+  with a structured learning and verification evidence (see Learnings), then sync and push.
+
+Execution returns to context when the graph changes under it:
+
+| Trigger         | Graph change                 | Action                                       |
+| --------------- | ---------------------------- | -------------------------------------------- |
+| New blocker     | `wv block`                   | Re-query context; resolve the blocker first  |
+| Contradiction   | `wv link --type=contradicts` | Hard stop; resolve with `wv resolve`         |
+| Scope expansion | a child node is created      | Block the current node on the child; work it |
+
+Editing files unrelated to the node is scope expansion: create a child node. A defect that surfaces
+is not scope expansion and is not deferred (`wv guide --procedure=scope-and-conventions`). The same
+approach failing twice is a signal to change strategy or record a blocker node, not to try a third
+time (the retry limit: `wv guide --procedure=session`).
+
 ## Edge Context
 
 Edges carry a `context` JSON field. Auto-generated summaries use node aliases and are marked
@@ -169,7 +206,7 @@ Procedures are harness-agnostic how-to content kept out of standing context. Eac
 canonical source (`templates/procedures/<id>.md` → installed `$CONFIG_DIR/procedures/<id>.md`) and
 is projected into each harness's native surface (Claude skill, `.codex/weave.json`, Copilot
 instructions). Every procedure resolves anywhere via its fallback command, which serves the
-installed canonical body — so a pointer never breaks after `wv init-repo`.
+installed canonical body; a pointer keeps working after `wv init-repo`.
 
 | Procedure             | Description                                                              | Fallback                                   |
 | --------------------- | ------------------------------------------------------------------------ | ------------------------------------------ |
@@ -231,7 +268,12 @@ wv sync --gh --mode=full
 wv done <id> --learning="decision: what was chosen | pattern: reusable technique | pitfall: gotcha to avoid"
 ```
 
-Good learnings are specific, actionable, and scoped to a concrete context.
+Good learnings are specific, actionable, and scoped to a concrete context. Every close carries one,
+trivial work included (there is no `--skip-learnings`). For non-trivial work, draft it with the
+`learning-curator` agent, or the `weave_learnings` MCP tool, from the node text, the files changed
+and a summary of the work. A close also needs verification evidence (tests passed, a build, a manual
+check); `--skip-verification` is for trivial work only. When the evidence and the learning are
+already in hand, `--no-overlap-check` closes without the learning-overlap prompt.
 
 ## Memory
 
@@ -268,8 +310,8 @@ hook/config state independently.
 
 ## Repair Workflow
 
-When execution reveals a real workflow problem (broken hook, stale guidance, close-time friction, or
-a missing guardrail), turn the defect into tracked remediation rather than fixing it silently:
+When execution reveals a workflow problem (broken hook, stale guidance, close-time friction, or a
+missing guardrail), turn the defect into tracked remediation rather than fixing it silently:
 
 1. Fix it in the current node only if it directly blocks safe completion.
 2. Otherwise create a tracked repair node: `wv add "task: ..." --gh --parent=<feature-or-epic>`.
@@ -307,6 +349,25 @@ state and flagged `needs_human_verification` rather than blocking the agent. Res
 explicit human approval once the evidence is in hand. This keeps non-interactive agent flows from
 hanging on close-time prompts while preserving the verification gate.
 
+## Graph Persistence
+
+The live graph is a database in the hot zone, a tmpfs a reboot clears. Every `wv` write publishes
+its change as a new file under `.weave/deltas/`. A write that cannot publish says so on stderr, and
+`wv add` and `wv done` refuse with `NOT PERSISTED` and a non-zero exit. The tracked snapshot
+(`.weave/state.sql`, `nodes.jsonl`, `edges.jsonl`) is rewritten only by `wv sync`, an
+auto-checkpoint commit and `wv load`; ordinary writes leave no tracked file modified.
+
+- **Branch switch.** `git checkout` is not refused over graph state. Deltas not yet committed are
+  untracked files and stay in the working tree, and the hot-zone graph is shared by every branch;
+  the next `wv sync` or checkpoint on the new branch writes it into that branch's snapshot.
+- **Crash or reboot.** `wv load` (run by the session-start hook) rebuilds the graph from `state.sql`
+  and then replays every delta: each write that reported success comes back. File attribution
+  recorded with `wv touch --files` reaches disk only with the snapshot; run `wv sync` to keep it
+  across a reboot.
+- **Concurrent trails.** `.weave/trails.md` merges through the `wv-trails` driver that
+  `wv init-repo` registers: both sides' notes and completion records are kept, and the generated
+  sections are rebuilt by the next `wv trails save`.
+
 ## Session End Behavior
 
 The stop hook has one hard block; everything else soft-warns:
@@ -316,8 +377,8 @@ The stop hook has one hard block; everything else soft-warns:
 - **Unpushed commits / dirty .weave/** → soft warning. Run `git push` or `/close-session`.
 
 No network calls in the hook (wv sync / git push belong in `/close-session`, not stop hook). The
-`/close-session` skill handles the full protocol (sync, commit, push). Only invoke it when you're
-actually done — a soft warning is not a signal to stop working.
+`/close-session` skill handles the full protocol (sync, commit, push). Invoke it only when the work
+is done — a soft warning is not a signal to stop working.
 
 The session-end hook (`wv hook dispatch --event=SessionEnd`, on hosts that register it) runs only
 fast local steps: prune, a local `wv sync`, a `.weave/` checkpoint commit and clearing the crash

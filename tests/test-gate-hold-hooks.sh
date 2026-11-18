@@ -146,5 +146,45 @@ rm -f "$MARK/heavy-fail"
 env WV_AGENT_ID=gone-owner bash -c ". '$LIB'; wv_gate_push_outcome running 'refs/heads/main def5678'"
 has "bootstrap reports an orphaned push as interrupted" "$(advisories)" "last push interrupted: its gate"
 
+# wv-33cf11: a gate running in ANOTHER worktree of the repository. Each
+# worktree has its own lock, so only the foreign-holder check sees it.
+echo "another worktree's gate"
+git worktree add -q -b wt-branch "$T/wt" HEAD
+# hold_in <dir> — another owner's gate holds <dir>'s worktree until drop.
+hold_in() {
+    rm -f "$T/ready"
+    (cd "$1" && exec env WV_AGENT_ID=peer-owner bash -c ". '$LIB'; wv_gate_hold_acquire pre-push 'refs/heads/main 1234abc' \
+        && echo \$\$ > '$T/ready.tmp' && mv '$T/ready.tmp' '$T/ready' && sleep 120") &
+    disown
+    local i=0
+    while [ ! -f "$T/ready" ] && [ "$i" -lt 100 ]; do sleep 0.05; i=$((i+1)); done
+    HOLDER=$(cat "$T/ready" 2>/dev/null)
+}
+heavy_before=$(runs heavy)
+hold_in "$T/wt"
+check "(a linked worktree's gate holds it)" "1" "$([ -n "$HOLDER" ] && echo 1 || echo 0)"
+prepush
+check "a push from the main worktree refuses while a linked worktree's gate runs" "1" "$RC"
+has "...naming the holder" "$OUT" "gate held by peer-owner is running in another worktree"
+has "...and the fix" "$OUT" "Wait for that gate to finish, then fetch, rebase onto the remote and push again"
+check "...before running any heavy suite" "$heavy_before" "$(runs heavy)"
+check "...and releases its own lock" "" "$(hold_status)"
+drop
+prepush
+check "once that gate is dead (its record left behind), the push runs" "0" "$RC"
+hasnt "...with no foreign-gate refusal" "$OUT" "another worktree"
+hold
+heavy_before=$(runs heavy)
+OUT=$(cd "$T/wt" && bash "$HOOKS/pre-push-weave.sh" origin "$T/remote.git" \
+    < <(printf 'refs/heads/main %s refs/heads/main %s\n' "$(git rev-parse HEAD)" "$(git rev-parse origin/main)") 2>&1); RC=$?
+check "a push from the linked worktree refuses while the main worktree's gate runs" "1" "$RC"
+has "...naming that holder" "$OUT" "gate held by other-owner is running in another worktree"
+check "...before running any heavy suite" "$heavy_before" "$(runs heavy)"
+drop
+OUT=$(cd "$T/wt" && bash "$HOOKS/pre-push-weave.sh" origin "$T/remote.git" \
+    < <(printf 'refs/heads/main %s refs/heads/main %s\n' "$(git rev-parse HEAD)" "$(git rev-parse origin/main)") 2>&1); RC=$?
+hasnt "with no gate anywhere else, the linked worktree's push meets no foreign-gate refusal" "$OUT" "another worktree"
+git worktree remove --force "$T/wt" 2>/dev/null || true
+
 echo "Results: $pass/$run passed"
 [ "$pass" -eq "$run" ]

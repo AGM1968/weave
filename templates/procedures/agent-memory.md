@@ -1,13 +1,14 @@
 ---
 id: agent-memory
 description:
-  "Agent memory model and per-agent memory surfaces — what to capture, where each harness stores it,
-  and how runtime-memory capture relates to the graph. Use when deciding what belongs in memory vs
-  the graph."
+  "Agent memory and session trails: what belongs in memory or the graph, where each harness stores
+  it, and how to leave an append-only trail (state, attempts, next step) for the next session. Use
+  when deciding what to remember, or when handing off work, switching tasks or ending a session."
 fallback: "wv guide --procedure=agent-memory"
-adapters: [codex, copilot]
+adapters: [claude, codex, copilot]
 visibility: shared
 status: ready
+claude_skill: trails
 ---
 
 # Agent Memory
@@ -88,6 +89,50 @@ at one moment, and that state moves on.
 After any memory change, re-render every projection together with `wv memory render --agent=all` and
 commit them with the graph state that produced them.
 
+## Trails
+
+A trail is the handoff path of one node: an append-only list of capsules in `metadata.trails[]`. The
+way the work evolved, failed approaches included, survives compaction and the end of a session.
+Append a capsule before compaction, when switching tasks, and before ending a session with work in
+progress.
+
+```bash
+wv trails capsule <id> --json='{
+  "goal": "one sentence: what the work is trying to achieve",
+  "state": "what is done so far",
+  "blocking": null,
+  "files": ["src/middleware/rateLimit.ts", "src/app.ts"],
+  "decisions": ["sliding window: fairer than a fixed window"],
+  "discoveries": ["existing middleware uses callbacks, not async/await"],
+  "next": "integrate the middleware into src/app.ts",
+  "remaining": ["tests", "docs"],
+  "questions": ["what limit applies to premium users?"]
+}'
+wv trails save --message="..."   # a one-line repository-level note
+wv trails show                    # the repository trail
+wv show <id>                      # a node's capsules
+```
+
+`wv trails capsule` appends and stamps `at` when it is omitted. Never write the list with
+`wv update --metadata`: that replaces the array instead of appending to it. The newest entry is the
+current capsule; the PreCompact snapshot prints it for each active node.
+
+A capsule is useful only when the next session can act on it:
+
+- `next` is the most important field: name the immediate action, not "continue work".
+- Name files by path, not "the config file"; nothing vague ("was working on stuff").
+- Record decisions with their reason, and failed approaches as discoveries.
+- Keep it to about 200 tokens, and append again when the state changes significantly so the newest
+  entry is never stale.
+
+Handoff: append a capsule for each active node, then follow the session-close procedure
+(`wv guide --procedure=session-close`). Resuming: read the trail with `wv show <id>`, check the
+named files still match the recorded state, append a fresh capsule if they do not, then continue
+from `next` or reassess.
+
+`wv breadcrumbs` is a back-compat alias of `wv trails`, and `wv load` seeds a legacy single-snapshot
+`metadata.breadcrumbs` object into `trails[0]`.
+
 ## JSON Contract
 
 The public lifecycle surface is `wv memory`; `wv query` may power reads underneath, but it must not
@@ -133,6 +178,29 @@ A memory with `metadata.resident` set to `full` keeps its whole text. Read any m
 are no harness's instruction file and `--agent=all` no longer writes them; `--agent=claude-memory`
 or `--agent=codex-memory` still renders one on request.
 
-Claude’s legacy `/weave` skill remains a hand-written orchestration facade. It forwards memory
-policy here through `wv guide --procedure=agent-memory`; it is not generated from or replaced by
-this procedure. Codex and Copilot receive their managed procedure pointers directly.
+### Exposure: rendered or graph-only
+
+`metadata.exposure` decides whether a memory is rendered at all. `rendered` is the default, and a
+memory without the field is rendered: an existing memory leaves the projections only when someone
+marks it. A `graph-only` memory is left out of every rendered surface: the projection files,
+`wv bootstrap`'s memory index (which reports how many it left out as `memory.graph_only`) and the
+`wv doctor` block budget. Recall is unchanged: `wv memory recall`, `wv show` and `wv search` return
+it in full. Mark a memory graph-only when an agent needs it only on recall, such as a reference
+detail for one subsystem, and keep it rendered when every session should see its index line.
+
+- Capture: `wv remember <text> --exposure=graph-only`.
+- Change an existing memory: record a review verdict, then apply it.
+  `wv memory review <id> --verdict=exposure --exposure=graph-only --reason=<why>` records it, and
+  `wv memory review --apply` sets the field and keeps who chose it, when and why (`exposure_by`,
+  `exposure_at`, `exposure_reason`). A memory leaves or rejoins the projections only through such a
+  recorded decision.
+- Show: `wv memory exposure <id>` prints the value and the recorded reason.
+- Supersede: `wv remember --supersedes=<id>` keeps the predecessor's exposure unless `--exposure`
+  says otherwise.
+
+The projections change on the next `wv memory render --agent=all`. An auto-checkpoint re-renders the
+committed projections after an exposure change, as it does after any other memory change.
+
+Every harness reaches this procedure the same way, through `wv guide --procedure=agent-memory` and
+the Procedures section of the workflow reference. Claude's hand-written `weave` skill is a pointer
+to that reference (wv-9d5131) and states no memory policy of its own.

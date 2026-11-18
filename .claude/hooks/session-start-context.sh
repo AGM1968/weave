@@ -38,7 +38,7 @@ fi
 
 # Fail open: a session must start even when dispatch cannot run.
 output=$(printf '%s' "$payload" | "$WV" hook dispatch --event=SessionStart --format=host 2>/dev/null) || true
-if printf '%s' "$output" | jq -e '.hookSpecificOutput.hookEventName == "SessionStart"' >/dev/null 2>&1; then
+if printf '%s' "$output" | jq -se 'length == 1 and (.[0] | .hookSpecificOutput.hookEventName == "SessionStart")' >/dev/null 2>&1; then
     printf '%s\n' "$output"
 else
     jq -n '{hookSpecificOutput: {hookEventName: "SessionStart",

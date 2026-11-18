@@ -34,6 +34,12 @@ TEST_DIR="/tmp/wv-sprint34-test-$$"
 export WV_HOT_ZONE="$TEST_DIR"
 export WV_DB="$TEST_DIR/brain.db"
 export WV_REQUIRE_LEARNING=0
+# No session identity from the parent: session-summary below writes the flat
+# .session_snapshot, and an inherited harness session id would move wv's read
+# to the per-session name (wv-9a867a, wv-595343). WV_SESSION_IDENTITY=0 keeps
+# claims on the coarse owner.
+unset WV_SESSION_ID CLAUDE_CODE_SESSION_ID CODEX_THREAD_ID PI_SESSION_ID AMP_CURRENT_THREAD_ID
+export WV_SESSION_IDENTITY=0
 
 cleanup() {
     cd /tmp

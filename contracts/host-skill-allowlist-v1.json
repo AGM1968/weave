@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "host": "claude-code",
+  "node": "wv-3f70a7",
+  "description": "Hand-written Claude Code skills admitted beside the procedure projections. A tracked .claude/skills/<name>/SKILL.md without the WEAVE-MANAGED-SKILL marker fails tests/test-host-adapter-parity.sh unless it is listed here. Each entry is {skill, node, reason}: node is the wv-xxxxxx node holding the owner admission. Empty at landing (owner ruling 2026-11-16, skills option B); admission is a data entry here, never a skill frontmatter flag.",
+  "skills": []
+}

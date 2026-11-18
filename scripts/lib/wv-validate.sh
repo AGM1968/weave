@@ -229,15 +229,15 @@ wv_kind_create_metadata() {
     local metadata="$1" text="$2" kind_flag="$3" source="${4:-metadata}" kind
     if [ -n "$kind_flag" ]; then
         validate_node_kind "$kind_flag" "--kind" || return 1
-        if ! printf '%s' "$metadata" | jq -e --arg k "$kind_flag" \
-            '[.node_kind, .type] | map(select(. != null)) | all(. == $k)' >/dev/null 2>&1; then
+        if ! printf '%s' "$metadata" | jq -se --arg k "$kind_flag" \
+            'length == 1 and (.[0] | [.node_kind, .type] | map(select(. != null)) | all(. == $k))' >/dev/null 2>&1; then
             echo -e "${RED}Error: --kind=$kind_flag disagrees with the kind in ${source}${NC}" >&2
             return 1
         fi
         printf '%s' "$metadata" | jq -c --arg k "$kind_flag" '. + {node_kind: $k, type: $k}'
         return
     fi
-    if printf '%s' "$metadata" | jq -e 'has("node_kind") or has("type")' >/dev/null 2>&1; then
+    if printf '%s' "$metadata" | jq -se 'length == 1 and (.[0] | has("node_kind") or has("type"))' >/dev/null 2>&1; then
         wv_kind_patch_metadata "$metadata" "$source"
         return
     fi

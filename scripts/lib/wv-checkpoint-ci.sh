@@ -259,7 +259,8 @@ WV_MEMORY_PROJECTION_PATHS=(
 )
 WV_ACTIVE_MEMORY_FILTER='[.[] | .metadata |= (if type == "string" then fromjson else . // {} end)
     | select((.metadata.node_kind // .metadata.type) == "memory" and (.metadata.mem_status // "active") == "active")
-    | {id, text, verified_at: .metadata.verified_at, hook: .metadata.hook, resident: .metadata.resident}] | sort_by(.id)'
+    | {id, text, verified_at: .metadata.verified_at, hook: .metadata.hook, resident: .metadata.resident,
+        exposure: (.metadata.exposure // "rendered")}] | sort_by(.id)'
 
 # wv_stage_memory_projections <git-root>
 #   When the staged graph's active memories differ from HEAD's, renders HEAD's
@@ -282,7 +283,7 @@ wv_stage_memory_projections() {
     # or copilot-instructions.md without it is the user's (wv-91f0ca).
     for path in "${WV_MEMORY_PROJECTION_PATHS[@]}"; do
         case "$path" in
-            *.json) git -C "$git_root" show "HEAD:$path" 2>/dev/null | jq -e '.memory' >/dev/null 2>&1 || continue ;;
+            *.json) git -C "$git_root" show "HEAD:$path" 2>/dev/null | jq -se 'length == 1 and (.[0] | .memory)' >/dev/null 2>&1 || continue ;;
             *) grep -qF -- '<!-- ── BEGIN WEAVE:MEMORY ──' <<< "$(git -C "$git_root" show "HEAD:$path" 2>/dev/null)" || continue ;;
         esac
         tracked+=("$path")
@@ -358,12 +359,22 @@ wv_unstaged_non_graph_state() {
 # checkpoint made or amended under a running gate moves HEAD beneath it
 # (2026-11-09: an amend landed mid-gate); it waits for the next checkpoint
 # instead (wv-2f32a7). The gate's own shell never calls this.
+#   A fourth: the repository-wide hold, weave-autocommit-hold in the common git
+# dir, which holds every worktree of the repository at once (wv-8abb6a): one
+# session waiting on a peer in another worktree can state its hold there. It
+# is the same file as the main worktree's own hold, so a hold made in the main
+# worktree covers the linked ones too.
 wv_auto_commit_enabled() { # predicate
     [ "${WV_AUTO_CHECKPOINT:-1}" != "0" ] || return 1
-    local hold root="${1:-.}"
+    local hold root="${1:-.}" common
     hold=$(git -C "$root" rev-parse --git-path weave-autocommit-hold 2>/dev/null) || return 0
     case "$hold" in /*) ;; *) hold="$root/$hold" ;; esac
     [ ! -e "$hold" ] || return 1
+    common=$(git -C "$root" rev-parse --git-common-dir 2>/dev/null) || common=""
+    if [ -n "$common" ]; then
+        case "$common" in /*) ;; *) common="$root/$common" ;; esac
+        [ ! -e "$common/weave-autocommit-hold" ] || return 1
+    fi
     if ! declare -F wv_gate_hold_status >/dev/null; then
         # shellcheck source=/dev/null
         [ -r "$(dirname "${BASH_SOURCE[0]}")/wv-gate-hold.sh" ] \

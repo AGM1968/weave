@@ -313,15 +313,29 @@ export function aiAgentLabel(): string | undefined {
 }
 
 export function resolveAgentHarness(): AgentHarness {
-  // Built in precedence order: copilot > AI_AGENT > claude > codex.
+  // Built in precedence order:
+  // copilot > AI_AGENT > copilot (COPILOT_CLI) > claude > codex > amp/pi
+  // session variable.
   const present: string[] = [];
   const add = (h: string | undefined) => {
     if (h && !present.includes(h)) present.push(h);
   };
+  const ai = aiAgentLabel();
   if (process.env.COPILOT_AGENT === "1") add("copilot");
-  add(aiAgentLabel());
+  add(ai);
+  // Copilot CLI (wv-6781d7) sets COPILOT_CLI=1, never COPILOT_AGENT; it leaks
+  // to children like CLAUDECODE, so it ranks after AI_AGENT. Mirrors bash.
+  if (process.env.COPILOT_CLI === "1") add("copilot");
   if (process.env.CLAUDECODE === "1") add("claude");
   if (process.env.CODEX_THREAD_ID || process.env.CODEX_CI === "1") add("codex");
+  // Session-variable fallback (wv-55a24d), mirrors bash: counted last and only
+  // when AI_AGENT names no harness, so the innermost agent's AI_AGENT stays
+  // decisive; alone it names the harness, beside another marker it is named in
+  // the ambiguity diagnostic rather than the parent winning silently.
+  if (ai === undefined) {
+    if (process.env.AMP_CURRENT_THREAD_ID) add("amp");
+    if (process.env.PI_SESSION_ID) add("pi");
+  }
 
   if (present.length === 0) return "human";
   if (present.length === 1) return present[0];
@@ -352,6 +366,10 @@ function sessionSource(): string | undefined {
   // Own keys only: an AI_AGENT label such as "constructor" must not reach the
   // object prototype.
   const harness = resolveAgentHarness();
+  // Copilot CLI's tool shell carries COPILOT_AGENT_SESSION_ID (wv-6781d7); only
+  // with COPILOT_CLI=1, since a COPILOT_AGENT=1 process was not observed with it
+  // and naming an absent variable would refuse that session ownership.
+  if (harness === "copilot") return process.env.COPILOT_CLI === "1" ? "COPILOT_AGENT_SESSION_ID" : undefined;
   return Object.prototype.hasOwnProperty.call(SESSION_ID_VARS, harness) ? SESSION_ID_VARS[harness] : undefined;
 }
 
@@ -1836,6 +1854,12 @@ const TOOLS: Tool[] = [
           type: "string",
           description: "Id of the active memory this one replaces; the old one is kept as superseded",
         },
+        exposure: {
+          type: "string",
+          enum: ["rendered", "graph-only"],
+          description:
+            "rendered (default) lists it in the projections and bootstrap's index; graph-only keeps it out of both while recall still returns it. A superseding memory inherits its predecessor's exposure",
+        },
       },
       required: ["text"],
     },
@@ -2095,6 +2119,11 @@ const TOOLS: Tool[] = [
           type: "boolean",
           description:
             "Add close_time: when a done node last closed, derived from the committed graph history (closed_at, the commit, the window it fell in). Walks git history, so it can take seconds.",
+        },
+        actors: {
+          type: "boolean",
+          description:
+            "Add actors: who created, claimed and closed the node, read from the append-only Delta v2 operation log (one actor per operation). Graph state keeps only the last writer, so this is the authorship record; history before the v2 log reports none.",
         },
       },
       required: ["id"],
@@ -2922,10 +2951,16 @@ const TOOL_HANDLERS: Record<string, ToolHandler> = {
     // harness reads (wv-f757a4). This ran the Claude SessionStart hook, whose
     // ~55s wv load outran the 5s timeout and whose agent-mode output never
     // carried a "policy:" line, and a silent catch hid both; say so instead.
+    // The directives are rendered as context-policy states them (wv-eb061d).
     try {
-      const out = JSON.parse(wv(["context-policy", "--json"])) as { policy?: string; reasons?: string[] };
+      const out = JSON.parse(wv(["context-policy", "--json"])) as {
+        policy?: string;
+        reasons?: string[];
+        directives?: { text?: string[] } | null;
+      };
       const reason = out.reasons && out.reasons.length > 0 ? ` (${out.reasons[0]})` : "";
-      parts.push(`\n=== Context Policy ===\npolicy: ${out.policy ?? "unknown"}${reason}`);
+      const directives = (out.directives?.text ?? []).map((line) => `\n- ${line}`).join("");
+      parts.push(`\n=== Context Policy ===\npolicy: ${out.policy ?? "unknown"}${reason}${directives}`);
     } catch (err) {
       parts.push(`\n=== Context Policy ===\nUnavailable (wv context-policy failed: ${String(err).split("\n")[0]})`);
     }
@@ -3211,11 +3246,13 @@ const TOOL_HANDLERS: Record<string, ToolHandler> = {
     const scope = args.scope as string | undefined;
     const sourceAgent = args.source_agent as string | undefined;
     const supersedes = args.supersedes as string | undefined;
+    const exposure = args.exposure as string | undefined;
     const cmd = ["remember", text, "--json"];
     if (kind) cmd.push(`--kind=${kind}`);
     if (scope) cmd.push(`--scope=${scope}`);
     if (sourceAgent) cmd.push(`--source-agent=${sourceAgent}`);
     if (supersedes) cmd.push(`--supersedes=${supersedes}`);
+    if (exposure) cmd.push(`--exposure=${exposure}`);
     return wv(cmd);
   },
 
@@ -3350,6 +3387,7 @@ const TOOL_HANDLERS: Record<string, ToolHandler> = {
     const id = args.id as string;
     const cmd = ["show", id, "--json-v2"];
     if (args.close_time === true) cmd.push("--close-time");
+    if (args.actors === true) cmd.push("--actors");
     result = wv(cmd, args.close_time === true ? 120_000 : undefined);
     return result;
   },

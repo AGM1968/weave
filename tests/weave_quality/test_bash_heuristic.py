@@ -579,6 +579,45 @@ class TestFindFunctionEnd:
         end = _find_function_end(lines, 0)
         assert end == len(lines) - 1
 
+    def test_here_string_opens_no_heredoc(self) -> None:
+        """A here-string (<<<) is not a heredoc: the close after it counts (wv-70c888)."""
+        lines = [
+            "pool() {",
+            '    run_hook_suites <<< "0\ttests/test-quick.sh\t1"',
+            "}",
+            "later() {",
+            "    echo later",
+            "}",
+        ]
+        assert _find_function_end(lines, 0) == 2
+
+    def test_heredoc_forms_still_skip_their_body(self) -> None:
+        """<<EOF, <<-EOF and <<'EOF' still hide a } in their body."""
+        for opener in ("cat <<EOF", "cat <<-EOF", "cat <<'EOF'", 'cat << "EOF"'):
+            lines = ["f() {", f"    {opener}", "}", "EOF", "}"]
+            assert _find_function_end(lines, 0) == 4, opener
+
+    def test_one_liner_with_trailing_comment(self) -> None:
+        """f() { ...; }   # note — still a one-line range (wv-70c888)."""
+        lines = ['f() { shift 2; "$@"; }   # a supervisor that strips nothing', "x=1", "}"]
+        assert _find_function_end(lines, 0) == 0
+
+    def test_nested_one_liner_with_trailing_comment(self) -> None:
+        """A nested one-liner with a trailing comment opens nothing."""
+        lines = [
+            "outer() {",
+            '    g() { shift 2; "$@"; }   # stub',
+            "    echo outer",
+            "}",
+            "}",
+        ]
+        assert _find_function_end(lines, 0) == 3
+
+    def test_brace_in_comment_is_not_a_close(self) -> None:
+        """A def line whose comment ends in } is not a one-liner."""
+        lines = ["f() {   # opens { here }", "    echo body", "}"]
+        assert _find_function_end(lines, 0) == 2
+
 
 # ---------------------------------------------------------------------------
 # _function_name — unknown fallback (line 218)

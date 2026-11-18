@@ -307,7 +307,7 @@ install_procedure_assets() {
         fi
         # Do not treat a failed/empty API response as an empty canonical set: a
         # successful swap in that state would erase a known-good installation.
-        if ! procedure_files=$(printf '%s' "$listing" | jq -er '[.[]? | select(.type == "file") | .name] | if length > 0 then .[] else error("no procedure files") end'); then
+        if ! procedure_files=$(printf '%s' "$listing" | jq -ser 'if length == 1 then .[0] else error("expected one JSON value") end | [.[]? | select(.type == "file") | .name] | if length > 0 then .[] else error("no procedure files") end'); then
             rm -rf "$staging"
             return 1
         fi
@@ -317,6 +317,8 @@ install_procedure_assets() {
                 rm -rf "$staging"
                 return 1
             fi
+            # curl drops the mode bit a local cp -a keeps; a shell resource runs.
+            case "$procedure_file" in *.sh) chmod +x "$staging/$procedure_file" ;; esac
             echo "$destination/$procedure_file" >> "$MANIFEST"
         done <<< "$procedure_files"
     fi
@@ -612,9 +614,12 @@ mkdir -p "$CONFIG_DIR/agents"
 # The skills install.sh places in CONFIG_DIR - the ONE list the mkdir, copy,
 # download and prune steps below read (wv-f4a68b). Four hand-kept copies of it
 # drifted: the breadcrumbs -> trails rename reached only some of them.
-WV_CONFIG_SKILLS=(trails close-session wv-decompose-work fix-issue pre-mortem wv-verify-complete
-    resolve-refs wv-clarify-spec sanity-check ship-it wv-guard-scope wv-detect-loop weave-audit
-    weave zero-in plan-agent)
+# Empty since wv-c7f784: every Weave skill is now a projection of a procedure,
+# delivered by project-procedures.sh. The list stays as the delivery path for a
+# hand-written host-only skill the owner admits to the S5 allowlist (wv-3f70a7).
+WV_CONFIG_SKILLS=()
+# skills/ holds the manifest even when the list is empty.
+mkdir -p "$CONFIG_DIR/skills"
 for _wv_sk in "${WV_CONFIG_SKILLS[@]}"; do mkdir -p "$CONFIG_DIR/skills/$_wv_sk"; done
 
 # Record source path so wv self-update can find the dev clone later
@@ -645,6 +650,7 @@ if [ -f "./scripts/wv" ]; then
     install_file ./scripts/lib/wv-gh.sh "$LIB_DIR/lib/wv-gh.sh"
     install_file ./scripts/lib/wv-delta.sh "$LIB_DIR/lib/wv-delta.sh"
     install_file ./scripts/lib/wv-delta-catalog.sh "$LIB_DIR/lib/wv-delta-catalog.sh"
+    install_file ./scripts/lib/wv-load-receipt.sh "$LIB_DIR/lib/wv-load-receipt.sh"
     install_file ./scripts/lib/wv-compact-pre-cutover.sh "$LIB_DIR/lib/wv-compact-pre-cutover.sh"
     install_file ./scripts/lib/wv-delta-v2-replay.py "$LIB_DIR/lib/wv-delta-v2-replay.py"
     install_file ./scripts/lib/wv-load-ack.py "$LIB_DIR/lib/wv-load-ack.py"
@@ -662,9 +668,11 @@ if [ -f "./scripts/wv" ]; then
     install_file ./scripts/lib/wv-gate-snapshot.sh "$LIB_DIR/lib/wv-gate-snapshot.sh"
     install_file ./scripts/lib/wv-gate-lanes.sh "$LIB_DIR/lib/wv-gate-lanes.sh"
     install_file ./scripts/lib/wv-gate-hold.sh "$LIB_DIR/lib/wv-gate-hold.sh"
+    install_file ./scripts/lib/wv-clock.sh "$LIB_DIR/lib/wv-clock.sh"
     install_file ./scripts/lib/wv-repository-class.sh "$LIB_DIR/lib/wv-repository-class.sh"
     install_file ./scripts/lib/wv-git-hook-signature.sh "$LIB_DIR/lib/wv-git-hook-signature.sh"
     install_file ./scripts/lib/wv-runtime-ignores.sh "$LIB_DIR/lib/wv-runtime-ignores.sh"
+    install_file ./scripts/lib/wv-skill-retirement.sh "$LIB_DIR/lib/wv-skill-retirement.sh"
     install_file ./scripts/lib/wv-workflow-classes.gen.sh "$LIB_DIR/lib/wv-workflow-classes.gen.sh"
     install_file ./scripts/lib/wv-violation-vocabulary.gen.sh "$LIB_DIR/lib/wv-violation-vocabulary.gen.sh"
     install_file ./scripts/lib/wv-hook-common.sh "$LIB_DIR/lib/wv-hook-common.sh"
@@ -801,6 +809,12 @@ if [ -f "./scripts/wv" ]; then
     # can refresh vendored scripts/hooks/ in consumer repos without network access
     mkdir -p "$LIB_DIR/hooks"
     install_file ./scripts/hooks/pre-commit-weave.sh "$LIB_DIR/hooks/pre-commit-weave.sh"
+    # The staged-markdown prose checker a consumer opts into with a tracked
+    # .weave/prose-gate.conf; the hook finds it here, never in the repository
+    # it judges (wv-0cd05f).
+    install_file ./scripts/prose-gate.py "$LIB_DIR/prose-gate.py"
+    # The .weave/trails.md merge driver wv-init-repo registers (wv-8595fb).
+    install_file ./scripts/merge-trails.py "$LIB_DIR/merge-trails.py"
     # Builder-only (wv-758b3a): Weave's source repository alone has it, and a
     # release does not ship it, so a LIB_DIR copy exists only where it does.
     if [ -f ./scripts/hooks/pre-commit-recovery.sh ]; then
@@ -839,15 +853,33 @@ if [ -f "./scripts/wv" ]; then
         install_git_hook_from_repo ./scripts/hooks/prepare-commit-msg-weave.sh "Weave: append Weave-ID trailers" "prepare-commit-msg"
         install_git_hook_from_repo ./scripts/hooks/pre-push-weave.sh "Weave pre-push" "pre-push"
         install_git_hook_from_repo ./scripts/hooks/reference-transaction-weave.sh "Weave reference-transaction" "reference-transaction"
+        # The source checkout keeps a Weave graph too, and only wv-init-repo
+        # registered its merge drivers, which this checkout never runs
+        # (wv-f0b143). Git config is shared by every linked worktree.
+        if wv_register_merge_drivers "$PWD" "$LIB_DIR/merge-trails.py"; then
+            echo -e "  ${GREEN}✓${NC} git merge drivers configured for this checkout (ours, theirs, wv-trails)"
+        else
+            echo -e "  ${YELLOW}⚠${NC} git merge drivers not all registered for this checkout: wv doctor lists them" >&2
+        fi
     fi
     # Scripts
-    # context-guard.sh has one copy, under hooks/ (an on-demand banner since
-    # wv-a523de folded its SessionStart line into wv hook dispatch); the
-    # diverged scripts/ copy it replaced is dropped (wv-5cfbc1).
-    rm -f "$CONFIG_DIR/context-guard.sh" 2>/dev/null || true
+    # context-guard.sh retired (wv-26fda8): its policy is wv context-policy and
+    # its stale-findings warning is wv bootstrap readiness. Both installed
+    # copies go, the scripts/ one dropped earlier (wv-5cfbc1) and the hooks/ one.
+    rm -f "$CONFIG_DIR/context-guard.sh" "$CONFIG_DIR/hooks/context-guard.sh" 2>/dev/null || true
     install_copy ./scripts/resolve-refs.sh "$CONFIG_DIR/"
     install_copy ./scripts/project-procedures.sh "$CONFIG_DIR/"
     install_copy ./scripts/gen-procedures.sh "$CONFIG_DIR/"
+    install_copy ./scripts/gen-skill-provenance.sh "$CONFIG_DIR/"
+    # Content-addressed skill provenance (wv-ef7ad7): every skill version this
+    # clone's history shipped, so the projector can adopt Weave's own pre-marker
+    # copies in a consumer. Derived here from git history, never kept by hand.
+    if bash ./scripts/gen-skill-provenance.sh --repo=. --out="$CONFIG_DIR/skill-provenance.txt.new" 2>/dev/null; then
+        mv "$CONFIG_DIR/skill-provenance.txt.new" "$CONFIG_DIR/skill-provenance.txt"
+    else
+        rm -f "$CONFIG_DIR/skill-provenance.txt.new"
+        echo -e "  ${YELLOW}⚠${NC} skill provenance not generated (no git history here); the projector keeps refusing unmarked skills"
+    fi
     # Lib available to hooks from global path (~/.config/weave/hooks/../lib/)
     install_copy ./scripts/lib/wv-resolve-project.sh "$CONFIG_DIR/lib/wv-resolve-project.sh"
     install_copy ./scripts/lib/wv-resolve-runtime.sh "$CONFIG_DIR/lib/wv-resolve-runtime.sh"
@@ -866,8 +898,8 @@ if [ -f "./scripts/wv" ]; then
     install_copy ./scripts/lib/wv-shell-scope.sh "$CONFIG_DIR/lib/wv-shell-scope.sh"
     install_copy ./scripts/lib/wv-scratch.sh "$CONFIG_DIR/lib/wv-scratch.sh"
     install_copy ./scripts/lib/wv-repository-class.sh "$CONFIG_DIR/lib/wv-repository-class.sh"
+    install_copy ./scripts/lib/wv-skill-retirement.sh "$CONFIG_DIR/lib/wv-skill-retirement.sh"
     # Claude hooks (all 9 — registered globally via ~/.claude/settings.json under Alt-A)
-    install_copy ./.claude/hooks/context-guard.sh "$CONFIG_DIR/hooks/"
     install_copy ./.claude/hooks/session-start-context.sh "$CONFIG_DIR/hooks/"
     install_copy ./.claude/hooks/session-end-sync.sh "$CONFIG_DIR/hooks/"
     install_copy ./.claude/hooks/stop-check.sh "$CONFIG_DIR/hooks/"
@@ -889,7 +921,6 @@ if [ -f "./scripts/wv" ]; then
     for _wv_sk in "${WV_CONFIG_SKILLS[@]}"; do
         install_copy "./.claude/skills/$_wv_sk/SKILL.md" "$CONFIG_DIR/skills/$_wv_sk/"
     done
-    install_copy ./.claude/skills/weave-audit/audit-report.sh "$CONFIG_DIR/skills/weave-audit/"
     # CLAUDE.md template (generic, not project-specific)
     install_copy ./templates/CLAUDE.md.template "$CONFIG_DIR/CLAUDE.md.template"
     # Workflow reference (compact wv cheatsheet for new repos)
@@ -933,6 +964,7 @@ else
     download_file "$REPO/scripts/lib/wv-gh.sh" "$LIB_DIR/lib/wv-gh.sh"
     download_file "$REPO/scripts/lib/wv-delta.sh" "$LIB_DIR/lib/wv-delta.sh"
     download_file "$REPO/scripts/lib/wv-delta-catalog.sh" "$LIB_DIR/lib/wv-delta-catalog.sh"
+    download_file "$REPO/scripts/lib/wv-load-receipt.sh" "$LIB_DIR/lib/wv-load-receipt.sh"
     download_file "$REPO/scripts/lib/wv-compact-pre-cutover.sh" "$LIB_DIR/lib/wv-compact-pre-cutover.sh"
     download_file "$REPO/scripts/lib/wv-delta-v2-replay.py" "$LIB_DIR/lib/wv-delta-v2-replay.py"
     download_file "$REPO/scripts/lib/wv-load-ack.py" "$LIB_DIR/lib/wv-load-ack.py"
@@ -950,9 +982,11 @@ else
     download_file "$REPO/scripts/lib/wv-gate-snapshot.sh" "$LIB_DIR/lib/wv-gate-snapshot.sh"
     download_file "$REPO/scripts/lib/wv-gate-lanes.sh" "$LIB_DIR/lib/wv-gate-lanes.sh"
     download_file "$REPO/scripts/lib/wv-gate-hold.sh" "$LIB_DIR/lib/wv-gate-hold.sh"
+    download_file "$REPO/scripts/lib/wv-clock.sh" "$LIB_DIR/lib/wv-clock.sh"
     download_file "$REPO/scripts/lib/wv-repository-class.sh" "$LIB_DIR/lib/wv-repository-class.sh"
     download_file "$REPO/scripts/lib/wv-git-hook-signature.sh" "$LIB_DIR/lib/wv-git-hook-signature.sh"
     download_file "$REPO/scripts/lib/wv-runtime-ignores.sh" "$LIB_DIR/lib/wv-runtime-ignores.sh"
+    download_file "$REPO/scripts/lib/wv-skill-retirement.sh" "$LIB_DIR/lib/wv-skill-retirement.sh"
     download_file "$REPO/scripts/lib/wv-workflow-classes.gen.sh" "$LIB_DIR/lib/wv-workflow-classes.gen.sh"
     download_file "$REPO/scripts/lib/wv-violation-vocabulary.gen.sh" "$LIB_DIR/lib/wv-violation-vocabulary.gen.sh"
     download_file "$REPO/scripts/lib/wv-hook-common.sh" "$LIB_DIR/lib/wv-hook-common.sh"
@@ -1005,6 +1039,8 @@ else
     # Git hook sources (used by wv-init-repo --update refresh)
     mkdir -p "$LIB_DIR/hooks"
     download_file "$REPO/scripts/hooks/pre-commit-weave.sh" "$LIB_DIR/hooks/pre-commit-weave.sh"
+    download_file "$REPO/scripts/prose-gate.py" "$LIB_DIR/prose-gate.py"   # opt-in prose gate (wv-0cd05f)
+    download_file "$REPO/scripts/merge-trails.py" "$LIB_DIR/merge-trails.py"   # trails.md merge driver (wv-8595fb)
     rm -f "$LIB_DIR/hooks/post-commit-weave.sh" 2>/dev/null || true   # retired (wv-56c823)
     download_file "$REPO/scripts/hooks/prepare-commit-msg-weave.sh" "$LIB_DIR/hooks/prepare-commit-msg-weave.sh"
     download_file "$REPO/scripts/hooks/pre-push-weave.sh" "$LIB_DIR/hooks/pre-push-weave.sh"
@@ -1109,10 +1145,14 @@ else
     download_file "$REPO/scripts/weave_search/graph.py" "$LIB_DIR/weave_search/graph.py"
     download_file "$REPO/scripts/weave_search/definitions.py" "$LIB_DIR/weave_search/definitions.py"
     # Scripts
-    rm -f "$CONFIG_DIR/context-guard.sh" 2>/dev/null || true   # one copy, under hooks/ (wv-5cfbc1)
+    rm -f "$CONFIG_DIR/context-guard.sh" "$CONFIG_DIR/hooks/context-guard.sh" 2>/dev/null || true   # retired (wv-5cfbc1, wv-26fda8)
     curl -sSL "$REPO/scripts/resolve-refs.sh" -o "$CONFIG_DIR/resolve-refs.sh"
     curl -sSL "$REPO/scripts/project-procedures.sh" -o "$CONFIG_DIR/project-procedures.sh"
     curl -sSL "$REPO/scripts/gen-procedures.sh" -o "$CONFIG_DIR/gen-procedures.sh"
+    curl -sSL "$REPO/scripts/gen-skill-provenance.sh" -o "$CONFIG_DIR/gen-skill-provenance.sh"
+    # No git history in a download: skill provenance cannot be derived, so an
+    # existing list from an earlier clone install stays (its hashes remain true)
+    # and without one the projector keeps refusing unmarked skills (wv-ef7ad7).
     # Lib available to hooks from global path (~/.config/weave/hooks/../lib/)
     curl -sSL "$REPO/scripts/lib/wv-resolve-project.sh" -o "$CONFIG_DIR/lib/wv-resolve-project.sh"
     curl -sSL "$REPO/scripts/lib/wv-resolve-runtime.sh" -o "$CONFIG_DIR/lib/wv-resolve-runtime.sh"
@@ -1131,8 +1171,8 @@ else
     curl -sSL "$REPO/scripts/lib/wv-shell-scope.sh" -o "$CONFIG_DIR/lib/wv-shell-scope.sh"
     curl -sSL "$REPO/scripts/lib/wv-scratch.sh" -o "$CONFIG_DIR/lib/wv-scratch.sh"
     curl -sSL "$REPO/scripts/lib/wv-repository-class.sh" -o "$CONFIG_DIR/lib/wv-repository-class.sh"
+    curl -sSL "$REPO/scripts/lib/wv-skill-retirement.sh" -o "$CONFIG_DIR/lib/wv-skill-retirement.sh"
     # Claude hooks
-    curl -sSL "$REPO/.claude/hooks/context-guard.sh" -o "$CONFIG_DIR/hooks/context-guard.sh"
     curl -sSL "$REPO/.claude/hooks/session-start-context.sh" -o "$CONFIG_DIR/hooks/session-start-context.sh"
     curl -sSL "$REPO/.claude/hooks/session-end-sync.sh" -o "$CONFIG_DIR/hooks/session-end-sync.sh"
     curl -sSL "$REPO/.claude/hooks/stop-check.sh" -o "$CONFIG_DIR/hooks/stop-check.sh"
@@ -1154,7 +1194,6 @@ else
     for _wv_sk in "${WV_CONFIG_SKILLS[@]}"; do
         curl -sSL "$REPO/.claude/skills/$_wv_sk/SKILL.md" -o "$CONFIG_DIR/skills/$_wv_sk/SKILL.md"
     done
-    curl -sSL "$REPO/.claude/skills/weave-audit/audit-report.sh" -o "$CONFIG_DIR/skills/weave-audit/audit-report.sh"
     # CLAUDE.md template (generic, not project-specific)
     curl -sSL "$REPO/templates/CLAUDE.md.template" -o "$CONFIG_DIR/CLAUDE.md.template"
     # Workflow reference (compact wv cheatsheet for new repos)
@@ -1193,12 +1232,15 @@ fi
 # itself recorded are candidates, so a hand-written skill, or one another tool
 # placed, is never touched, and a procedure-projected skill (it carries the
 # WEAVE-MANAGED-SKILL marker) is kept even if listed. A CONFIG_DIR older than
-# the manifest is seeded with the skills retired before the manifest existed.
+# the manifest is seeded with the retired-skill list, the one list wv-init-repo
+# also reads (wv-skill-retirement.sh, wv-853052).
 _wv_sk_manifest="$CONFIG_DIR/skills/.weave-installed"
 if [ -f "$_wv_sk_manifest" ]; then
     _wv_sk_prev=$(cat "$_wv_sk_manifest")
 else
-    _wv_sk_prev="breadcrumbs epic-breakdown prove-it rubber-duck stay-in-lane unstuck"
+    # shellcheck source=scripts/lib/wv-skill-retirement.sh
+    source "$LIB_DIR/lib/wv-skill-retirement.sh"
+    _wv_sk_prev="${WV_RETIRED_SKILLS[*]}"
 fi
 for _wv_sk in $_wv_sk_prev; do
     [[ "$_wv_sk" =~ ^[a-z0-9-]+$ ]] || continue
@@ -1208,15 +1250,16 @@ for _wv_sk in $_wv_sk_prev; do
     rm -rf "${CONFIG_DIR:?}/skills/${_wv_sk:?}"
     echo -e "  ${GREEN}✓${NC} skills/$_wv_sk (no longer shipped, removed)"
 done
-printf '%s\n' "${WV_CONFIG_SKILLS[@]}" > "$_wv_sk_manifest"
+: > "$_wv_sk_manifest"   # empty, not one blank line, when nothing ships
+for _wv_sk in "${WV_CONFIG_SKILLS[@]}"; do printf '%s\n' "$_wv_sk" >> "$_wv_sk_manifest"; done
 
 chmod +x "$INSTALL_DIR/wv"
 chmod +x "$INSTALL_DIR/wv-test"
 chmod +x "$CONFIG_DIR/resolve-refs.sh"
 chmod +x "$CONFIG_DIR/project-procedures.sh"
 chmod +x "$CONFIG_DIR/gen-procedures.sh"
+chmod +x "$CONFIG_DIR/gen-skill-provenance.sh"
 chmod +x "$CONFIG_DIR/hooks/"*.sh
-chmod +x "$CONFIG_DIR/skills/weave-audit/audit-report.sh"
 install_procedure_assets
 install_pattern_assets
 
@@ -1355,8 +1398,10 @@ for arg in "$@"; do
             echo ""
             echo "  claude   (default) Claude Code hooks, skills, settings.local.json"
             echo "  copilot  VS Code Copilot MCP config (.vscode/mcp.json + legacy .mcp.json) + copilot-instructions.md"
-            echo "  codex    Codex setup contract (.codex/weave.json); AGENTS.md remains universal"
+            echo "  codex    Codex setup contract (.codex/weave.json) and the neutral skills in .agents/skills"
+            echo "           (Codex and Amp load them with no prompt; pi asks for folder trust); AGENTS.md remains universal"
             echo "  all      Claude Code, VS Code Copilot, and Codex"
+            echo "           .agents/skills, once written, is kept up to date by every --update; delete it to opt out"
             echo ""
             echo "  --update  Update managed files (hooks, skills, agents, copilot-instructions)"
             echo "            Preserves user-customized files (CLAUDE.md, settings.local.json, MCP config)"
@@ -1468,6 +1513,10 @@ RUNTIME_IGNORES_LIB="${WV_LIB_DIR:-$HOME/.local/lib/weave}/lib/wv-runtime-ignore
 [ -f "$RUNTIME_IGNORES_LIB" ] || { echo "wv-init-repo: runtime ignore list missing: $RUNTIME_IGNORES_LIB" >&2; exit 1; }
 # shellcheck source=scripts/lib/wv-runtime-ignores.sh
 source "$RUNTIME_IGNORES_LIB"
+SKILL_RETIREMENT_LIB="${WV_LIB_DIR:-$HOME/.local/lib/weave}/lib/wv-skill-retirement.sh"
+[ -f "$SKILL_RETIREMENT_LIB" ] || { echo "wv-init-repo: retired-skill list missing: $SKILL_RETIREMENT_LIB" >&2; exit 1; }
+# shellcheck source=scripts/lib/wv-skill-retirement.sh
+source "$SKILL_RETIREMENT_LIB"
 if [ -n "$REPOSITORY_CLASS_ARG" ]; then
     wv_repository_class_set "$REPO_ROOT" "$REPOSITORY_CLASS_ARG" "$ACKNOWLEDGE_UPSTREAM_FORK"
 fi
@@ -1757,7 +1806,7 @@ fi
 
 # .weave/runtime.md scaffold (shared by weave-runtime system prompt injection)
 # Two-block architecture:
-#   Block 1: BEGIN/END WEAVE RUNTIME CONTEXT  — context policy, managed by context-guard.sh
+#   Block 1: BEGIN/END WEAVE RUNTIME CONTEXT  — context policy, managed by wv context-policy
 #   Block 2: BEGIN/END WEAVE RUNTIME CONTENT  — generic Weave guidance, updatable by --update
 #   Below block 2: repo-specific content, never touched by init-repo
 # The PATH guidance differs by repo kind, and stating the wrong one is worse
@@ -2014,6 +2063,10 @@ ATTR_BLOCK="${ATTR_MARKER_BEGIN}
 .weave/edges.jsonl merge=ours -diff linguist-generated
 .weave/quality-adjudications.jsonl merge=union
 .weave/breadcrumbs.md merge=ours
+# Session trails: notes and completion records from both sides are kept, the
+# generated sections are ours until the next save regenerates them (wv-8595fb).
+# Requires: git config merge.wv-trails.driver (done by wv-init-repo)
+.weave/trails.md merge=wv-trails
 # Causal cutover marker (wv-2448dd): an operator declaration stamped once when
 # every agent has synced. merge=ours keeps the local stamp rather than halting a
 # merge; concurrent stamping is operator error the coordination gate guards.
@@ -2072,14 +2125,18 @@ else
     echo -e "  ${GREEN}✓${NC} .gitattributes (created)"
 fi
 
-# Register 'ours' merge driver (required for .gitattributes merge=ours)
-git config merge.ours.driver true 2>/dev/null || true
-echo -e "  ${GREEN}✓${NC} git merge.ours.driver configured"
-
-# Register 'theirs' merge driver (required for .gitattributes merge=theirs)
-# Used by .weave/deltas/**/*.sql — on conflict, accept remote version
-git config merge.theirs.driver "cp %B %A" 2>/dev/null || true
-echo -e "  ${GREEN}✓${NC} git merge.theirs.driver configured"
+# Register the merge drivers the .gitattributes rules above name: ours
+# (state.sql and the snapshots), theirs (delta files) and wv-trails, the union
+# of both sides' notes and completion records (wv-8595fb). One definition with
+# install.sh and wv doctor (wv-git-hook-signature.sh, wv-f0b143).
+_TRAILS_DRIVER="${WV_LIB_DIR:-$HOME/.local/lib/weave}/merge-trails.py"
+if wv_register_merge_drivers . "$_TRAILS_DRIVER" 2>/dev/null; then
+    echo -e "  ${GREEN}✓${NC} git merge drivers configured (ours, theirs, wv-trails)"
+elif [ ! -f "$_TRAILS_DRIVER" ]; then
+    echo -e "  ${YELLOW}⚠${NC} $_TRAILS_DRIVER not found: .weave/trails.md merges conflict until 'wv-update' installs it" >&2
+else
+    echo -e "  ${YELLOW}⚠${NC} git merge drivers could not be registered: wv doctor lists the missing ones" >&2
+fi
 
 # Initialize wv database (idempotent — skip if already running)
 if wv init 2>/dev/null; then
@@ -2147,13 +2204,26 @@ if [ "$AGENT" = "claude" ]; then
     # User files (only overwritten with --force): CLAUDE.md, settings.local.json, settings.json
 
     # ── Skills (managed — always update) ──
-    SKILLS=(trails close-session fix-issue plan-agent pre-mortem resolve-refs sanity-check ship-it weave weave-audit wv-clarify-spec wv-decompose-work wv-detect-loop wv-guard-scope wv-verify-complete zero-in)
+    # The skill set is install.sh's WV_CONFIG_SKILLS, read from the manifest it
+    # writes at every install (wv-fb2c31). This program kept a second hand-kept
+    # copy of the list that had to agree with it (wv-b49316 tested the
+    # agreement); one list removes the drift by construction. No manifest means
+    # no install has run with this version: say so rather than install nothing.
+    SKILLS=()
+    _wv_sk_manifest="$CONFIG_DIR/skills/.weave-installed"
+    if [ -f "$_wv_sk_manifest" ]; then
+        while IFS= read -r _wv_sk; do
+            [[ "$_wv_sk" =~ ^[a-z0-9-]+$ ]] && SKILLS+=("$_wv_sk")
+        done < "$_wv_sk_manifest"
+    else
+        echo -e "  ${YELLOW}⚠${NC} skills: $_wv_sk_manifest is missing; run 'wv self-update' to install the skill set" >&2
+    fi
     for skill in "${SKILLS[@]}"; do
         if [ -f "$CONFIG_DIR/skills/$skill/SKILL.md" ]; then
             mkdir -p "$REPO_ROOT/.claude/skills/$skill"
             if [ "$UPDATE_MODE" = "1" ] || [ ! -f "$REPO_ROOT/.claude/skills/$skill/SKILL.md" ]; then
                 cp "$CONFIG_DIR/skills/$skill/SKILL.md" "$REPO_ROOT/.claude/skills/$skill/"
-                # Copy extra files (e.g., audit-report.sh)
+                # Copy the skill's extra files beside SKILL.md
                 for extra in "$CONFIG_DIR/skills/$skill/"*; do
                     [ "$(basename "$extra")" = "SKILL.md" ] && continue
                     [ -f "$extra" ] && cp "$extra" "$REPO_ROOT/.claude/skills/$skill/" && chmod +x "$REPO_ROOT/.claude/skills/$skill/$(basename "$extra")" 2>/dev/null
@@ -2164,6 +2234,10 @@ if [ "$AGENT" = "claude" ]; then
             fi
         fi
     done
+    # A retired skill stops being delivered but its copy here stays, a second
+    # source of rules now held by a procedure. Remove an unedited Weave copy;
+    # keep and report an edited or unprovable one (wv-853052).
+    wv_retire_skill_copies "$REPO_ROOT/.claude/skills" "$CONFIG_DIR/skill-provenance.txt"
 
     # ── Agents (managed — always update) ──
     mkdir -p "$REPO_ROOT/.claude/agents"
@@ -2300,7 +2374,7 @@ AGENTSEOF
     elif [ "$UPDATE_MODE" = "1" ]; then
         # On --update, strip any stale hooks key if present
         existing=$(cat "$REPO_ROOT/.claude/settings.json")
-        if echo "$existing" | jq -e '.hooks' >/dev/null 2>&1; then
+        if echo "$existing" | jq -se 'length == 1 and (.[0] | .hooks)' >/dev/null 2>&1; then
             echo "$existing" | jq 'del(.hooks)' > "$REPO_ROOT/.claude/settings.json"
             echo -e "  ${GREEN}✓${NC} .claude/settings.json (removed stale hooks key)"
         else

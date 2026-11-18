@@ -127,6 +127,65 @@ legacy_rc=$?
 set -e
 check "the legacy patchText shape still meets the installed-copy guard" test "$legacy_rc" -eq 1
 
+# ── The same patch in Copilot CLI's shape (wv-c95723): tool_name Edit with the
+# patch document as the bare tool_input string (owner canary on Copilot CLI
+# 1.0.112, 2026-11-17). Dispatch reads it as the apply_patch observation, so
+# the same guards judge it; it used to be refused as malformed even with a claim.
+copilot_patch() {
+    jq -cn --arg p "$1" '{hook_event_name:"PreToolUse",tool_name:"Edit",tool_use_id:"custom_call_1",tool_input:$p}'
+}
+# The SessionStart checks above made the fixture node a previous session's
+# claim, which the stale-node guard refuses; claim it in this one.
+"$WV" work "$node_id" >/dev/null 2>&1
+set +e
+cp_allow=$(copilot_patch $'*** Begin Patch\n*** Add File: src/c.py\n+alpha\n*** End Patch\n' \
+    | "$WV" hook dispatch --event=PreToolUse --json)
+set -e
+# $id below is a jq variable, not a shell expansion.
+# shellcheck disable=SC2016
+check "a Copilot CLI string patch is admitted with an active node" _jq_ok "$cp_allow" \
+    '.decision == "allow" and .active_node == $id' --arg id "$node_id"
+copilot_patch $'*** Begin Patch\n*** Add File: src/c.py\n+alpha\n*** End Patch\n' \
+    | jq -c '.hook_event_name = "PostToolUse" | .tool_result = {result_type:"success"}' \
+    | "$WV" hook dispatch --event=PostToolUse --json >/dev/null
+check "PostToolUse attributes a Copilot CLI string patch's path" \
+    test "$(sqlite3 "$WV_DB" "SELECT COUNT(*) FROM node_files WHERE node_id='$node_id' AND path='src/c.py';")" -eq 1
+set +e
+cp_installed=$(copilot_patch $'*** Begin Patch\n*** Update File: /fake/.local/bin/wv\n*** End Patch\n' \
+    | "$WV" hook dispatch --event=PreToolUse --json)
+cp_installed_rc=$?
+cp_text=$(copilot_patch 'not a patch' | "$WV" hook dispatch --event=PreToolUse --json)
+cp_text_rc=$?
+set -e
+check "a Copilot CLI string patch meets the installed-copy guard" test "$cp_installed_rc" -eq 1
+check "installed-copy decision for the string patch names the path" _jq_ok "$cp_installed" \
+    '.decision == "block" and (.reason | contains(".local/bin/wv"))'
+check "a string tool_input that is not a patch is still refused" test "$cp_text_rc" -eq 1
+check "the refusal names the malformed payload" _jq_ok "$cp_text" \
+    '.decision == "block" and (.reason | contains("tool_input must be an object"))'
+
+# A string patch into a second Weave checkout is judged by that checkout's
+# graph, not the cwd's claim (wv-455739), as a Codex apply_patch is.
+Q="$TEST_DIR/other"
+mkdir -p "$Q/src"
+q_env() { (cd "$Q" && env -u WV_HOT_ZONE -u WV_DB -u WV_PROJECT_DIR -u WEAVE_DIR "$@"); }
+git -C "$Q" init -q
+# Under the gate's test mode the default placement sits inside
+# WV_TEST_HOT_ZONE_ROOT, whose tmp/ parent wv will not create (wv-80be32).
+[ -z "${WV_TEST_HOT_ZONE_ROOT:-}" ] || (umask 077 && mkdir -p "$WV_TEST_HOT_ZONE_ROOT/tmp")
+q_env "$WV" init >/dev/null 2>&1
+Q_ZONE=$(dirname "$(q_env "$WV" hotzone db 2>/dev/null)")
+case "$Q_ZONE" in /tmp/weave-*/?*) trap 'cd /tmp; rm -rf "$TEST_DIR" "$Q_ZONE"' EXIT ;; esac
+check "fixture: the second checkout has its own graph" test -s "$Q_ZONE/brain.db"
+set +e
+cp_other=$(copilot_patch "*** Begin Patch"$'\n'"*** Update File: $Q/src/q.py"$'\n'"*** End Patch"$'\n' \
+    | "$WV" hook dispatch --event=PreToolUse --json)
+cp_other_rc=$?
+set -e
+check "a string patch into another checkout with no claim there is refused" test "$cp_other_rc" -eq 1
+check "the refusal is that checkout's missing claim" _jq_ok "$cp_other" \
+    '.decision == "block" and (.reason | contains("No active Weave node"))'
+
 # ── SessionStart: stamps .session_epoch and resets phase to discover, mirroring
 # .claude/hooks/session-start-context.sh so stale-node detection has a baseline.
 "$WV" hook dispatch --event=SessionStart --json <<<'{}' >/dev/null

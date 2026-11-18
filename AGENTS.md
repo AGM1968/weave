@@ -63,11 +63,9 @@ only inside its markers; delete the markers to opt this file out.
 
 ## Graph memory
 
-`wv memory render --agent=all` refreshes this block from the graph, and only inside its markers.
-Change a claim with `wv remember --supersedes=<id>`, not by editing the block.
-
-<!-- ── BEGIN WEAVE:MEMORY ── managed by wv memory render, do not edit manually -->
-<!-- ── END WEAVE:MEMORY ── -->
+Durable memory lives in the Weave graph, not in this file. Read the active memories with
+`wv memory recall --agent=all --json` (or `wv show <id>` for one), and capture a new one with
+`wv remember <text>`; `wv bootstrap --json` carries the same index at session start.
 
 ## Full documentation
 

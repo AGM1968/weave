@@ -621,7 +621,8 @@ _durable_log_writable() {
     [ "${WV_CALL_SOURCE:-}" != "test" ] || [ -n "${WV_SUITE_LOG:-}" ] || [ -n "${WV_GATE_LOG:-}" ]
 }
 
-# _suite_log_append <suite> <files_csv> <exit> <duration_ms> <sha>
+# _suite_log_append <suite> <files_csv> <exit> <duration_ms> <sha> [estimate_ms]
+#                   [started_ms] [ended_ms] [clock]
 # One JSONL line per suite RUN (not per file). Best-effort: a logging failure must
 # never break a commit hook. jq -cn guarantees valid JSON + escaping, so a path
 # containing a quote can neither corrupt the log nor inject a field. Records only
@@ -629,7 +630,7 @@ _durable_log_writable() {
 # and `repo` is a basename so no absolute $HOME/username path leaks (no PII).
 _suite_log_append() {
     local suite="$1" files="$2" exit_code="$3" duration_ms="$4" sha="$5" estimate_ms="${6:-}"
-    local started_ms="${7:-}" ended_ms="${8:-}"
+    local started_ms="${7:-}" ended_ms="${8:-}" clock="${9:-}"
     _durable_log_writable || return 0
     local log_path; log_path=$(_suite_log_path)
     [ -n "$log_path" ] || return 0
@@ -644,6 +645,9 @@ _suite_log_append() {
     # for a gate is after its last suite ends. Unknown is absent, never 0.
     case "$started_ms" in ''|0|*[!0-9]*) started_ms=null ;; esac
     case "$ended_ms" in ''|0|*[!0-9]*) ended_ms=null ;; esac
+    # clock (wv-b17a85): the clock duration_ms was measured on (wv-clock.sh).
+    # Only monotonic leaves out a suspend; absent on rows from before it.
+    _clock_kind_valid "$clock" || clock=""
     local repo=""
     [ -n "${REPO_ROOT:-}" ] && repo=$(basename "$REPO_ROOT")
     # phase/gate_id (wv-ffda33) come from the gate that ran the suite, so one
@@ -662,7 +666,9 @@ _suite_log_append() {
         --argjson estimate_ms "$estimate_ms" \
         --argjson started_ms "$started_ms" \
         --argjson ended_ms "$ended_ms" \
+        --arg clock "$clock" \
         '{ts:$ts, repo:$repo, suite:$suite, files:$files, exit:$exit, duration_ms:$duration_ms, sha:$sha}
+         + (if $clock != "" then {clock:$clock} else {} end)
          + (if $phase != "" then {phase:$phase} else {} end)
          + (if $gate_id != "" then {gate_id:$gate_id} else {} end)
          + (if $execution_mode != "" then {execution_mode:$execution_mode} else {} end)
@@ -670,6 +676,11 @@ _suite_log_append() {
          + (if $started_ms != null then {started_ms:$started_ms} else {} end)
          + (if $ended_ms != null then {ended_ms:$ended_ms} else {} end)' \
         >> "$log_path" 2>/dev/null || true
+}
+
+# _clock_kind_valid <kind> — one of the kinds wv-clock.sh declares.
+_clock_kind_valid() {
+    case "${1:-}" in monotonic|boottime|wall|unknown) return 0 ;; *) return 1 ;; esac
 }
 
 # _gate_log_path: the per-gate log sits beside the suite log, so every isolation
@@ -681,7 +692,7 @@ _gate_log_path() {
 
 # _gate_log_append <phase> <gate_id> <exit> <duration_ms> <estimate_ms> <suites_csv> <sha> [started_ms]
 #                  [suite_modes] [lanes_json] [lanes_ms] [lanes_started_ms]
-#                  [pressure_start] [pressure_end]
+#                  [pressure_start] [pressure_end] [clock]
 # One JSONL line per gate INVOCATION: its wall time, what it ran, what it
 # expected to take, and how it ended. Best-effort like the suite log.
 # started_ms (wv-4666cb) is the gate's start in epoch ms, the origin its suites'
@@ -699,10 +710,11 @@ _gate_log_path() {
 # gate's wall time. The gate's own parallel suites contend too, so a share is
 # host load including the gate, not interference alone. Absent where either
 # reading is missing or the counters went backwards.
+# clock (wv-b17a85) is the clock duration_ms and lanes_ms were measured on.
 _gate_log_append() {
     local phase="$1" gate_id="$2" exit_code="$3" duration_ms="$4" estimate_ms="$5" suites="$6" sha="$7"
     local started_ms="${8:-}" suite_modes="${9:-}" lanes="${10:-}" lanes_ms="${11:-}" lanes_started_ms="${12:-}"
-    local pressure_start="${13:-}" pressure_end="${14:-}" pressure=null
+    local pressure_start="${13:-}" pressure_end="${14:-}" pressure=null clock="${15:-}"
     _durable_log_writable || return 0
     local log_path; log_path=$(_gate_log_path)
     mkdir -p "$(dirname "$log_path")" 2>/dev/null || return 0
@@ -712,7 +724,8 @@ _gate_log_append() {
     case "$started_ms" in ''|0|*[!0-9]*) started_ms=null ;; esac
     case "$lanes_ms" in ''|*[!0-9]*) lanes_ms=null ;; esac
     case "$lanes_started_ms" in ''|0|*[!0-9]*) lanes_started_ms=null ;; esac
-    jq -e 'type == "array" and length > 0' >/dev/null 2>&1 <<< "$lanes" || lanes=null
+    jq -se 'length == 1 and (.[0] | type == "array" and length > 0)' >/dev/null 2>&1 <<< "$lanes" || lanes=null
+    _clock_kind_valid "$clock" || clock=""
     if [[ "$pressure_start" =~ ^[0-9]+,[0-9]+$ ]] && [[ "$pressure_end" =~ ^[0-9]+,[0-9]+$ ]]; then
         pressure=$(jq -cn --arg s "$pressure_start" --arg e "$pressure_end" --argjson d "$duration_ms" '
             ($s | split(",") | map(tonumber)) as $a | ($e | split(",") | map(tonumber)) as $b
@@ -733,9 +746,10 @@ _gate_log_append() {
         --argjson estimate_ms "$estimate_ms" --arg suites "$suites" --arg sha "$sha" \
         --argjson started_ms "$started_ms" --arg suite_modes "$suite_modes" \
         --argjson lanes "$lanes" --argjson lanes_ms "$lanes_ms" --argjson lanes_started_ms "$lanes_started_ms" \
-        --argjson pressure "$pressure" \
+        --argjson pressure "$pressure" --arg clock "$clock" \
         '{ts:$ts, repo:$repo, phase:$phase, gate_id:$gate_id, exit:$exit, duration_ms:$duration_ms,
           estimate_ms:$estimate_ms, suites:($suites | split(",") | map(select(. != ""))), sha:$sha}
+         + (if $clock != "" then {clock:$clock} else {} end)
          + (if $execution_mode != "" then {execution_mode:$execution_mode} else {} end)
          + (if $started_ms != null then {started_ms:$started_ms} else {} end)
          + ($suite_modes | split(",") | map(select(test("^[^=]+=(frozen|checkout)$")) | split("="))
@@ -756,9 +770,12 @@ _gate_log_append() {
 # shared exit code — so the consumer can ask per-file "is this content fresh?".
 # Idempotent per (suite, path): a re-run overwrites the prior row (latest wins).
 # With no --files, records a single sentinel row (path='') under the HEAD sha.
-# --duration=MS is the suite run's wall-clock cost (LL1); the suite ran once, so
+# --duration=MS is the suite run's cost (LL1); the suite ran once, so
 # every per-file row from that run carries the same shared duration. Omitted or
 # non-numeric coerces to 0 (the "unmeasured" sentinel, matching the prior baseline).
+# --clock=KIND names the clock it was measured on (monotonic | boottime | wall |
+# unknown, wv-clock.sh); the durable log carries it and estimates read only
+# monotonic rows (wv-b17a85). Any other value is dropped, never guessed.
 # Side effect (LL2): also appends ONE durable JSONL history line per run to the
 # on-disk suite log (_suite_log_append) so run history survives `wv load`/reboot,
 # unlike the tmpfs table. Never fails the caller — a recording error must not break
@@ -772,7 +789,7 @@ cmd_test_record() {
     local files="" exit_code="0" commit_sha="" duration_ms="0" estimate_ms=""
     local gate_mode=false gate_phase="${WV_GATE_PHASE:-}" gate_id="${WV_GATE_ID:-}" gate_suites="" gate_suite_modes=""
     local start_fps="" start_given=false inputs_key="" started_ms="" ended_ms="" snapshot_plan=""
-    local gate_lanes="" gate_lanes_ms="" gate_lanes_started_ms="" gate_pressure_start="" gate_pressure_end=""
+    local gate_lanes="" gate_lanes_ms="" gate_lanes_started_ms="" gate_pressure_start="" gate_pressure_end="" clock=""
     local arg
     for arg in "$@"; do
         case "$arg" in
@@ -787,6 +804,7 @@ cmd_test_record() {
             --commit=*)   commit_sha="${arg#--commit=}" ;;
             --duration=*) duration_ms="${arg#--duration=}" ;;
             --estimate=*) estimate_ms="${arg#--estimate=}" ;;
+            --clock=*)    clock="${arg#--clock=}" ;;
             --gate)       gate_mode=true ;;
             --phase=*)    gate_phase="${arg#--phase=}" ;;
             --gate-id=*)  gate_id="${arg#--gate-id=}" ;;
@@ -802,8 +820,8 @@ cmd_test_record() {
     done
 
     if [ -z "$suite" ]; then
-        echo "Usage: wv test-record <suite> [--files=a,b] [--exit=N] [--commit=SHA] [--duration=MS] [--estimate=MS] [--started-ms=EPOCH_MS] [--ended-ms=EPOCH_MS]" >&2
-        echo "       wv test-record gate --gate --phase=P --gate-id=ID --exit=N --duration=MS [--estimate=MS] [--suites=a,b] [--started-ms=EPOCH_MS] [--lanes=JSON --lanes-ms=MS --lanes-started-ms=EPOCH_MS] [--pressure-start=CPU_US,IO_US --pressure-end=CPU_US,IO_US]" >&2
+        echo "Usage: wv test-record <suite> [--files=a,b] [--exit=N] [--commit=SHA] [--duration=MS] [--estimate=MS] [--started-ms=EPOCH_MS] [--ended-ms=EPOCH_MS] [--clock=KIND]" >&2
+        echo "       wv test-record gate --gate --phase=P --gate-id=ID --exit=N --duration=MS [--estimate=MS] [--suites=a,b] [--started-ms=EPOCH_MS] [--lanes=JSON --lanes-ms=MS --lanes-started-ms=EPOCH_MS] [--pressure-start=CPU_US,IO_US --pressure-end=CPU_US,IO_US] [--clock=KIND]" >&2
         return 1
     fi
 
@@ -818,7 +836,7 @@ cmd_test_record() {
         [ -z "$commit_sha" ] && commit_sha=$(git rev-parse --short HEAD 2>/dev/null || echo "")
         _gate_log_append "${gate_phase:-manual}" "$gate_id" "$exit_code" "$duration_ms" \
             "$estimate_ms" "$gate_suites" "$commit_sha" "$started_ms" "$gate_suite_modes" \
-            "$gate_lanes" "$gate_lanes_ms" "$gate_lanes_started_ms" "$gate_pressure_start" "$gate_pressure_end"
+            "$gate_lanes" "$gate_lanes_ms" "$gate_lanes_started_ms" "$gate_pressure_start" "$gate_pressure_end" "$clock"
         return 0
     fi
 
@@ -840,7 +858,7 @@ cmd_test_record() {
     # Durable history: one append-only JSONL line per run, survives wv load (LL2).
     # The tmpfs upserts below remain the gate's current-state view.
     _suite_log_append "$suite" "$files" "$exit_code" "$duration_ms" "$commit_sha" "$estimate_ms" \
-        "$started_ms" "$ended_ms"
+        "$started_ms" "$ended_ms" "$clock"
     # Mutable checkout tools are not captured by any content key. Keep the
     # measured outcome, but never certify per-file, legacy or frozen readiness.
     [ "$WV_GATE_EXECUTION_MODE" != checkout ] || return 0
@@ -866,7 +884,7 @@ cmd_test_record() {
     # plan rather than reading live HEAD after a potentially lengthy run.
     if [ -n "$snapshot_plan" ]; then
         local observation
-        observation=$(jq -ec --arg s "$suite" --arg k "$inputs_key" '
+        observation=$(jq -sec --arg s "$suite" --arg k "$inputs_key" 'if length == 1 then .[0] else error("expected one JSON value") end |
             . as $p | .suites[$s] as $s
             | select($s.identity.context == "prepush" and $s.key == $k
                 and ($k | test("^snapshot-v1:[0-9a-f]{64}$")))
@@ -978,7 +996,7 @@ cmd_test_status() {
         fi
         [ "$staged" = true ] && mode=staged
         if [ -n "$snapshot_plan" ]; then
-            keys=$(jq -er --arg suites "$suites" '
+            keys=$(jq -ser --arg suites "$suites" 'if length == 1 then .[0] else error("expected one JSON value") end |
                 .suites as $plan | $suites | split(",")[] as $suite
                 | $plan[$suite].key as $key
                 | if ($key | type == "string" and test("^snapshot-v1:[0-9a-f]{64}$"))

@@ -51,14 +51,14 @@ fi
 
 bash_identity() {
     # $1.. = env assignments, e.g. CLAUDE_CODE_SSE_PORT=1 CODEX_CI=1
-    env -u WV_AGENT_ID -u CLAUDE_CODE_SSE_PORT -u CLAUDECODE -u AI_AGENT -u PI_SESSION_ID -u AMP_CURRENT_THREAD_ID -u CODEX_THREAD_ID -u CODEX_CI -u COPILOT_AGENT -u CLAUDE_CODE_SESSION_ID -u WV_SESSION_IDENTITY -u WV_SESSION_ID \
+    env -u WV_AGENT_ID -u CLAUDE_CODE_SSE_PORT -u CLAUDECODE -u AI_AGENT -u PI_SESSION_ID -u AMP_CURRENT_THREAD_ID -u CODEX_THREAD_ID -u CODEX_CI -u COPILOT_AGENT -u COPILOT_CLI -u COPILOT_AGENT_SESSION_ID -u CLAUDE_CODE_SESSION_ID -u WV_SESSION_IDENTITY -u WV_SESSION_ID \
         "$@" bash -c "source '$RUNTIME_LIB'; resolve_agent_id" 2>/dev/null
 }
 
 mcp_identity() {
     # $1.. = env assignments
     local out
-    out=$(env -u WV_AGENT_ID -u CLAUDE_CODE_SSE_PORT -u CLAUDECODE -u AI_AGENT -u PI_SESSION_ID -u AMP_CURRENT_THREAD_ID -u CODEX_THREAD_ID -u CODEX_CI -u COPILOT_AGENT -u CLAUDE_CODE_SESSION_ID -u WV_SESSION_IDENTITY -u WV_SESSION_ID \
+    out=$(env -u WV_AGENT_ID -u CLAUDE_CODE_SSE_PORT -u CLAUDECODE -u AI_AGENT -u PI_SESSION_ID -u AMP_CURRENT_THREAD_ID -u CODEX_THREAD_ID -u CODEX_CI -u COPILOT_AGENT -u COPILOT_CLI -u COPILOT_AGENT_SESSION_ID -u CLAUDE_CODE_SESSION_ID -u WV_SESSION_IDENTITY -u WV_SESSION_ID \
         "$@" WV_PATH="$REPO_ROOT/scripts/wv" WV_PROJECT_ROOT="$REPO_ROOT" \
         node "$MCP_DIST" --scope=lite --health-check 2>/dev/null)
     echo "$out" | jq -r '.agent_id'
@@ -124,6 +124,15 @@ declare -a SCENARIOS=(
     "agnostic channel, any host (WV_SESSION_ID)|WV_SESSION_ID=amp-T-1234"
     "agnostic channel on copilot|COPILOT_AGENT=1 WV_SESSION_ID=xyz"
     "agnostic channel wins over harness default|CLAUDECODE=1 CLAUDE_CODE_SESSION_ID=abc WV_SESSION_ID=def"
+    "amp session variable alone, no AI_AGENT (wv-55a24d)|AMP_CURRENT_THREAD_ID=T-01a1a749-e3b6-723b-bd6c-86427007bbbe"
+    "pi session variable alone, no AI_AGENT (wv-55a24d)|PI_SESSION_ID=019a5e2c-7d10-7000-8000-000000000001"
+    "amp variable inside claude, no AI_AGENT (wv-55a24d)|CLAUDECODE=1 CLAUDE_CODE_SESSION_ID=abc AMP_CURRENT_THREAD_ID=T-1"
+    "claude inside amp: AI_AGENT decisive (wv-55a24d)|CLAUDECODE=1 AI_AGENT=claude-code_2-1-318_agent CLAUDE_CODE_SESSION_ID=abc AMP_CURRENT_THREAD_ID=T-1"
+    "copilot cli session (wv-6781d7)|COPILOT_CLI=1 COPILOT_AGENT_SESSION_ID=e6ffa6a9-f6e4-48e1-88b1-26cb209c229a"
+    "copilot cli, session id missing (wv-6781d7)|COPILOT_CLI=1"
+    "copilot cli beside an inherited CLAUDECODE (wv-6781d7)|COPILOT_CLI=1 COPILOT_AGENT_SESSION_ID=s1 CLAUDECODE=1"
+    "claude inside copilot cli: AI_AGENT decisive (wv-6781d7)|COPILOT_CLI=1 COPILOT_AGENT_SESSION_ID=s1 CLAUDECODE=1 AI_AGENT=claude-code_2-1-318_agent CLAUDE_CODE_SESSION_ID=abc"
+    "COPILOT_AGENT ignores the Copilot CLI session variable (wv-6781d7)|COPILOT_AGENT=1 COPILOT_AGENT_SESSION_ID=s1"
 )
 
 for scenario in "${SCENARIOS[@]}"; do
@@ -139,6 +148,60 @@ for scenario in "${SCENARIOS[@]}"; do
         fail "$label -> bash and MCP diverge" "bash=$b mcp=$m"
     fi
 done
+
+# wv-55a24d: the session-variable fallback names the harness, not just parity.
+# Amp's October 2026 work was credited to claude because an Amp process without
+# AI_AGENT inside a Claude shell resolved claude with no diagnostic at all.
+harness_of() { local id="$1"; printf '%s\n' "${id%%-*}"; }
+expect_harness() {  # $1 label, $2 expected harness, $3.. env
+    local label="$1" want="$2"; shift 2
+    local got_b got_m
+    got_b=$(harness_of "$(bash_identity "$@")")
+    got_m=$(harness_of "$(mcp_identity "$@")")
+    if [ "$got_b" = "$want" ] && [ "$got_m" = "$want" ]; then
+        pass "$label -> $want in bash and MCP"
+    else
+        fail "$label -> $want" "bash=$got_b mcp=$got_m"
+    fi
+}
+expect_harness "amp session variable alone" amp AMP_CURRENT_THREAD_ID=T-1
+expect_harness "pi session variable alone" pi PI_SESSION_ID=p1
+expect_harness "amp variable inside claude without AI_AGENT keeps claude" claude CLAUDECODE=1 AMP_CURRENT_THREAD_ID=T-1
+expect_harness "AI_AGENT stays decisive over an inherited amp variable" claude CLAUDECODE=1 AI_AGENT=claude-code_2-1-318_agent AMP_CURRENT_THREAD_ID=T-1
+expect_harness "AI_AGENT=amp unchanged" amp AI_AGENT=amp AMP_CURRENT_THREAD_ID=T-1
+# wv-6781d7: Copilot CLI sets COPILOT_CLI=1, never COPILOT_AGENT (1.0.112). It
+# leaks to children like CLAUDECODE, so it ranks after AI_AGENT.
+expect_harness "Copilot CLI's marker alone" copilot COPILOT_CLI=1 COPILOT_AGENT_SESSION_ID=s1
+expect_harness "Copilot CLI beside an inherited CLAUDECODE" copilot COPILOT_CLI=1 COPILOT_AGENT_SESSION_ID=s1 CLAUDECODE=1
+expect_harness "Claude Code started from a Copilot CLI shell keeps claude" claude COPILOT_CLI=1 COPILOT_AGENT_SESSION_ID=s1 CLAUDECODE=1 AI_AGENT=claude-code_2-1-318_agent
+# A Copilot CLI hook gets no session variable, only the payload's id (session_id
+# with PascalCase events, sessionId in Copilot's own format): adoption must give
+# it the owner its tool shell resolves.
+cp_shell=$(bash_identity COPILOT_CLI=1 COPILOT_AGENT_SESSION_ID=e6ffa6a9-f6e4-48e1-88b1-26cb209c229a)
+for payload in '{"session_id":"e6ffa6a9-f6e4-48e1-88b1-26cb209c229a"}' '{"sessionId":"e6ffa6a9-f6e4-48e1-88b1-26cb209c229a"}'; do
+    cp_hook=$(env -u WV_AGENT_ID -u CLAUDE_CODE_SSE_PORT -u CLAUDECODE -u AI_AGENT -u PI_SESSION_ID -u AMP_CURRENT_THREAD_ID -u CODEX_THREAD_ID -u CODEX_CI -u COPILOT_AGENT -u COPILOT_AGENT_SESSION_ID -u CLAUDE_CODE_SESSION_ID -u WV_SESSION_IDENTITY -u WV_SESSION_ID \
+        COPILOT_CLI=1 bash -c "source '$RUNTIME_LIB'; wv_adopt_hook_session_id '$payload'; resolve_agent_id" 2>/dev/null)
+    # Equal is not enough: an unrecognised harness makes both human and equal.
+    if [[ "$cp_shell" == copilot-*-h[0-9a-f]* ]] && [ "$cp_hook" = "$cp_shell" ]; then
+        pass "a Copilot CLI hook resolves its tool shell's owner from $payload ($cp_hook)"
+    else
+        fail "a Copilot CLI hook resolves its tool shell's owner from $payload" "shell=$cp_shell hook=$cp_hook"
+    fi
+done
+_diag=$(env -u WV_AGENT_ID -u AI_AGENT -u CODEX_THREAD_ID -u CODEX_CI -u COPILOT_AGENT -u COPILOT_CLI -u COPILOT_AGENT_SESSION_ID -u PI_SESSION_ID \
+    CLAUDECODE=1 AMP_CURRENT_THREAD_ID=T-1 bash -c "source '$RUNTIME_LIB'; resolve_agent_harness" 2>&1 >/dev/null || true)
+if [[ "$_diag" == *"ambiguous agent markers (claude amp)"* ]]; then
+    pass "amp variable beside claude is named in the ambiguity diagnostic, not silent"
+else
+    fail "amp variable beside claude is named in the ambiguity diagnostic" "stderr=[$_diag]"
+fi
+_diag=$(env -u WV_AGENT_ID -u CODEX_THREAD_ID -u CODEX_CI -u COPILOT_AGENT -u COPILOT_CLI -u COPILOT_AGENT_SESSION_ID -u PI_SESSION_ID \
+    CLAUDECODE=1 AI_AGENT=claude-code_2-1-318_agent AMP_CURRENT_THREAD_ID=T-1 bash -c "source '$RUNTIME_LIB'; resolve_agent_harness" 2>&1 >/dev/null || true)
+if [ -z "$_diag" ]; then
+    pass "AI_AGENT set: the fallback is not consulted, so no diagnostic"
+else
+    fail "AI_AGENT set: no diagnostic" "stderr=[$_diag]"
+fi
 
 # wv-24d57b: the session part digests the WHOLE id. Two UUIDv7 thread ids from
 # one millisecond share their first 12 characters (the timestamp), and ids that
@@ -192,7 +255,8 @@ echo "==========================================================================
 for envstr in "CLAUDECODE=1 CLAUDE_CODE_SESSION_ID=e2bbbaf2-606c-462b-8c2e-2d4305df0616" \
               "CODEX_THREAD_ID=019a-bc12-34" "WV_SESSION_ID=amp-T-1234" \
               "AI_AGENT=pi PI_SESSION_ID=019a5e2c-7d10-7000-8000-000000000001" \
-              "AI_AGENT=amp AMP_CURRENT_THREAD_ID=T-01a1a755-4c7b-77b4-9982-053d0b097bbb"; do
+              "AI_AGENT=amp AMP_CURRENT_THREAD_ID=T-01a1a755-4c7b-77b4-9982-053d0b097bbb" \
+              "COPILOT_CLI=1 COPILOT_AGENT_SESSION_ID=e6ffa6a9-f6e4-48e1-88b1-26cb209c229a"; do
     # shellcheck disable=SC2086  # envstr is a controlled, script-local word list
     ident=$(bash_identity $envstr)
     if [[ "$ident" =~ ^[a-z0-9]{1,24}-.+-.+-h[0-9a-f]{16}$ ]]; then
@@ -209,12 +273,12 @@ for envstr in "CLAUDECODE=1 CLAUDE_CODE_SESSION_ID=e2bbbaf2-606c-462b-8c2e-2d430
 done
 
 bash_require() {
-    env -u WV_AGENT_ID -u CLAUDE_CODE_SSE_PORT -u CLAUDECODE -u AI_AGENT -u PI_SESSION_ID -u AMP_CURRENT_THREAD_ID -u CODEX_THREAD_ID -u CODEX_CI -u COPILOT_AGENT \
+    env -u WV_AGENT_ID -u CLAUDE_CODE_SSE_PORT -u CLAUDECODE -u AI_AGENT -u PI_SESSION_ID -u AMP_CURRENT_THREAD_ID -u CODEX_THREAD_ID -u CODEX_CI -u COPILOT_AGENT -u COPILOT_CLI -u COPILOT_AGENT_SESSION_ID \
         -u CLAUDE_CODE_SESSION_ID -u WV_SESSION_IDENTITY -u WV_SESSION_ID \
         "$@" bash -c "set -euo pipefail; source '$RUNTIME_LIB'; require_agent_id" 2>/dev/null
 }
 for envstr in "CLAUDECODE=1" "CODEX_CI=1" "CLAUDECODE=1 CLAUDE_CODE_SESSION_ID=..--" "WV_SESSION_ID=" \
-              "AI_AGENT=pi" "AI_AGENT=amp"; do
+              "AI_AGENT=pi" "AI_AGENT=amp" "COPILOT_CLI=1"; do
     # shellcheck disable=SC2086
     if out=$(bash_require $envstr); then
         fail "require_agent_id refuses an unverifiable session ($envstr)" "got: $out"
@@ -224,7 +288,8 @@ for envstr in "CLAUDECODE=1" "CODEX_CI=1" "CLAUDECODE=1 CLAUDE_CODE_SESSION_ID=.
 done
 for envstr in "" "COPILOT_AGENT=1" "CLAUDECODE=1 WV_SESSION_IDENTITY=0" "CLAUDECODE=1 WV_AGENT_ID=me" \
               "CLAUDE_CODE_SSE_PORT=1" "CLAUDE_CODE_SSE_PORT=1 CODEX_THREAD_ID=t1" \
-              "CLAUDE_CODE_SSE_PORT=1 AI_AGENT=pi PI_SESSION_ID=p1" "AI_AGENT=constructor"; do
+              "CLAUDE_CODE_SSE_PORT=1 AI_AGENT=pi PI_SESSION_ID=p1" "AI_AGENT=constructor" \
+              "COPILOT_AGENT=1 COPILOT_AGENT_SESSION_ID=s1"; do
     # shellcheck disable=SC2086
     if out=$(bash_require $envstr) && [ -n "$out" ]; then
         pass "require_agent_id admits an actor-owned identity (${envstr:-human}): $out"

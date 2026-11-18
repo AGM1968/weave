@@ -204,7 +204,8 @@ _doctor_install_provenance() {
     ipath=$(grep -m1 '^source_path=' "$prov" 2>/dev/null | cut -d= -f2-)
 
     # Compare against the source it came from, when that is still present.
-    if [ -n "$ipath" ] && [ -d "$ipath/.git" ] && [ -n "$icommit" ]; then
+    # -e: a worktree source has a .git file, not a directory.
+    if [ -n "$ipath" ] && [ -e "$ipath/.git" ] && [ -n "$icommit" ]; then
         local head behind
         head=$(git -C "$ipath" rev-parse HEAD 2>/dev/null || echo "")
         if [ -n "$head" ] && [ "$head" != "$icommit" ]; then
@@ -333,6 +334,53 @@ _doctor_local_procedure_command_refs() {
     printf '%s' "$matches"
 }
 
+# _doctor_check_stranded_closes — closes main's committed graph does not hold
+# (wv-4a6d29). A close lives in the hot zone first; it reaches main only when
+# a commit on main carries .weave/. Two paths keep it out: a linked worktree or
+# side branch with its own graph that is never merged (wv-ca1f94), and a
+# session that closed and exited before anything committed .weave/. A node done
+# here whose last update is over a day old has been closed at least that long
+# (a close is never after its node's last update); one main's committed
+# nodes.jsonl does not hold as done is stranded. Main is the local main (or
+# master) branch, which every worktree of the repository shares.
+_doctor_check_stranded_closes() {
+    local root main_ref rel closes main_done stranded n list
+    root=$(git -C "${WV_PROJECT_DIR:-.}" rev-parse --show-toplevel 2>/dev/null) || {
+        _doctor_record "stranded closes" "pass" "not a git repository; no main to compare"; return 0; }
+    main_ref=$(git -C "$root" rev-parse --verify -q refs/heads/main 2>/dev/null \
+        || git -C "$root" rev-parse --verify -q refs/heads/master 2>/dev/null) || {
+        _doctor_record "stranded closes" "pass" "no main or master branch to compare"; return 0; }
+    rel=$(realpath --relative-to="$root" "${WEAVE_DIR:-$root/.weave}" 2>/dev/null) || rel=".weave"
+    if ! closes=$(db_query "SELECT id FROM nodes WHERE status = 'done'
+            AND updated_at < datetime('now', '-24 hours') ORDER BY id;" 2>/dev/null); then
+        _doctor_record "stranded closes" "warn" "could not read this graph's closes"
+        return 0
+    fi
+    [ -n "$closes" ] || { _doctor_record "stranded closes" "pass" "no close older than a day"; return 0; }
+    if ! git -C "$root" cat-file -e "$main_ref:$rel/nodes.jsonl" 2>/dev/null; then
+        _doctor_record "stranded closes" "pass" "main has no committed $rel/nodes.jsonl yet"
+        return 0
+    fi
+    # Two steps, each status checked: no pipefail in this file, whose other
+    # pipelines end early on purpose (tests/test-assert-helper-safety.sh).
+    local main_nodes
+    if ! main_nodes=$(git -C "$root" show "$main_ref:$rel/nodes.jsonl" 2>/dev/null) \
+        || ! main_done=$(jq -r 'select(.status == "done") | .id' <<< "$main_nodes" 2>/dev/null); then
+        _doctor_record "stranded closes" "warn" "could not read main's committed $rel/nodes.jsonl"
+        return 0
+    fi
+    stranded=$(LC_ALL=C comm -23 <(printf '%s\n' "$closes" | LC_ALL=C sort -u) \
+        <(printf '%s\n' "$main_done" | LC_ALL=C sort -u))
+    if [ -z "$stranded" ]; then
+        _doctor_record "stranded closes" "pass" "main's committed graph holds every close older than a day"
+        return 0
+    fi
+    n=$(printf '%s\n' "$stranded" | wc -l | tr -d ' ')
+    list=$(awk 'NR <= 5' <<< "$stranded" | paste -sd' ' -)
+    [ "$n" -le 5 ] || list="$list ..."
+    _doctor_record "stranded closes" "warn" "$n close(s) older than a day that main's committed graph does not hold as done: $list — on main, run wv sync and commit .weave/; from a linked worktree or side branch, merge it into main, then on main run wv load, wv sync and commit .weave/ (nodes.jsonl merges as ours, so the merge alone carries the close only as deltas)"
+}
+
 # _doctor_check_edge_invariants — stored edges that break their type's invariant
 # and closed parents over open children nothing accounts for (ontology S2,
 # wv-76b361). The query is the one wv link and wv done refuse by; history is
@@ -361,6 +409,19 @@ _doctor_check_edge_invariants() {
         _doctor_record "closed parents" "warn" "$n open child(ren) under a closed parent, not parked, re-parented or resolved (parent>child): $list$([ "$n" -gt 5 ] && echo ' ...')"
     else
         _doctor_record "closed parents" "pass" "no closed parent over an unaccounted open child"
+    fi
+    # Dangling edges: an endpoint that names no node (wv-477035). wv health
+    # counts them; doctor names them, since the committed graph can carry one.
+    if ! edges=$(db_query "SELECT source || '->' || target || ' (' || type || ')' FROM edges
+            WHERE source NOT IN (SELECT id FROM nodes) OR target NOT IN (SELECT id FROM nodes)
+            ORDER BY source, target, type;" 2>/dev/null); then
+        _doctor_record "dangling edges" "warn" "could not evaluate edges whose endpoint names no node"
+    elif [ -n "$edges" ]; then
+        n=$(wc -l <<< "$edges")
+        list=$(head -5 <<< "$edges" | tr '\n' ';' | sed 's/;$//; s/;/; /g')
+        _doctor_record "dangling edges" "warn" "$n edge(s) name a node that does not exist: $list$([ "$n" -gt 5 ] && echo '; ...') — remove each with wv unlink <source> <target> --type=<type>, or all with wv clean-ghosts"
+    else
+        _doctor_record "dangling edges" "pass" "every edge names two existing nodes"
     fi
 }
 
@@ -528,11 +589,11 @@ _doctor_check_codex_mcp() {
     fi
 }
 
-# Detect the project Codex hook config and surface trust guidance. Codex hook
-# trust is reviewed inside Codex itself (via /hooks) and is not reliably
-# inspectable from outside the running session, so a present + complete
-# config still warns "pending trust" rather than "pass" (see
-# docs/PROPOSAL-codex-hooks-rust-dispatch.md test plan item 10).
+# Detect the project Codex hook config and report its trust. Trust is granted
+# inside Codex (startup review or /hooks) but recorded in the Codex config,
+# where _doctor_codex_hook_trust reads it: a complete config passes only when
+# every hook has a trust entry (wv-f838ba; earlier this always warned "pending
+# trust", docs/PROPOSAL-codex-hooks-rust-dispatch.md test plan item 10).
 _doctor_check_codex_hooks() {
     local git_root hooks_file contract_file
     git_root=$(git rev-parse --show-toplevel 2>/dev/null)
@@ -544,7 +605,7 @@ _doctor_check_codex_hooks() {
     contract_file="$git_root/.codex/weave.json"
 
     if [ ! -f "$hooks_file" ]; then
-        if [ -f "$contract_file" ] && jq -e '(.hooks.enabled // 0) == 1' "$contract_file" >/dev/null 2>&1; then
+        if [ -f "$contract_file" ] && jq -se 'length == 1 and (.[0] | (.hooks.enabled // 0) == 1)' "$contract_file" >/dev/null 2>&1; then
             _doctor_record "codex hooks" "warn" ".codex/weave.json records hooks enabled but .codex/hooks.json is missing; run: wv init-repo --agent=codex --codex-hooks --force"
         else
             _doctor_record "codex hooks" "warn" "no project Codex hooks; optional: wv init-repo --agent=codex --codex-hooks"
@@ -552,14 +613,14 @@ _doctor_check_codex_hooks() {
         return
     fi
 
-    if ! jq -e 'type == "object" and (.hooks | type) == "object"' "$hooks_file" >/dev/null 2>&1; then
+    if ! jq -se 'length == 1 and (.[0] | type == "object" and (.hooks | type) == "object")' "$hooks_file" >/dev/null 2>&1; then
         _doctor_record "codex hooks" "fail" ".codex/hooks.json is present but is not valid JSON with a top-level hooks object"
         return
     fi
 
     local missing="" ev
     for ev in SessionStart PreToolUse PostToolUse PreCompact Stop; do
-        jq -e --arg ev "$ev" '(.hooks[$ev] // []) | length > 0' "$hooks_file" >/dev/null 2>&1 || missing="${missing:+$missing, }$ev"
+        jq -se --arg ev "$ev" 'length == 1 and (.[0] | (.hooks[$ev] // []) | length > 0)' "$hooks_file" >/dev/null 2>&1 || missing="${missing:+$missing, }$ev"
     done
     if [ -n "$missing" ]; then
         _doctor_record "codex hooks" "warn" ".codex/hooks.json is stale, missing event(s): $missing -- regenerate with wv init-repo --agent=codex --codex-hooks --force"
@@ -571,7 +632,7 @@ _doctor_check_codex_hooks() {
     # (wv-5b774a); the generated config uses --format=host.
     local advisory=""
     for ev in PreToolUse Stop; do
-        jq -e --arg ev "$ev" '[.hooks[$ev][]?.hooks[]?.command // empty | select(test("hook dispatch") and (test("--format=host") | not))] | length > 0' \
+        jq -se --arg ev "$ev" 'length == 1 and (.[0] | [.hooks[$ev][]?.hooks[]?.command // empty | select(test("hook dispatch") and (test("--format=host") | not))] | length > 0)' \
             "$hooks_file" >/dev/null 2>&1 && advisory="${advisory:+$advisory, }$ev"
     done
     if [ -n "$advisory" ]; then
@@ -579,7 +640,125 @@ _doctor_check_codex_hooks() {
         return
     fi
 
-    _doctor_record "codex hooks" "warn" ".codex/hooks.json covers SessionStart/PreToolUse/PostToolUse/PreCompact/Stop -- pending trust; review and trust with /hooks in Codex before it enforces"
+    _doctor_codex_hook_trust "$git_root" "$hooks_file"
+}
+
+# _doctor_codex_hook_trust <git root> <hooks file> -- whether Codex has trusted
+# each hook of the project hooks file. Codex runs a project hook only after a
+# person trusts it in the TUI, and codex exec skips an untrusted one without a
+# message (probe wv-f2dc79, docs/findings/codex-hooks-probe-2026-11-17). Trust
+# is one entry per hook in $CODEX_HOME/config.toml (default ~/.codex):
+#   [hooks.state."<abs path>/.codex/hooks.json:<event>:<group>:<hook>"]
+#   trusted_hash = "sha256:..."
+# Codex documents that it "records trust against the hook's current hash" but
+# not which bytes it hashes, and plain JSON forms of the entry do not match
+# (wv-d9f789). So doctor keeps a baseline: per trusted hook, the sha256 of the
+# hooks.json entry (matcher and hook) beside Codex's trusted_hash as first seen.
+# Codex's value unchanged with a changed entry is an edit after trust, which
+# Codex skips without a message (activation probe wv-514488); a new Codex value
+# is a fresh trust and becomes the baseline. The script a hook runs is outside
+# the entry, so editing it stays trusted, as observed. The baseline cannot
+# vouch for an entry already edited when doctor first sees it. Read-only on the
+# Codex config: doctor writes only its own baseline (ruling wv-2d8b49).
+_doctor_codex_hook_trust() {
+    local git_root="$1" hooks_file="$2" config root_real hooks_real key keypath th ev g h untrusted="" changed="" total=0 unrecorded=0
+    config="${CODEX_HOME:-$HOME/.codex}/config.toml"
+    root_real=$(cd "$git_root" 2>/dev/null && pwd -P) || root_real="$git_root"
+    hooks_real="$root_real/.codex/hooks.json"
+    while IFS=$'\t' read -r ev g h; do
+        [ -n "$ev" ] || continue
+        total=$((total + 1))
+        # PreToolUse -> pre_tool_use, the event spelling Codex uses in the key.
+        key="$(printf '%s' "$ev" | sed 's/\([a-z]\)\([A-Z]\)/\1_\2/g' | tr '[:upper:]' '[:lower:]'):$g:$h"
+        th="" keypath=""
+        for keypath in "$hooks_file:$key" "$hooks_real:$key"; do
+            th=$(_doctor_codex_trusted_hash "$config" "$keypath") && [ -n "$th" ] && break
+        done
+        if [ -z "$th" ]; then
+            case ",$untrusted," in *",$ev,"*) ;; *) untrusted="${untrusted:+$untrusted,}$ev" ;; esac
+            continue
+        fi
+        case "$(_doctor_codex_baseline "$keypath" "$th" "$(_doctor_codex_entry_sha "$hooks_file" "$ev" "$g" "$h")")" in
+            changed) case ",$changed," in *",$ev,"*) ;; *) changed="${changed:+$changed,}$ev" ;; esac ;;
+            unrecorded) unrecorded=$((unrecorded + 1)) ;;
+        esac
+    done < <(jq -r '.hooks | to_entries[] | .key as $ev
+            | .value | to_entries[] | .key as $g
+            | (.value.hooks // []) | to_entries[] | "\($ev)\t\($g)\t\(.key)"' "$hooks_file" 2>/dev/null)
+    _doctor_codex_trust_report "$total" "$untrusted" "$changed" "$unrecorded" "$config"
+}
+
+# _doctor_codex_trust_report <total> <untrusted> <changed> <unrecorded> <config>
+_doctor_codex_trust_report() {
+    local total="$1" untrusted="$2" changed="$3" unrecorded="$4" config="$5" msg=""
+    if [ "$total" -eq 0 ]; then
+        _doctor_record "codex hooks" "warn" ".codex/hooks.json declares no hook commands, so Codex runs nothing -- regenerate with wv init-repo --agent=codex --codex-hooks --force"
+        return
+    fi
+    [ -z "$untrusted" ] || msg="pending trust for: ${untrusted//,/, } -- codex exec skips an untrusted hook without a message; trust them once in the Codex TUI (startup review or /hooks)"
+    [ -z "$changed" ] || msg="${msg:+$msg; }changed since Codex trusted them: ${changed//,/, } -- Codex skips an edited hook without a message; review them again in the Codex TUI (startup review or /hooks)"
+    if [ -n "$msg" ]; then
+        _doctor_record "codex hooks" "warn" ".codex/hooks.json $msg"
+    elif [ "$unrecorded" -gt 0 ]; then
+        _doctor_record "codex hooks" "pass" ".codex/hooks.json: Codex has a trust entry for all $total hook(s) at this path ($config); $unrecorded not checked for edits: the baseline $(_doctor_codex_baseline_file) is not writable"
+    else
+        _doctor_record "codex hooks" "pass" ".codex/hooks.json: Codex has a trust entry for all $total hook(s) at this path ($config), each unchanged since first seen trusted"
+    fi
+}
+
+# _doctor_codex_trusted_hash <config> <keypath> -- Codex's trusted_hash for one
+# hook key, or nothing when the key has no entry.
+_doctor_codex_trusted_hash() {
+    [ -f "$1" ] || return 0
+    awk -v hdr="[hooks.state.\"$2\"]" '
+        $0 == hdr { inside = 1; next }
+        inside && /^\[/ { exit }
+        inside && /^trusted_hash[[:space:]]*=/ { v = $0; sub(/^[^"]*"/, "", v); sub(/".*$/, "", v); print v; exit }
+    ' "$1"
+}
+
+# _doctor_codex_entry_sha <hooks file> <event> <group> <hook> -- sha256 of one
+# hook's entry: its group's matcher and the hook object, keys sorted.
+_doctor_codex_entry_sha() {
+    jq -cS --arg ev "$2" --arg g "$3" --arg h "$4" \
+        '($g | tonumber) as $g | ($h | tonumber) as $h
+        | {matcher: (.hooks[$ev][$g].matcher // null), hook: .hooks[$ev][$g].hooks[$h]}' "$1" 2>/dev/null \
+        | sha256sum | cut -d' ' -f1
+}
+
+# The baseline is durable beside the call and suite logs. A suite that names no
+# baseline writes into its own hot zone, never the user's file (the call-log
+# rule in wv-config.sh, wv-6b0f57).
+_doctor_codex_baseline_file() {
+    if [ -n "${WV_CODEX_TRUST_BASELINE:-}" ]; then
+        printf '%s\n' "$WV_CODEX_TRUST_BASELINE"
+    elif [ "${WV_TEST_SUITE:-}" = 1 ]; then
+        printf '%s\n' "${WV_HOT_ZONE:-${TMPDIR:-/tmp}}/codex-hook-trust.tsv"
+    else
+        printf '%s\n' "$HOME/.local/share/weave/codex-hook-trust.tsv"
+    fi
+}
+
+# _doctor_codex_baseline <keypath> <trusted hash> <entry sha> -- prints ok,
+# changed or unrecorded. A key not in the baseline, or one whose trusted_hash
+# moved (a person trusted it again), is recorded with the current entry; the
+# record is kept as it is while Codex's value stays, so an edit keeps warning
+# until the hook is trusted again.
+_doctor_codex_baseline() {
+    local keypath="$1" th="$2" es="$3" file rec tmp
+    file=$(_doctor_codex_baseline_file)
+    rec=$(awk -F'\t' -v k="$keypath" '$1 == k { print $2 "\t" $3; exit }' "$file" 2>/dev/null)
+    if [ -n "$rec" ] && [ "${rec%%$'\t'*}" = "$th" ]; then
+        [ "${rec#*$'\t'}" = "$es" ] && echo ok || echo changed
+        return 0
+    fi
+    tmp=$(mktemp "$(dirname "$file")/.codex-hook-trust.XXXXXX" 2>/dev/null) \
+        || { mkdir -p "$(dirname "$file")" 2>/dev/null && tmp=$(mktemp "$(dirname "$file")/.codex-hook-trust.XXXXXX" 2>/dev/null); } \
+        || { echo unrecorded; return 0; }
+    { awk -F'\t' -v k="$keypath" '$1 != k' "$file" 2>/dev/null; printf '%s\t%s\t%s\n' "$keypath" "$th" "$es"; } > "$tmp" \
+        && mv "$tmp" "$file" && { echo ok; return 0; }
+    rm -f "$tmp"
+    echo unrecorded
 }
 
 # _doctor_hook_budgets <config> -- "Event=secs ..." for every event a hook config
@@ -725,6 +904,38 @@ _doctor_check_hot_zone_orphans() {
     if [ "$orphan_count" -gt 0 ]; then
         _doctor_record "orphan hot-zones" "warn" \
             "$orphan_count unmatched dir(s) under $hz_parent — run: wv hotzone gc"
+    fi
+}
+
+# _doctor_check_pattern_rules — name each pattern rule file that is not applied
+# (wv-0e4a57). Since wv-d0e4d6 the loader skips a rule file that breaks the rule
+# contract and warns on stderr, so scan and list keep working and the broken
+# rule is quietly not applied. This asks 'wv quality patterns validate', the one
+# command that judges every candidate on its own, and reads its JSON; the rule
+# contract is not re-derived here. Runs only where a repository has a pattern
+# directory. The answer is read as a string, not through jq's exit status, which
+# jq 1.6 reports as 0 on empty input (wv-b12fb4): empty or unparsable output is
+# "could not evaluate", never pass.
+_doctor_check_pattern_rules() {
+    [ -d "${WEAVE_DIR:-}/patterns" ] || return 0
+    local -a py_args=()
+    [ -n "${WV_HOT_ZONE:-}" ] && py_args+=("--hot-zone" "$WV_HOT_ZONE")
+    py_args+=("patterns" "validate" "--json")
+    local json="" status=0 shape="" bad="" count=""
+    json=$(_wv_quality_python "${py_args[@]}" 2>/dev/null) || status=$?
+    shape=$(jq -r 'if type == "object" and ((.rules // null) | type) == "array" then "rules" else "other" end' <<< "$json" 2>/dev/null) || shape=""
+    if [ "$shape" != "rules" ]; then
+        _doctor_record "pattern-rules" "warn" "could not evaluate pattern rule files -- 'wv quality patterns validate' gave no result (exit $status); run it directly"
+        return 0
+    fi
+    bad=$(jq -r '[.rules[] | select(.status != "valid") | "\(.path) (\(.status): \(.error // "no detail"))"] | join("; ")' <<< "$json" 2>/dev/null) || bad=""
+    count=$(jq -r '[.rules[] | select(.status != "valid")] | length' <<< "$json" 2>/dev/null) || count=""
+    if [ -z "$count" ]; then
+        _doctor_record "pattern-rules" "warn" "could not evaluate pattern rule files -- the validate result could not be read; run 'wv quality patterns validate'"
+    elif [ "$count" -gt 0 ]; then
+        _doctor_record "pattern-rules" "warn" "$count pattern rule file(s) not applied: $bad — fix or remove each, then run 'wv quality patterns validate'"
+    else
+        _doctor_record "pattern-rules" "pass" "every pattern rule file is valid"
     fi
 }
 
@@ -1355,8 +1566,7 @@ _hook_common_unwired() {
     local root="$1" rel hook lib dir
     for rel in .claude/hooks/pre-action.sh .claude/hooks/session-start-context.sh \
         .claude/hooks/session-end-sync.sh .claude/hooks/stop-check.sh \
-        .claude/hooks/pre-compact-context.sh .claude/hooks/wv-touched-files.sh \
-        .claude/hooks/context-guard.sh; do
+        .claude/hooks/pre-compact-context.sh .claude/hooks/wv-touched-files.sh; do
         hook="$root/$rel"
         _hook_common_named "$hook" && continue
         if [ -f "$hook" ]; then
@@ -1489,6 +1699,7 @@ Inspect before explicitly authorizing per-node takeover with wv work ID --force;
             _doctor_record "node-state" "pass" "no deferral-metadata-vs-status divergence"
         fi
         _doctor_check_edge_invariants
+        _doctor_check_stranded_closes
     fi
 
     # 14a-bis. Duplicate-authoritative-memory risk: durable Claude/Codex harness
@@ -1581,6 +1792,9 @@ Inspect before explicitly authorizing per-node takeover with wv work ID --force;
         fi
     fi
 
+    # 14a-ter-ter. Invalid pattern-rule files (wv-0e4a57).
+    _doctor_check_pattern_rules
+
     # 14a-quinquies. Coaching guide advisories, mirroring the managed-pattern
     # family above. A project override under .weave/guides/ outranks the package
     # guide of the same id, so a stale override silently outranks an improved one
@@ -1619,7 +1833,7 @@ Inspect before explicitly authorizing per-node takeover with wv work ID --force;
         doctor --project-root "$REPO_ROOT" 2>/dev/null) || _gd_rc=$?
     if [ "$_gd_rc" -ne 0 ]; then
         _gd_err="guides doctor exited $_gd_rc: $(printf '%s' "$_gd_out" | jq -r '.error // "no error reported"' 2>/dev/null || printf 'no error reported')"
-    elif ! printf '%s' "$_gd_out" | jq -e '
+    elif ! printf '%s' "$_gd_out" | jq -se 'length == 1 and (.[0] |
             def str: type == "string" and length > 0;
             def count: type == "number" and . >= 0 and . == floor;
             (.canonical_types | count) and .canonical_types > 0
@@ -1631,7 +1845,7 @@ Inspect before explicitly authorizing per-node takeover with wv work ID --force;
                 and all(.[]; type == "object" and (.violation_type | str)
                     and (.language == null or (.language | str)) and (.error | str)))
             and all(.unused, .examples, .fallback_only; type == "array" and all(.[]; str))
-            and (.module | str)' >/dev/null 2>&1; then
+            and (.module | str))' >/dev/null 2>&1; then
         _gd_err="guides doctor printed no complete report"
     else
         _gd_want=$(readlink -f "$_gd_pypath/weave_quality/guides.py" 2>/dev/null || true)
@@ -1804,10 +2018,10 @@ Inspect before explicitly authorizing per-node takeover with wv work ID --force;
 # so a harness the repository never set up is not reported.
 _doctor_has_managed_projection() {
     local root="$1"
-    grep -rqsF -- 'WEAVE-MANAGED-SKILL' "$root/.claude/skills" && return 0
+    grep -rqsF -- 'WEAVE-MANAGED-SKILL' "$root/.claude/skills" "$root/.agents/skills" && return 0
     grep -qsF 'BEGIN WEAVE PROCEDURES' "$root/AGENTS.md" "$root/.github/copilot-instructions.md" && return 0
     [ -f "$root/.codex/weave.json" ] \
-        && jq -e '[.procedures[]? | select(.managed == true)] | length > 0' "$root/.codex/weave.json" >/dev/null 2>&1
+        && jq -se 'length == 1 and (.[0] | [.procedures[]? | select(.managed == true)] | length > 0)' "$root/.codex/weave.json" >/dev/null 2>&1
 }
 
 # _doctor_projection_stale <root> <config_dir> — print the managed surfaces of
@@ -1819,7 +2033,7 @@ _doctor_has_managed_projection() {
 _doctor_projection_stale() {
     local root="$1" config_dir="$2" tmp rel out stale=""
     tmp=$(mktemp -d) || return 0
-    for rel in .claude/skills .codex/weave.json .github/copilot-instructions.md AGENTS.md; do
+    for rel in .claude/skills .agents/skills .codex/weave.json .github/copilot-instructions.md AGENTS.md; do
         [ -e "$root/$rel" ] || continue
         mkdir -p "$tmp/$(dirname "$rel")"
         cp -a "$root/$rel" "$tmp/$rel"
@@ -1829,11 +2043,13 @@ _doctor_projection_stale() {
         printf '%s' "$out" | head -2 | tr '\n' ' '
         return 1
     fi
-    grep -rqsF -- 'WEAVE-MANAGED-SKILL' "$root/.claude/skills" \
-        && ! diff -rq "$tmp/.claude/skills" "$root/.claude/skills" >/dev/null 2>&1 \
-        && stale=".claude/skills"
+    for rel in .claude/skills .agents/skills; do
+        grep -rqsF -- 'WEAVE-MANAGED-SKILL' "$root/$rel" \
+            && ! diff -rq "$tmp/$rel" "$root/$rel" >/dev/null 2>&1 \
+            && stale="${stale:+$stale, }$rel"
+    done
     [ -f "$root/.codex/weave.json" ] \
-        && jq -e '[.procedures[]? | select(.managed == true)] | length > 0' "$root/.codex/weave.json" >/dev/null 2>&1 \
+        && jq -se 'length == 1 and (.[0] | [.procedures[]? | select(.managed == true)] | length > 0)' "$root/.codex/weave.json" >/dev/null 2>&1 \
         && ! cmp -s "$tmp/.codex/weave.json" "$root/.codex/weave.json" && stale="${stale:+$stale, }.codex/weave.json"
     for rel in .github/copilot-instructions.md AGENTS.md; do
         grep -qsF 'BEGIN WEAVE PROCEDURES' "$root/$rel" && ! cmp -s "$tmp/$rel" "$root/$rel" \
@@ -1971,6 +2187,21 @@ _doctor_check_surfaces() {
             "$_dr_hooks/reference-transaction" \
             "Weave reference-transaction" \
             "install -m 755 scripts/hooks/reference-transaction-weave.sh $_dr_hooks/reference-transaction"
+    fi
+
+    # 17a. Merge drivers .gitattributes names (wv-f0b143). A rule whose driver
+    # is not registered is an inactive adapter: git merges the file as text
+    # without a word. Read only; the setup steps named in the fix write it.
+    if [ -n "$git_root" ] && [ -f "$git_root/.gitattributes" ] \
+        && grep -qE '(^|[[:space:]])merge=' "$git_root/.gitattributes" 2>/dev/null; then
+        local _dr_missing _dr_fix="wv init-repo --update"
+        _dr_missing=$(wv_unregistered_merge_drivers "$git_root" | paste -sd, - | sed 's/,/, /g')
+        [ -f "$git_root/install.sh" ] && [ -f "$git_root/scripts/lib/wv-git-hook-signature.sh" ] && _dr_fix="./install.sh"
+        if [ -n "$_dr_missing" ]; then
+            _doctor_record "merge drivers" "warn" ".gitattributes names merge driver(s) with no git config driver: $_dr_missing; git merges those files as text. Fix: $_dr_fix"
+        else
+            _doctor_record "merge drivers" "pass" "every merge driver .gitattributes names is registered"
+        fi
     fi
 
     # 18. Ghost settings: check for chat.hooks.enabled in .vscode/settings.json

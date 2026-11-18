@@ -157,6 +157,8 @@ _ptu_fail_closed() {
 wv_ptu_edit_guard() (
     set -e; set +u; set +o pipefail
     _ptu_tag_hook
+    # The wait budget's start, without a fork (bash 5); empty on older bash.
+    _ptu_t0_us="${EPOCHREALTIME/[.,]/}"
     INPUT="$1"
     TOOL=$(echo "$INPUT" | jq -r '.tool_name // empty' 2>/dev/null)
     TOOL_INPUT=$(echo "$INPUT" | jq -r '.tool_input // empty' 2>/dev/null)
@@ -181,11 +183,19 @@ wv_ptu_edit_guard() (
     command -v _hc_refresh >/dev/null 2>&1 \
         || _ptu_fail_closed "wv-hook-common.sh could not be loaded (wv-376de3)"
     _hc_refresh
+    # The wv calls' budget runs from the guard's start (wv-3a8c06); without
+    # EPOCHREALTIME, _hc_wv starts it at the first call.
+    _HC_WV_START_US="${_ptu_t0_us:-}"
 
     # Liveness heartbeat (wv-4efe06): the last tool call's time. Session start
     # compares it with stop-check's last stop record to tell a session that died
     # mid-turn from one that stopped and then ended without SessionEnd.
-    [ -d "${_HC_HOT_ZONE:-}" ] && date +%s > "${_HC_HOT_ZONE}/.session_heartbeat" 2>/dev/null || true
+    # Per session (wv-9a867a): a peer in the same checkout keeps its own.
+    if [ -d "${_HC_HOT_ZONE:-}" ]; then
+        _ptu_hb="${_HC_HOT_ZONE}/.session_heartbeat"
+        declare -F wv_session_file >/dev/null && _ptu_hb=$(wv_session_file "$_HC_HOT_ZONE" heartbeat)
+        date +%s > "$_ptu_hb" 2>/dev/null || true
+    fi
 
     _hc_check_read_size "$TOOL" "$TOOL_INPUT" || exit 0
     # apply_patch is an edit whose paths are its patch headers: each one meets
@@ -285,9 +295,9 @@ wv_ptu_claim_guard() (
 
             NODE_TEXT=$(echo "$NODE_JSON" | jq -r '.text // ""' 2>/dev/null || echo "")
             HAS_SHIP_IT=$(echo "$NODE_JSON" | jq -r '.metadata | fromjson | has("done_criteria")' 2>/dev/null || echo "false")
-            # Pre-mortem analysis lands under "premortem" (the /pre-mortem skill writes it)
-            # or "risks" (legacy/--risks= label). Accept either so a node that already has a
-            # real premortem is not nagged for a missing static risk label (finding wv-cd5ddb).
+            # The pre-mortem procedure and --risks= both write "risks"; a "premortem" key
+            # (hand-written on older nodes, never written by a shipped procedure) is accepted
+            # too, so a node with a real assessment is not nagged (finding wv-cd5ddb).
             HAS_PRE_MORTEM=$(echo "$NODE_JSON" | jq -r '.metadata | fromjson | (has("risks") or has("premortem"))' 2>/dev/null || echo "false")
             NODE_ALIAS=$(echo "$NODE_JSON" | jq -r '.alias // ""' 2>/dev/null || echo "")
 
@@ -296,7 +306,7 @@ wv_ptu_claim_guard() (
             # wv-cd5ddb). Fail-open to an empty string so the claim is never errored or blocked.
             IMPACT_LINE=""
             IMPACT_JSON=$("$WV" impact --json "$NODE_ID" 2>/dev/null || true)
-            if [[ -n "$IMPACT_JSON" ]] && echo "$IMPACT_JSON" | jq -e . >/dev/null 2>&1; then
+            if [[ -n "$IMPACT_JSON" ]] && echo "$IMPACT_JSON" | jq -se 'length == 1 and (.[0] | .)' >/dev/null 2>&1; then
                 IMPACT_LINE=$(echo "$IMPACT_JSON" | jq -r '
                     (.impacted | length) as $n
                     | ([.impacted[].risk_score] | max // 0) as $maxr
@@ -320,13 +330,13 @@ wv_ptu_claim_guard() (
             # context on a claim that proceeds.
             required="" advisory=""
             if [[ "$HAS_SHIP_IT" == "false" ]]; then
-                required="${required}[1] done_criteria not set — run /ship-it, use --criteria= on wv add, or: wv update $NODE_ID --metadata='{\"done_criteria\":[...]}'. "
+                required="${required}[1] done_criteria not set (wv guide --procedure=quality-gate) — use --criteria= on wv add, or: wv update $NODE_ID --metadata='{\"done_criteria\":[...]}'. "
             fi
             if [[ -z "$NODE_ALIAS" ]]; then
                 required="${required}[2] alias not set — graph is unreadable without short names: wv update $NODE_ID --alias=<short-name>. "
             fi
             if [[ "$HAS_PRE_MORTEM" == "false" ]]; then
-                advisory="risks/premortem not set — consider /pre-mortem, or record them with --risks= on wv add or wv update $NODE_ID --metadata='{\"risks\":[...]}'."
+                advisory="risks/premortem not set — consider wv guide --procedure=pre-mortem, or record them with --risks= on wv add or wv update $NODE_ID --metadata='{\"risks\":[...]}'."
             fi
             # Each unmet gate is its own rule's decision (wv-664b7f).
             [[ "$HAS_SHIP_IT" == "false" ]] && _hc_observe claim_requires_done_criteria deny

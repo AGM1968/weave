@@ -695,7 +695,8 @@ from collections import defaultdict
 log_path = sys.argv[1]
 repo_filter = sys.argv[2]   # empty string = show all repos
 agg = defaultdict(lambda: {"runs": 0, "passed": 0, "failed": 0,
-                           "total_ms": 0, "_durs": [], "last_ts": "", "last_sha": ""})
+                           "total_ms": 0, "_durs": [], "_mono": [], "_legacy": [],
+                           "last_ts": "", "last_sha": ""})
 
 def p95(vals):
     if not vals:
@@ -724,6 +725,15 @@ try:
             a["passed" if ok else "failed"] += 1
             a["total_ms"] += dur
             a["_durs"].append(dur)
+            # The estimate's sample (wv-b17a85): runs timed on the monotonic
+            # clock, which leaves out a suspend. Rows from before rows carried
+            # a clock are kept apart; a row on any other clock is never used.
+            if dur > 0:
+                clock = e.get("clock")
+                if clock == "monotonic":
+                    a["_mono"].append(dur)
+                elif clock is None:
+                    a["_legacy"].append(dur)
             ts = str(e.get("ts", ""))
             if ts >= a["last_ts"]:           # ISO-8601 sorts lexicographically
                 a["last_ts"] = ts
@@ -732,10 +742,18 @@ except OSError as exc:
     print(json.dumps({"error": str(exc)}))
     sys.exit(1)
 
+def median(vals):
+    return sorted(vals)[len(vals) // 2] if vals else 0
+
 suites = []
 total_runs = 0
 for suite, a in agg.items():
     total_runs += a["runs"]
+    # A suite with any monotonic run is estimated from those alone; one with
+    # none yet falls back to its unlabelled history until it has one, so the
+    # cutover does not make every suite look unmeasured (launched first).
+    basis = "monotonic" if a["_mono"] else ("legacy" if a["_legacy"] else "none")
+    sample = a["_mono"] or a["_legacy"]
     suites.append({
         "suite": suite,
         "runs": a["runs"],
@@ -745,15 +763,15 @@ for suite, a in agg.items():
         "avg_ms": a["total_ms"] // a["runs"] if a["runs"] else 0,
         "p95_ms": p95(a["_durs"]),
         # Median of measured runs only: 0 is the "unmeasured" sentinel, and the
-        # gate's estimates read this field (wv-ffda33).
-        "p50_ms": sorted(d for d in a["_durs"] if d > 0)[len([d for d in a["_durs"] if d > 0]) // 2]
-                  if any(d > 0 for d in a["_durs"]) else 0,
+        # gate's estimates read this field (wv-ffda33). Its sample is
+        # estimate_basis: monotonic runs, else unlabelled legacy runs, never a
+        # run labelled wall, boottime or unknown (wv-b17a85).
+        "p50_ms": median(sample),
         # The same median over the last 10 measured runs (log order): an
         # all-history median lags a suite that is growing, and quoted
         # test-hooks.sh at ~173s while it was running 480-700s (wv-8138ec).
-        "recent_p50_ms": sorted([d for d in a["_durs"] if d > 0][-10:])[
-                             len([d for d in a["_durs"] if d > 0][-10:]) // 2]
-                         if any(d > 0 for d in a["_durs"]) else 0,
+        "recent_p50_ms": median(sample[-10:]),
+        "estimate_basis": basis,
         "last_ts": a["last_ts"],
         "last_sha": a["last_sha"],
     })

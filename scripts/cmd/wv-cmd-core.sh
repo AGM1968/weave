@@ -460,7 +460,7 @@ _add_parse_args() {
 }
 
 cmd_add() {
-    local text="$1"
+    local text="${1:-}"  # bare 'wv add' prints usage, not an unbound-variable crash
     local status="todo"
     local metadata="{}"
     local create_gh=false
@@ -483,7 +483,7 @@ cmd_add() {
 
     if [ -z "$text" ]; then
         echo -e "${RED}Error: text required${NC}" >&2
-        echo "Usage: wv add \"task description\" [--status=todo|active|done|blocked] [--parent=<id>] [--gh] [--force] [--standalone] [--criteria=\"c1|c2\"] [--risks=low|medium|high|none] [--kind=<kind>] [--verification-plan=\"...\"]" >&2
+        echo "Usage: wv add \"task description\" [--status=${VALID_STATUSES// /|}] [--parent=<id>] [--gh] [--force] [--standalone] [--criteria=\"c1|c2\"] [--risks=${VALID_RISK_LEVELS// /|}] [--kind=<kind>] [--verification-plan=\"...\"]" >&2
         return 1
     fi
 
@@ -765,7 +765,7 @@ cmd_add() {
 _memory_usage() {
     cat >&2 <<'EOF'
 Usage:
-  wv remember <text> [--kind=project] [--scope=repo] [--source-agent=name] [--supersedes=<id>] [--json]
+  wv remember <text> [--kind=project] [--scope=repo] [--source-agent=name] [--supersedes=<id>] [--exposure=rendered|graph-only] [--json]
   wv memory recall [--agent=current|all|name] [--json]
       # --agent is caller provenance only; recall is agent-agnostic and never filters.
       # The resolved caller is echoed on stderr; stdout is the same memory set for every agent.
@@ -778,6 +778,9 @@ Usage:
   wv memory review <active id> --verdict=graduate --reason=TEXT --target=<repo path> [--json]
       # target: .weave/procedures/<id>.md, .weave/guides/<id>.md, .weave/patterns/<id>.yaml or a tracked .md
   wv memory review --apply [--dry-run] [--json]
+  wv memory review <active id> --verdict=exposure --exposure=rendered|graph-only --reason=TEXT [--json]
+      # graph-only: left out of every projection and bootstrap's index; recall still returns it
+  wv memory exposure <id> [--json]
 EOF
 }
 
@@ -840,11 +843,20 @@ _memory_recall_json() {
 # full text is one command away: wv memory recall --agent=all --json.
 # Each entry keeps the {id, text, metadata.verified_at} shape every renderer
 # and the parity suite read; text is what the projection shows.
+#
+# metadata.exposure (wv-287b39) says whether a memory is rendered at all:
+# "rendered" (also when absent, so no existing memory leaves a projection
+# unasked) or "graph-only", which every renderer leaves out: the projection
+# files, bootstrap's index and the doctor's block budget all read this list.
+# Graph recall is not narrowed: wv memory recall, wv show, wv search and the
+# duplicate checks read the graph, not this index. A graph-only memory with
+# resident=full is still graph-only; resident only shapes a rendered entry.
 _memory_index_entries() {
     jq -c '
         def first_sentence: (capture("^(?<s>.*?(?<!e\\.g)(?<!i\\.e)(?<!etc)(?<!vs)(?<!cf)(?<!\\$)[.!?])(\\s|$)").s // .);
         def clip: if length > 160 then (.[0:160] | sub("\\s+\\S*$"; "")) + " …" else . end;
         [ .[] | (.metadata // {}) as $m
+          | select(($m.exposure // "rendered") != "graph-only")
           | ($m.resident == "full") as $full
           | {
               id,
@@ -863,7 +875,7 @@ _memory_markdown_block() {
             "",
             "Authority: weave graph. Capture records dynamic agent provenance, but recall is agent-agnostic. Lifecycle field: metadata.mem_status. Recall: `wv memory recall --agent=all --json`. Capture: `wv remember <text>`.",
             "",
-            "Each line is an index entry. Read a memory in full with `wv memory recall --agent=all --json` or `wv show <id>` before relying on it.",
+            "Each line is an index entry. Read a memory in full with `wv memory recall --agent=all --json` or `wv show <id>` before relying on it. Recall also returns the graph-only memories this index leaves out.",
             "",
             (if length == 0 then "_No active graph memory._" else (.[] | "- [`\(.id)`] \(.text) (verified: \(.metadata.verified_at // "unknown"))") end),
             "<!-- ── END WEAVE:MEMORY ── -->"
@@ -1668,6 +1680,66 @@ _memory_crystallize_finding() {
     echo "$id"
 }
 
+# ── Exposure (wv-287b39) ─────────────────────────────────────────────────────
+# metadata.exposure: "rendered" (the default, also when absent) or "graph-only".
+# A graph-only memory is left out of every rendered surface (_memory_index_entries)
+# and stays in graph recall. Nothing sets it implicitly: an existing memory leaves
+# the projections only through an applied review verdict (--verdict=exposure),
+# which records who chose it, when and why; a new one may be captured graph-only.
+_memory_exposure_valid() {
+    case "$1" in
+        rendered|graph-only) return 0 ;;
+    esac
+    echo -e "${RED}Error: exposure must be rendered or graph-only, got '$1'${NC}" >&2
+    return 1
+}
+
+# wv memory exposure <id> [--json]: show one memory's exposure and, when a
+# review verdict set it, who chose it, when and why. Changing it is a review
+# verdict (wv memory review <id> --verdict=exposure), never a direct write:
+# what the projections deliver changes only through a recorded decision.
+_memory_exposure_command() {
+    local id="" format="text" arg
+    for arg in "$@"; do
+        case "$arg" in
+            --json) format="json" ;;
+            --help|-h) _memory_usage; return 0 ;;
+            --*)
+                echo -e "${RED}Error: unknown option $arg${NC}" >&2
+                _memory_usage
+                return 1
+                ;;
+            *)
+                if [ -z "$id" ]; then id="$arg"
+                else
+                    echo -e "${RED}Error: wv memory exposure only shows; change it with: wv memory review $id --verdict=exposure --exposure=$arg --reason=TEXT${NC}" >&2
+                    return 1
+                fi
+                ;;
+        esac
+    done
+    if [ -z "$id" ] || ! validate_id "$id" 2>/dev/null; then
+        echo -e "${RED}Error: wv memory exposure needs a memory id${NC}" >&2
+        _memory_usage
+        return 1
+    fi
+    wv_require_graph || return 1
+    local meta
+    meta=$(db_query_json "SELECT metadata FROM nodes WHERE id='$id';" 2>/dev/null \
+        | jq -c '.[0].metadata // empty | fromjson' 2>/dev/null || true)
+    if [ -z "$meta" ] || [ "$(jq -r '.node_kind // .type // ""' <<< "$meta")" != "memory" ]; then
+        echo -e "${RED}Error: $id is not a memory node${NC}" >&2
+        return 1
+    fi
+    if [ "$format" = "json" ]; then
+        jq -c --arg id "$id" '{id: $id, exposure: (.exposure // "rendered"),
+            by: (.exposure_by // null), at: (.exposure_at // null), reason: (.exposure_reason // null)}' <<< "$meta"
+    else
+        jq -r --arg id "$id" '"\($id) exposure: \(.exposure // "rendered")"
+            + (if .exposure_at then " (set \(.exposure_at) by \(.exposure_by // "unknown"): \(.exposure_reason // "")"  + ")" else "" end)' <<< "$meta"
+    fi
+}
+
 cmd_remember() {
     local text=""
     local kind="project"
@@ -1675,10 +1747,12 @@ cmd_remember() {
     local source_agent=""
     local format="text"
     local supersedes=""
+    local exposure=""
 
     while [ $# -gt 0 ]; do
         case "$1" in
             --kind=*) kind="${1#*=}" ;;
+            --exposure=*) exposure="${1#*=}" ;;
             --supersedes=*) supersedes="${1#*=}" ;;
             --scope=*) scope="${1#*=}" ;;
             --source-agent=*) source_agent="${1#*=}" ;;
@@ -1709,6 +1783,10 @@ cmd_remember() {
         return 1
     fi
 
+    if [ -n "$exposure" ] && ! _memory_exposure_valid "$exposure"; then
+        return 1
+    fi
+
     if [ -z "$source_agent" ]; then
         source_agent=$(_memory_operating_agent)
     fi
@@ -1736,6 +1814,10 @@ cmd_remember() {
             echo -e "${RED}Error: $supersedes is $(jq -r '.mem_status' <<< "$old_meta"), not active; supersede the live memory in its chain${NC}" >&2
             return 1
         fi
+        # A changed claim keeps where its predecessor was shown unless the
+        # caller says otherwise: superseding must not move a memory into or
+        # out of the projections as a side effect (wv-287b39).
+        [ -n "$exposure" ] || exposure=$(jq -r '.exposure // ""' <<< "$old_meta")
     fi
 
     local id metadata text_sql metadata_sql now
@@ -1747,6 +1829,7 @@ cmd_remember() {
         --arg source_agent "$source_agent" \
         --arg now "$now" \
         --arg supersedes "$supersedes" \
+        --arg exposure "$exposure" \
         '{
             type: "memory",
             node_kind: "memory",
@@ -1756,7 +1839,8 @@ cmd_remember() {
             source_agent: $source_agent,
             source_kind: "remember",
             verified_at: $now
-        } + (if $supersedes != "" then {supersedes: $supersedes} else {} end)')
+        } + (if $supersedes != "" then {supersedes: $supersedes} else {} end)
+          + (if $exposure != "" then {exposure: $exposure} else {} end)')
     text_sql=$(sql_escape "$text")
     metadata_sql=$(sql_escape "$metadata")
 
@@ -1805,13 +1889,18 @@ cmd_remember() {
 #            the repository surface that now carries the lesson; apply checks
 #            the target again and sets mem_status=graduated with graduated_to,
 #            which drops the memory from every projection but not from recall
-_MEMORY_REVIEW_VERDICTS="promote merge reject verify graduate"
+#   exposure the other verdict on an ACTIVE memory (wv-287b39): --exposure=
+#            graph-only|rendered; apply sets metadata.exposure and records
+#            who chose it, when and why (exposure_by/_at/_reason), so a memory
+#            leaves or rejoins the projections only through a recorded verdict
+_MEMORY_REVIEW_VERDICTS="promote merge reject verify graduate exposure"
 
 _memory_review_command() {
-    local id="" verdict="" reason="" target="" apply=false dry=false format="text"
+    local id="" verdict="" reason="" target="" exposure="" apply=false dry=false format="text"
     while [ $# -gt 0 ]; do
         case "$1" in
             --verdict=*) verdict="${1#*=}" ;;
+            --exposure=*) exposure="${1#*=}" ;;
             --reason=*) reason="${1#*=}" ;;
             --target=*) target="${1#*=}" ;;
             --apply) apply=true ;;
@@ -1832,8 +1921,8 @@ _memory_review_command() {
     db_ensure
 
     if [ "$apply" = true ]; then
-        if [ -n "$id$verdict$reason$target" ]; then
-            echo -e "${RED}Error: --apply applies the recorded verdicts; it takes no id, verdict, reason or target${NC}" >&2
+        if [ -n "$id$verdict$reason$target$exposure" ]; then
+            echo -e "${RED}Error: --apply applies the recorded verdicts; it takes no id, verdict, reason, target or exposure${NC}" >&2
             return 1
         fi
         _memory_review_apply "$dry" "$format"
@@ -1862,14 +1951,14 @@ _memory_review_command() {
     fi
     local mem_status reviewable=candidate
     mem_status=$(jq -r '.mem_status // "active"' <<< "$meta")
-    [ "$verdict" = graduate ] && reviewable=active
+    case "$verdict" in graduate|exposure) reviewable=active ;; esac
     if [ "$mem_status" != "$reviewable" ]; then
         echo -e "${RED}Error: $id is $mem_status, not $reviewable; --verdict=$verdict applies to $reviewable memories${NC}" >&2
         return 1
     fi
     # A memory promoted by review turns active with its verdict applied, and may
     # graduate later: that earlier review does not block this one.
-    if [ "$verdict" != graduate ] && [ "$(jq -r '.review.applied // false' <<< "$meta")" = true ]; then
+    if [ "$reviewable" != active ] && [ "$(jq -r '.review.applied // false' <<< "$meta")" = true ]; then
         echo -e "${RED}Error: $id's verdict was already applied${NC}" >&2
         return 1
     fi
@@ -1886,11 +1975,23 @@ _memory_review_command() {
         echo -e "${RED}Error: --target goes with --verdict=merge or --verdict=graduate${NC}" >&2
         return 1
     fi
+    if [ "$verdict" = exposure ]; then
+        _memory_exposure_valid "$exposure" || return 1
+        if [ "$exposure" = "$(jq -r '.exposure // "rendered"' <<< "$meta")" ]; then
+            echo -e "${RED}Error: $id is already $exposure${NC}" >&2
+            return 1
+        fi
+    elif [ -n "$exposure" ]; then
+        echo -e "${RED}Error: --exposure goes with --verdict=exposure${NC}" >&2
+        return 1
+    fi
 
     local patch
-    patch=$(jq -nc --arg v "$verdict" --arg r "$reason" --arg t "$target" \
+    patch=$(jq -nc --arg v "$verdict" --arg r "$reason" --arg t "$target" --arg e "$exposure" \
         --arg by "$(resolve_agent_id 2>/dev/null || echo unknown)" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-        '{review: ({verdict: $v, reason: $r, by: $by, at: $at, applied: false} + (if $t == "" then {} else {target: $t} end))}')
+        '{review: ({verdict: $v, reason: $r, by: $by, at: $at, applied: false}
+            + (if $t == "" then {} else {target: $t} end)
+            + (if $e == "" then {} else {exposure: $e} end))}')
     # Replace the review object whole: a merge into the old one would keep a
     # stale target after a change of verdict.
     _memory_patch_metadata "$id" '{"review": null}'
@@ -1898,7 +1999,7 @@ _memory_review_command() {
     if [ "$format" = json ]; then
         jq -c --arg id "$id" '{id: $id} + .' <<< "$patch"
     else
-        echo "✓ Recorded $verdict for $id${target:+ -> $target}; apply with: wv memory review --apply"
+        echo "✓ Recorded $verdict for $id${target:+ -> $target}${exposure:+ -> $exposure}; apply with: wv memory review --apply"
     fi
     auto_sync_or_warn
 }
@@ -1914,11 +2015,11 @@ _memory_review_apply() {
             WHERE $(wv_kind_sql) = 'memory'
               AND (json_extract(metadata,'\$.mem_status') = 'candidate'
                    OR (COALESCE(json_extract(metadata,'\$.mem_status'),'active') = 'active'
-                       AND json_extract(metadata,'\$.review.verdict') = 'graduate'))
+                       AND json_extract(metadata,'\$.review.verdict') IN ('graduate', 'exposure')))
               AND json_extract(metadata,'\$.review.verdict') IS NOT NULL
               AND COALESCE(json_extract(metadata,'\$.review.applied'), 0) = 0
             ORDER BY id;" 2>/dev/null \
-        | jq -r '.[] | (.metadata | fromjson? // {}) as $m | [.id, $m.review.verdict, ($m.review.reason // "" | gsub("\t";" ")), ($m.review.target // "")] | @tsv')
+        | jq -r '.[] | (.metadata | fromjson? // {}) as $m | [.id, $m.review.verdict, ($m.review.reason // "" | gsub("\t";" ")), ($m.review.target // $m.review.exposure // "")] | @tsv')
     for row in "${rows[@]}"; do
         IFS=$'\t' read -r cid verdict reason target <<< "$row"
         [ -n "$cid" ] || continue
@@ -1953,6 +2054,19 @@ _memory_review_apply() {
                 elif [ "$dry" != true ]; then
                     _memory_patch_metadata "$cid" "$(jq -nc --arg g "$target" --arg r "$reason" --arg t "$now" \
                         '{mem_status: "graduated", graduated_to: $g, graduated_reason: $r, graduated_at: $t, review: {applied: true, applied_at: $t}}')"
+                fi
+                ;;
+            exposure)
+                # target carries the exposure value (see the row query). The
+                # receipt fields outlive the review object a later verdict replaces.
+                if ! _memory_exposure_valid "$target" 2>/dev/null; then
+                    status="refused: unknown exposure '$target'; review again"
+                elif [ "$dry" != true ]; then
+                    _memory_patch_metadata "$cid" "$(db_query_json "SELECT metadata FROM nodes WHERE id='$cid';" 2>/dev/null \
+                        | jq -c --arg e "$target" --arg r "$reason" --arg t "$now" \
+                            '(.[0].metadata | fromjson? // {}) as $m
+                            | {exposure: $e, exposure_reason: $r, exposure_at: $t, exposure_by: ($m.review.by // "unknown"),
+                               review: {applied: true, applied_at: $t}}')"
                 fi
                 ;;
             verify)
@@ -2291,6 +2405,9 @@ cmd_memory() {
             ;;
         review)
             _memory_review_command "$@"
+            ;;
+        exposure)
+            _memory_exposure_command "$@"
             ;;
         crystallize)
             _memory_crystallize_command "$@"
@@ -4319,6 +4436,39 @@ _work_claim_held_by_other() {
     fi
 }
 
+# ─── _work_retires_sweep ─────────────────────────────────────────────────────
+# A node that retires or moves an entity declares it in metadata.retires
+# ("skill:<name>", or an array of them). Claiming it lists every tracked
+# reference to the bare name, word-bounded, across the surfaces that pin
+# shipped names, before any edit (wv-dfdc21). Origin wv-d231af: a sweep on
+# skills/trails missed a test pinning the bare name 'trails', found only at
+# the gate. Output goes to stderr so --json and --quiet stdout are unchanged.
+_work_retires_sweep() {
+    local id="$1" entry name hits
+    local -a entries=()
+    mapfile -t entries < <(db_query "SELECT value FROM nodes, json_each(nodes.metadata, '\$.retires')
+        WHERE nodes.id='$(sql_escape "$id")' AND json_valid(nodes.metadata);" 2>/dev/null)
+    [ "${#entries[@]}" -gt 0 ] || return 0
+    git rev-parse --is-inside-work-tree >/dev/null 2>&1 || {
+        echo -e "${YELLOW}⚠ $id declares retires but this is not a git work tree; no reference sweep${NC}" >&2
+        return 0
+    }
+    for entry in "${entries[@]}"; do
+        name="${entry#*:}"
+        if ! [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo -e "${YELLOW}⚠ retires entry '$entry' names no sweepable entity; expected kind:<name>${NC}" >&2
+            continue
+        fi
+        hits=$(git grep -n -w -F -e "$name" -- tests install.sh templates scripts 2>/dev/null || true)
+        if [ -z "$hits" ]; then
+            echo -e "${CYAN}Retires $entry: no references to '$name' in tests/ install.sh templates/ scripts/${NC}" >&2
+        else
+            echo -e "${CYAN}Retires $entry: $(printf '%s\n' "$hits" | wc -l) reference(s) to '$name' - review each before editing:${NC}" >&2
+            printf '%s\n' "$hits" >&2
+        fi
+    done
+}
+
 cmd_work() {
     # Check for incomplete operations before claiming new work
     # Auto-clear if the stale operation is >30 minutes old (likely a failed sync from a prior session)
@@ -4504,6 +4654,7 @@ cmd_work() {
     # within WV_SYNC_INTERVAL, and the throttle would skip it. Its output goes
     # to stderr: --json and --quiet print machine-read stdout below.
     auto_sync_or_warn --force >&2
+    _work_retires_sweep "$id"
 
     if [ "$format" = "json" ]; then
         # Structured output for runtime consumption
@@ -5141,8 +5292,8 @@ _render_trails() {
     at=$(echo "$latest" | jq -r '.at // empty' 2>/dev/null)
 
     # Staleness: flag when the latest entry predates the current session start.
-    local stale=""
-    local snapshot="$WV_HOT_ZONE/.session_snapshot"
+    local stale="" snapshot
+    snapshot=$(wv_session_file "$WV_HOT_ZONE" snapshot)
     if [ -n "$at" ] && [ -f "$snapshot" ]; then
         local start_ts entry_ts
         IFS=$'\t' read -r start_ts _ < "$snapshot"
@@ -5250,11 +5401,53 @@ _show_close_json() {
     fi
 }
 
+# _show_actors_json <id> — who acted on a node, for wv show --actors (wv-8c24e6).
+# Graph state cannot answer it: nodes.lineage_actor is the LAST writer (CAS
+# ordering, not authorship; bulk stamps overwrote most of it) and a closed node
+# keeps no claimed_by. The append-only Delta v2 log keeps one actor_id per
+# operation, bound into its operation_sha256, so this reads that log. Coverage
+# is the v2 log present in .weave/deltas; earlier history reports nothing.
+# A claim is a transition into active, a close a transition into done; a full
+# row re-emitted for an already-closed node is not a second close.
+_show_actors_json() {
+    local id="$1" dir="${WEAVE_DIR:-.weave}/deltas" files
+    files=$(grep -rlF --include='*.json' -- "\"$id\"" "$dir" 2>/dev/null || true)
+    files=$(grep -F -- '/v2/' <<< "$files" || true)
+    if [ -z "$files" ]; then
+        jq -nc '{source: "delta-v2-log", events: [], created_by: null, claimed_by: [],
+                 closed_by: null, reason: "no Delta v2 operation names this node"}'
+        return 0
+    fi
+    # shellcheck disable=SC2086  # paths come from grep -l over WEAVE_DIR; no spaces
+    printf '%s\n' "$files" | xargs jq -c --arg id "$id" '
+        ((input_filename | capture("deltas/(?<d>[0-9]{4}-[0-9]{2}-[0-9]{2})/") | .d) // null) as $day
+        | (.payload | if type == "string" then fromjson else . end) as $p
+        | select($p.entity.id == $id and $p.entity.kind == "node")
+        | $p.mutation as $m
+        | {seq: .actor_sequence, actor: .actor_id, day: $day, op: $m.kind,
+           status: (if $m.kind == "node_patch" then ($m.fields.status.value // null)
+                    elif $m.kind == "node_create" then ($m.row.status // null)
+                    else null end)}' 2>/dev/null \
+    | jq -sc '
+        (sort_by(.seq, .actor)) as $e
+        | (reduce $e[] as $x ({prev: null, claims: [], closes: []};
+              (if $x.status == "active" and .prev != "active" then .claims += [$x] else . end)
+              | (if $x.status == "done" and .prev != "done" then .closes += [$x] else . end)
+              | (if $x.status != null then .prev = $x.status else . end))) as $t
+        | {source: "delta-v2-log",
+           events: $e,
+           created_by: ([$e[] | select(.op == "node_create")][0] | if . == null then null else {actor, seq, day} end),
+           claimed_by: [$t.claims[] | {actor, seq, day}],
+           closed_by: ($t.closes | if length == 0 then null else (.[-1] | {actor, seq, day}) end),
+           since: ([$e[].day | select(. != null)] | min)}'
+}
+
 cmd_show() {
     local id="${1:-}"
     local format="text"
     local mode_arg=""
     local close_time=false
+    local actors=false
 
     shift || true
     while [ $# -gt 0 ]; do
@@ -5263,6 +5456,7 @@ cmd_show() {
             --json-v2) format="json-v2" ;;
             --mode=*)  mode_arg="${1#--mode=}" ;;
             --close-time) close_time=true ;;
+            --actors) actors=true ;;
             -*) _wv_reject_arg show "$1"; return 1 ;;  # wv-016983
         esac
         shift
@@ -5293,13 +5487,34 @@ cmd_show() {
         if [ "$close_time" = true ]; then
             _result=$(jq -c --argjson c "$(_show_close_json "$id")" 'map(. + {close_time: $c})' <<< "$_result")
         fi
+        if [ "$actors" = true ]; then
+            # The actors object grows with every operation on the node, so it
+            # travels by file, not argv (MAX_ARG_STRLEN; test-argjson-payload).
+            local _af
+            _af=$(mktemp) || return 1
+            _show_actors_json "$id" > "$_af"
+            _result=$(jq -c --slurpfile a "$_af" 'map(. + {actors: $a[0]})' <<< "$_result")
+            rm -f "$_af"
+        fi
         if [ "$mode" = "bootstrap" ] || [ "$mode" = "discover" ]; then
             echo "$_result" | jq '[.[] | del(.metadata.current_intent)]'
         else
             echo "$_result"
         fi
     elif [ "$format" = "json" ]; then
-        if [ "$close_time" = true ]; then
+        if [ "$actors" = true ]; then
+            # Unbounded (one event per operation): by file, not argv.
+            local _af
+            _af=$(mktemp) || return 1
+            _show_actors_json "$id" > "$_af"
+            if [ "$close_time" = true ]; then
+                db_query_json "$query" | jq -c --argjson c "$(_show_close_json "$id")" --slurpfile a "$_af" \
+                    'if .[0] then .[0] + {close_time: $c, actors: $a[0]} else empty end'
+            else
+                db_query_json "$query" | jq -c --slurpfile a "$_af" 'if .[0] then .[0] + {actors: $a[0]} else empty end'
+            fi
+            rm -f "$_af"
+        elif [ "$close_time" = true ]; then
             db_query_json "$query" | jq -c --argjson c "$(_show_close_json "$id")" '(.[0] // empty) + {close_time: $c}'
         else
             db_query_json "$query" | jq -c '.[0] // empty'
@@ -5348,6 +5563,14 @@ cmd_show() {
                 else
                     echo -e "${CYAN}Closed:${NC}   not closed"
                 fi
+            fi
+            if [ "$actors" = true ]; then
+                echo -e "${CYAN}Actors:${NC}   $(_show_actors_json "$id" | jq -r '
+                    if (.events | length) == 0 then "none recorded (\(.reason))"
+                    else ("created by \(.created_by.actor // "unknown")"
+                          + "; claimed by " + ([.claimed_by[].actor] | unique | if length == 0 then "nobody" else join(", ") end)
+                          + "; closed by " + (.closed_by.actor // "not closed")
+                          + " [Delta v2 log since \(.since // "?")]") end')"
             fi
         done
         
@@ -5672,7 +5895,7 @@ validate_update_metadata_json() {
     local metadata_source="$2"
     local jq_error=""
 
-    if ! jq_error=$(printf '%s' "$metadata_payload" | jq -e '.' 2>&1 >/dev/null); then
+    if ! jq_error=$(printf '%s' "$metadata_payload" | jq -se 'length == 1 and (.[0] | .)' 2>&1 >/dev/null); then
         echo -e "${RED}Error: invalid JSON in ${metadata_source}${NC}" >&2
         if [ -n "$jq_error" ]; then
             echo "$jq_error" >&2
@@ -5876,8 +6099,8 @@ cmd_update() {
     # stored metadata whenever jq failed.)
     if [ -n "$kind_flag" ]; then
         [ "$metadata_supplied" = true ] || metadata_patch='{}'
-        if ! printf '%s' "$metadata_patch" | jq -e --arg k "$kind_flag" \
-            '[.node_kind, .type] | map(select(. != null)) | all(. == $k)' >/dev/null 2>&1; then
+        if ! printf '%s' "$metadata_patch" | jq -se --arg k "$kind_flag" \
+            'length == 1 and (.[0] | [.node_kind, .type] | map(select(. != null)) | all(. == $k))' >/dev/null 2>&1; then
             echo -e "${RED}Error: --kind=$kind_flag disagrees with the kind in --metadata${NC}" >&2
             return 1
         fi
@@ -6116,7 +6339,7 @@ _parse_allowed_tools() {
 # ═══════════════════════════════════════════════════════════════════════════
 
 cmd_quick() {
-    local text="$1"
+    local text="${1:-}"  # bare 'wv quick' prints usage, not an unbound-variable crash
     local learning="trivial fix"
     local metadata="{}"
 

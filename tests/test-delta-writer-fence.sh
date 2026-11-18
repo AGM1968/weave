@@ -130,6 +130,55 @@ check "...a state.sql holding both edits" bash -c \
 rm -rf "$R/.hot"; "$WV" load >/dev/null 2>&1
 check "...that a cold load reproduces" test "$(text_of "$N_PEER")/$(text_of "$N_LOCAL")" = "peer edit/unsynced edit"
 
+# ── unloaded deltas from elsewhere (wv-287e89) ──────────────────────────────
+# No compaction this time: a peer syncs and the clone pulls the peer's new
+# delta files and state.sql, but its live database never replays them. First
+# seen in a two-session run on 2026-11-17: the clone's next sync wrote a
+# state.sql without the peer's node.
+echo "--- unloaded deltas ---"
+U="$T/uclone"; mkdir -p "$U"; use "$U"
+git init -q && git config user.email t@t && git config user.name t
+"$WV" init >/dev/null 2>&1
+N_U=$(add_node "clone node")
+"$WV" sync >/dev/null 2>&1
+"$WV" load >/dev/null 2>&1
+"$WV" update "$N_U" --text="clone own edit" >/dev/null 2>&1
+rc=0; "$WV" sync >/dev/null 2>&1 || rc=$?
+check "the clone's own published deltas do not fence it" bash -c \
+    "[ $rc -eq 0 ] && grep -q 'clone own edit' '$U/.weave/state.sql'"
+
+UP="$T/upeer"; cp -a "$U" "$UP"; rm -rf "$UP/.hot"; use "$UP"
+"$WV" load >/dev/null 2>&1
+before_u=$(deltas)
+N_X=$(add_node "peer node X")
+"$WV" sync >/dev/null 2>&1
+mapfile -t new_u < <(comm -13 <(printf '%s\n' "$before_u") <(deltas))
+check "peer: its sync published delta files" test "${#new_u[@]}" -gt 0
+
+use "$U"
+for f in "${new_u[@]}"; do mkdir -p "$(dirname "$U/${f#"$UP/"}")"; cp "$f" "$U/${f#"$UP/"}"; done
+cp "$UP/.weave/state.sql" "$UP/.weave/nodes.jsonl" "$UP/.weave/edges.jsonl" "$U/.weave/"
+cp "$U/.weave/state.sql" "$T/upulled.sql"
+check "clone: its database lacks the peer's node" test -z "$(text_of "$N_X")"
+
+d2=$(deltas)
+out=$("$WV" update "$N_U" --text="clone after pull" 2>&1)
+check "auto_sync after the pull: state.sql is not written" cmp -s "$U/.weave/state.sql" "$T/upulled.sql"
+check "...it says the deltas came from elsewhere" grep -q "came from elsewhere" <<< "$out"
+check "...and the change is published as a delta" bash -c \
+    "comm -13 <(printf '%s\n' \"\$1\") <(find '$U/.weave/deltas' -type f | LC_ALL=C sort) | xargs -r grep -l 'clone after pull' | grep -q ." _ "$d2"
+rc=0; out=$("$WV" sync 2>&1) || rc=$?
+check "wv sync after the pull: refused" test "$rc" -ne 0
+check "...naming a peer delta file" grep -qF -- "${new_u[0]##*/}" <<< "$out"
+check "...state.sql is still the pulled one" cmp -s "$U/.weave/state.sql" "$T/upulled.sql"
+
+"$WV" load >/dev/null 2>&1
+check "wv load gives the peer's node" test "$(text_of "$N_X")" = "peer node X"
+check "...and keeps the clone's edit" test "$(text_of "$N_U")" = "clone after pull"
+rc=0; "$WV" sync >/dev/null 2>&1 || rc=$?
+check "after the load wv sync writes a state.sql holding both" bash -c \
+    "[ $rc -eq 0 ] && grep -q 'peer node X' '$U/.weave/state.sql' && grep -q 'clone after pull' '$U/.weave/state.sql'"
+
 echo ""
 echo "$pass/$run passed"
 [ "$pass" -eq "$run" ]

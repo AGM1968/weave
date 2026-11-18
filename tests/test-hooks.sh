@@ -142,7 +142,7 @@ setup_test_env() {
     ln -sf "$PROJECT_ROOT/scripts/lib/wv-resolve-project.sh" "$TEST_DIR/project/scripts/lib/wv-resolve-project.sh"
     ln -sf "$PROJECT_ROOT/scripts/lib/wv-resolve-runtime.sh" "$TEST_DIR/project/scripts/lib/wv-resolve-runtime.sh"
 
-    # Init git repo (needed by stop-check and context-guard)
+    # Init git repo (needed by stop-check)
     cd "$TEST_DIR/project"
     git init -q
     # Disable GPG signing for test repo (global gpgsign=true would fail in CI/SSH)
@@ -562,7 +562,7 @@ set -e
 assert_exit_code "0" "$EXIT_CODE" "pre-claim: exits 0 (soft deny) for real Bash payload"
 assert_contains "$OUTPUT" "hookSpecificOutput" "pre-claim: uses canonical hookSpecificOutput schema"
 assert_contains "$OUTPUT" "permissionDecision" "pre-claim: contains permissionDecision field"
-assert_contains "$OUTPUT" "/ship-it" "pre-claim: suggests ship-it when done_criteria absent"
+assert_contains "$OUTPUT" "procedure=quality-gate" "pre-claim: points to the quality-gate procedure when done_criteria absent"
 # Combined preflight (wv-7c28f4): ALL unmet gates in ONE message, not serial discovery.
 # ID is missing criteria AND alias AND risks — every gate must appear in a single deny.
 assert_contains "$OUTPUT" "alias" "pre-claim combined: alias gate reported alongside done_criteria"
@@ -2831,77 +2831,11 @@ OUTPUT=$(bash "$HOOKS_DIR/pre-compact-context.sh" 2>/dev/null || true)
 assert_contains "$OUTPUT" "Active:" "lifecycle: pre-compact reports active work during session"
 
 # Put back the real wv the lifecycle stub replaced: later sections reach the
-# project's scripts/wv first, and context-guard now asks it for the policy
-# (wv-f757a4) -- against the stub every policy check read "unknown".
+# project's scripts/wv first.
 ln -sf "$WV" "$TEST_DIR/project/scripts/wv"
 
-# ============================================================
-# Context-guard tests (S1.5 + S1.6)
-# ============================================================
-echo ""
-echo "=== Context Guard ==="
-
-# Reset to test project
-cd "$TEST_DIR/project"
-export POLICY_CACHE="$TEST_DIR/.context_policy"
-rm -f "$POLICY_CACHE" 2>/dev/null || true
-
-# Create some tracked files so git ls-files has something
-for i in $(seq 1 5); do echo "x=1" > "mod${i}.py"; done
-git add -A && git commit -m "add test files" -q
-
-# 1. Fresh run → should produce a policy (small repo = HIGH)
-set +e
-OUTPUT=$(bash "$HOOKS_DIR/context-guard.sh" 2>/dev/null)
-EXIT_CODE=$?
-set -e
-assert_exit_code "0" "$EXIT_CODE" "context-guard: exits 0"
-assert_contains "$OUTPUT" "policy" "context-guard: emits policy line"
-
-# 2. Cache file should exist after first run
-TESTS_RUN=$((TESTS_RUN + 1))
-if [ -f "$POLICY_CACHE" ]; then
-    echo -e "${GREEN}✓${NC} context-guard: cache file created"
-    TESTS_PASSED=$((TESTS_PASSED + 1))
-else
-    echo -e "${RED}✗${NC} context-guard: cache file created"
-    echo "  Expected $POLICY_CACHE to exist"
-    TESTS_FAILED=$((TESTS_FAILED + 1))
-fi
-
-# 3. Cached policy matches first run
-CACHED_POLICY=$(head -1 "$POLICY_CACHE" 2>/dev/null || echo "")
-assert_equals "HIGH" "$CACHED_POLICY" "context-guard: small repo yields HIGH policy"
-
-# 4. Cache TTL expiry — backdate cache mtime, should recompute
-touch -d "2 hours ago" "$POLICY_CACHE" 2>/dev/null || touch -t 202001010000 "$POLICY_CACHE"
-set +e
-OUTPUT2=$(bash "$HOOKS_DIR/context-guard.sh" 2>/dev/null)
-EXIT_CODE2=$?
-set -e
-assert_exit_code "0" "$EXIT_CODE2" "context-guard: exits 0 after stale cache"
-# Cache should be refreshed (mtime within last minute)
-MTIME=$(stat -c %Y "$POLICY_CACHE" 2>/dev/null || echo 0)
-NOW=$(date +%s)
-AGE=$(( NOW - MTIME ))
-TESTS_RUN=$((TESTS_RUN + 1))
-if [ "$AGE" -lt 60 ]; then
-    echo -e "${GREEN}✓${NC} context-guard: stale cache was refreshed"
-    TESTS_PASSED=$((TESTS_PASSED + 1))
-else
-    echo -e "${RED}✗${NC} context-guard: stale cache was refreshed"
-    echo "  Cache age: ${AGE}s (expected < 60s)"
-    TESTS_FAILED=$((TESTS_FAILED + 1))
-fi
-
-setup_uninitialized_project
-set +e
-OUTPUT=$(bash "$HOOKS_DIR/context-guard.sh" 2>/dev/null)
-EXIT_CODE=$?
-set -e
-assert_exit_code "0" "$EXIT_CODE" "context-guard: exits 0 in uninitialized repo"
-assert_contains "$OUTPUT" "policy" "context-guard: emits policy line in uninitialized repo"
-assert_equals "absent" "$(if [ -d "$TEST_DIR/project/.weave" ]; then echo present; else echo absent; fi)" "context-guard: does not create .weave in uninitialized repo"
+# The context-guard banner tests moved to tests/test-context-policy.sh when the
+# script retired (wv-26fda8): its policy is wv context-policy.
 
 # ============================================================
 # --- JSONL bridge: crash path includes last-prompt ---
@@ -3247,23 +3181,12 @@ unset WV_TOUCHED_DIR WV_TOUCHED_NODE_CAP WV_TOUCHED_RING_CAP WV_DB
 echo ""
 echo "--- Hook JSON schema audit ---"
 
-# Static hook → event-type map. Keep in sync with ~/.claude/settings.json hooks.
-declare -A HOOK_EVENTS=(
-    [pre-action.sh]=PreToolUse
-    [pre-claim-skills.sh]=PreToolUse
-    [pre-close-verification.sh]=PreToolUse
-    [bash-dedup.sh]=PreToolUse
-    [post-edit-lint.sh]=PostToolUse
-    [bash-dedup-post.sh]=PostToolUse
-    [wv-budget-tally.sh]=PostToolUse
-    [wv-touched-files.sh]=PostToolUse
-    [post-memory-capture.sh]=PostToolUse
-    [stop-check.sh]=Stop
-    [session-start-context.sh]=SessionStart
-    [context-guard.sh]=SessionStart
-    [session-end-sync.sh]=SessionEnd
-    [pre-compact-context.sh]=PreCompact
-)
+# Hook -> event map from the hook manifest, the one place it is written
+# (wv-3f70a7); each hook is audited against its first registered event.
+declare -A HOOK_EVENTS=()
+while IFS=$'\t' read -r _he_hook _he_event; do
+    HOOK_EVENTS[$_he_hook]=$_he_event
+done < <(jq -r '.hooks | to_entries[] | [.key, .value.events[0]] | @tsv' "$PROJECT_ROOT/contracts/host-hook-manifest-v1.json")
 
 schema_check() {
     local label="$1"
@@ -3277,6 +3200,9 @@ schema_check() {
         TESTS_FAILED=$((TESTS_FAILED + 1))
     fi
 }
+
+_he_ok=1; [ "${#HOOK_EVENTS[@]}" -gt 0 ] && _he_ok=0
+schema_check "the hook manifest lists hooks to audit (${#HOOK_EVENTS[@]})" "$_he_ok"
 
 for hook in "${!HOOK_EVENTS[@]}"; do
     event="${HOOK_EVENTS[$hook]}"
@@ -3480,22 +3406,9 @@ assert_equals "" "$(cat "$MC_DECOY_LOG" 2>/dev/null || true)" \
 echo ""
 echo "--- agent-hook branches (wv-e53f56) ---"
 
-# context-guard: a Weave history over 100 nodes lowers the load policy, a small
-# one does not. The existing policy case ran without a nodes.jsonl at all, so
-# the history branch never executed and flipping '-gt 100' survived.
-setup_test_env
-export POLICY_CACHE="$TEST_DIR/.context_policy"
-for cg_n in 150 5; do
-    rm -f "$POLICY_CACHE"
-    seq 1 "$cg_n" | sed 's/.*/{}/' > "$TEST_DIR/project/.weave/nodes.jsonl"
-    bash "$HOOKS_DIR/context-guard.sh" >/dev/null 2>&1 || true
-    cg_policy=$(head -1 "$POLICY_CACHE" 2>/dev/null || echo "<no policy cached>")
-    if [ "$cg_n" -gt 100 ]; then
-        assert_equals "LOW" "$cg_policy" "context-guard: a ${cg_n}-node history lowers the policy to LOW"
-    else
-        assert_equals "HIGH" "$cg_policy" "context-guard: a ${cg_n}-node history keeps a small repo HIGH"
-    fi
-done
+# The node-count policy branch (history over 100 nodes is LOW, 5 stays HIGH)
+# is driven in tests/test-context-policy.sh since context-guard.sh retired
+# (wv-26fda8).
 
 # pre-compact: the checkpoint folds into a previous graph-only checkpoint, but
 # never amends a commit that carries code, and its message is the checkpoint

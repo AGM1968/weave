@@ -369,7 +369,26 @@ test_install_under_live_sessions() {
     rm -f "$CONFIG_DIR/.install-in-progress"
 }
 
+test_worktree_source_is_compared() {
+    # wv-65cd02 (widened): doctor tested the source with -d .git, but a linked
+    # worktree's .git is a file, so an install from a worktree was never
+    # compared with its source and a stale one read as current.
+    echo "-- doctor compares an install with a worktree source"
+    local wt="$TEST_DIR/src-worktree" saved="$TEST_DIR/prov.saved" line
+    git -C "$SRC" worktree add -q --detach "$wt" HEAD >/dev/null 2>&1
+    git -C "$wt" -c user.name=t -c user.email=t@example.com -c commit.gpgsign=false \
+        commit -q --allow-empty -m "ahead in the worktree"
+    cp "$PROV" "$saved"
+    sed -i "s|^source_path=.*|source_path=$wt|" "$PROV"
+    assert_equals "file" "$([ -f "$wt/.git" ] && echo file)" "the worktree's .git is a file"
+    line=$(doctor_provenance_line)
+    assert_contains "$line" "1 commit(s) ahead" "doctor reports the worktree source as ahead of the install"
+    cp "$saved" "$PROV"
+    git -C "$SRC" worktree remove --force "$wt" >/dev/null 2>&1
+}
+
 test_clean_source_records_clean_install
+test_worktree_source_is_compared
 test_install_under_live_sessions
 test_untracked_files_count_as_dirty
 test_dirty_install_warns

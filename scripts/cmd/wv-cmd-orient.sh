@@ -539,14 +539,34 @@ _bootstrap_gate_json() {
         '{holder: $h[0], last_push: $l[0]}' 2>/dev/null || echo null
 }
 
+# _BOOTSTRAP_STALE_FINDING_DAYS — an open finding promoted this many days ago or
+# more is reported in readiness. The one home of the threshold: it moved here
+# from the retired context-guard.sh banner (wv-26fda8), and wv context-policy
+# stays graph-free.
+_BOOTSTRAP_STALE_FINDING_DAYS=14
+
+# _bootstrap_stale_findings_json -> {"count": N, "days": D}, or null when the
+# graph cannot be read.
+_bootstrap_stale_findings_json() {
+    local days="$_BOOTSTRAP_STALE_FINDING_DAYS" count
+    count=$(db_query "SELECT COUNT(*) FROM nodes n
+        WHERE $(wv_kind_sql n) = 'finding' AND n.status != 'done'
+          AND json_extract(n.metadata, '\$.promoted_at') IS NOT NULL
+          AND CAST((julianday('now') - julianday(json_extract(n.metadata, '\$.promoted_at'))) AS INTEGER) >= $days;" 2>/dev/null) \
+        || { echo null; return 0; }
+    [[ "$count" =~ ^[0-9]+$ ]] || { echo null; return 0; }
+    printf '{"count":%d,"days":%d}\n' "$count" "$days"
+}
+
 # _bootstrap_readiness_advisories <framework_json> <structural_json>
-# [heavy_tier_json] [gate_json] [load_json] -> a JSON array of advisory strings, framework first.
+# [heavy_tier_json] [gate_json] [load_json] [stale_findings_json] -> a JSON
+# array of advisory strings, framework first.
 _bootstrap_readiness_advisories() {
     # The structural list is uncapped: files, not argv (wv-200d36).
     jq -cn --slurpfile fw <(printf '%s' "$1") --slurpfile st <(printf '%s' "$2") \
         --slurpfile ht <(printf '%s' "${3:-null}") --slurpfile gt <(printf '%s' "${4:-null}") \
-        --slurpfile ld <(printf '%s' "${5:-null}") '
-        $fw[0] as $fw | $st[0] as $st | $ht[0] as $ht | $gt[0] as $gt | $ld[0] as $ld
+        --slurpfile ld <(printf '%s' "${5:-null}") --slurpfile sf <(printf '%s' "${6:-null}") '
+        $fw[0] as $fw | $st[0] as $st | $ht[0] as $ht | $gt[0] as $gt | $ld[0] as $ld | $sf[0] as $sf
         | ($gt.holder // null) as $hold
         | def short: (. // "") | .[0:9];
         # The tier the record names (wv-dfd636): make check is the fast tier.
@@ -589,6 +609,13 @@ _bootstrap_readiness_advisories() {
                 "last push failed\(if (.detail // "") != "" then " on \(.detail)" else "" end) (exit \(.exit // "?"), ended \(.ended_at // "?"), \(.subject // "")) - fix it, then git push again"
              elif .state == "interrupted" then
                 "last push interrupted: its gate (pid \(.pid), held by \(.agent_id), since \(.started_at)) ended without a result - git push again"
+             else empty end),
+            # Findings left open since promotion (wv-26fda8): last, as review
+            # work rather than a stop. The comparison predicates are printed
+            # in single quotes, written as the jq escape u0027: pasted bare,
+            # >= redirects to a file named =N (wv-14ce87).
+            (if ($sf.count // 0) > 0 then
+                "\($sf.count) open finding(s) promoted \($sf.days)+ days ago - review: wv query type=finding \u0027stale>=\($sf.days)\u0027 \u0027status!=done\u0027"
              else empty end)
         ]'
 }
@@ -725,7 +752,7 @@ cmd_bootstrap() {
     fi
 
     # ── Readiness (wv-814d33) ── first in advisories: fix the framework first.
-    local framework_json structural_json heavy_json gate_json load_json readiness_advisories
+    local framework_json structural_json heavy_json gate_json load_json stale_json readiness_advisories
     framework_json=$(_bootstrap_framework_json)
     structural_json=$(_bootstrap_structural_json)
     heavy_json=$(_bootstrap_heavy_tier_json 2>/dev/null) || heavy_json='null'
@@ -734,16 +761,25 @@ cmd_bootstrap() {
     [ -n "$gate_json" ] || gate_json='null'
     load_json=$(_bootstrap_load_json 2>/dev/null) || load_json='null'
     [ -n "$load_json" ] || load_json='null'
-    readiness_advisories=$(_bootstrap_readiness_advisories "$framework_json" "$structural_json" "$heavy_json" "$gate_json" "$load_json" 2>/dev/null || echo '[]')
+    stale_json=$(_bootstrap_stale_findings_json 2>/dev/null) || stale_json='null'
+    [ -n "$stale_json" ] || stale_json='null'
+    readiness_advisories=$(_bootstrap_readiness_advisories "$framework_json" "$structural_json" "$heavy_json" "$gate_json" "$load_json" "$stale_json" 2>/dev/null || echo '[]')
 
     # ── Graph memory index (wv-bff31b) ── the agnostic delivery path: every
     # harness, MCP client (weave_bootstrap passes this through) and wv_client
     # runtime reads bootstrap, while the projection files reach only the
     # harnesses that load them. The same one-line index the projections carry;
-    # the full text is one recall away.
-    local memory_json
-    memory_json=$(_memory_recall_json 2>/dev/null | _memory_index_entries 2>/dev/null) || memory_json='[]'
+    # the full text is one recall away. Graph-only memories (wv-287b39) are
+    # left out of the index like every rendered surface; graph_only counts
+    # them so a session knows recall holds more than the index shows.
+    local memory_all memory_json memory_graph_only
+    memory_all=$(_memory_recall_json 2>/dev/null) || memory_all='[]'
+    [ -n "$memory_all" ] || memory_all='[]'
+    memory_json=$(_memory_index_entries <<< "$memory_all" 2>/dev/null) || memory_json='[]'
     [ -n "$memory_json" ] || memory_json='[]'
+    memory_graph_only=$(jq '[.[] | select(((.metadata // {}).exposure // "rendered") == "graph-only")] | length' \
+        <<< "$memory_all" 2>/dev/null) || memory_graph_only=0
+    [ -n "$memory_graph_only" ] || memory_graph_only=0
 
     # ── Compose final JSON ──
     # Through files, not argv: the context pack and the --ready/--learnings
@@ -766,6 +802,7 @@ cmd_bootstrap() {
         --slurpfile gate <(printf '%s' "$gate_json") \
         --slurpfile load <(printf '%s' "$load_json") \
         --slurpfile memory <(printf '%s' "$memory_json") \
+        --arg memory_graph_only "$memory_graph_only" \
         '$status[0] as $status | $active_node[0] as $active_node
         | $context[0] as $context | $ready[0] as $ready | $learnings[0] as $learnings
         | $framework[0] as $framework | $structural[0] as $structural
@@ -795,6 +832,7 @@ cmd_bootstrap() {
             breadcrumb: (if $breadcrumb != "" then $breadcrumb else null end),
             memory: {
                 count: ($memory | length),
+                graph_only: ($memory_graph_only | tonumber? // 0),
                 recall: "wv memory recall --agent=all --json",
                 entries: ($memory | map({id, text, verified_at: .metadata.verified_at, full: (.index | not)}))
             }
@@ -1279,7 +1317,8 @@ cmd_session_summary() {
         shift
     done
 
-    local snapshot="$WV_HOT_ZONE/.session_snapshot"
+    local snapshot
+    snapshot=$(wv_session_file "$WV_HOT_ZONE" snapshot)
     if [ ! -f "$snapshot" ]; then
         echo "No session snapshot found. Run 'wv load' at session start."
         return 0
@@ -1381,7 +1420,8 @@ _hygiene_score() {
     start_iso=$(sql_escape "$start_iso")
 
     # Component 1: edit discipline = % Edit/Write attempts that had an active node.
-    local edits_file="$WV_HOT_ZONE/session-edits.json"
+    local edits_file
+    edits_file=$(wv_session_edits_file "$WV_HOT_ZONE")
     _h_edit_total=0
     _h_edit_with=0
     if [ -f "$edits_file" ]; then
@@ -1505,13 +1545,43 @@ _context_policy_decide() {
     printf '%s\n' "$policy" "${reasons[@]}"
 }
 
+# _CONTEXT_POLICY_DIRECTIVES — what each level means, the one source every
+# surface renders (wv-eb061d): context-policy --json and its text output, the
+# runtime.md block, `wv help context`, the SessionStart line and MCP
+# weave_overview. Hosts render .text; .search_first, .whole_read_max_lines
+# (null: no whole reads), .slice_max_lines (null: line ranges, no cap) and
+# .summarise are the same rules for a host that enforces them.
+_CONTEXT_POLICY_DIRECTIVES='{
+  "HIGH":   {"search_first": "large_files", "whole_read_max_lines": 500, "slice_max_lines": null, "summarise": false,
+             "text": ["Read files under 500 lines whole.", "Search first for larger files."]},
+  "MEDIUM": {"search_first": "always", "whole_read_max_lines": 500, "slice_max_lines": null, "summarise": false,
+             "text": ["Always search before reading.", "No whole reads over 500 lines; use line ranges."]},
+  "LOW":    {"search_first": "always", "whole_read_max_lines": null, "slice_max_lines": 200, "summarise": true,
+             "text": ["Always search first.", "Read only slices under 200 lines.", "Summarise rather than quote."]}
+}'
+
+# _context_policy_directives <level> — that level's directives object, or null
+# for a level the table does not hold.
+_context_policy_directives() {
+    jq -c --arg level "$1" '.[$level] // null' <<< "$_CONTEXT_POLICY_DIRECTIVES"
+}
+
+# _context_policy_levels_text — every level and its directive text, one level
+# per line ("HIGH   — a; b"), for help output.
+_context_policy_levels_text() {
+    jq -r 'to_entries[] | "  \(.key | . + (" " * (6 - length))) — \(.value.text | join(" "))"' \
+        <<< "$_CONTEXT_POLICY_DIRECTIVES"
+}
+
 _context_policy_runtime_md() {
     local runtime_md="$1" policy="$2" begin="<!-- BEGIN WEAVE RUNTIME CONTEXT -->"
-    local end="<!-- END WEAVE RUNTIME CONTEXT -->" block tmp
+    local end="<!-- END WEAVE RUNTIME CONTEXT -->" block tmp directives
     [ -f "$runtime_md" ] || return 0
+    directives=$(_context_policy_directives "$policy" | jq -r '(.text // [])[] | "- " + .')
     block="${begin}
 Current context policy: ${policy}
-Policy source: .weave/.context_policy
+${directives:+${directives}
+}Policy source: .weave/.context_policy
 This file is loaded into weave-runtime system prompts. Keep repo-specific instructions below this block.
 ${end}"
     tmp=$(mktemp) || return 0
@@ -1564,12 +1634,14 @@ cmd_context_policy() {
     _context_policy_runtime_md "$weave_dir/runtime.md" "$policy"
 
     if [ "$json" = true ]; then
-        jq -n --arg policy "$policy" --argjson cached "$cached" \
-            '{policy: $policy, reasons: $ARGS.positional, cached: $cached, source: ".weave/.context_policy"}' \
-            --args "${reasons[@]}"
+        # The directives table arrives on stdin, so no JSON travels in argv.
+        jq --arg policy "$policy" --argjson cached "$cached" \
+            '{policy: $policy, reasons: $ARGS.positional, directives: (.[$policy] // null), cached: $cached, source: ".weave/.context_policy"}' \
+            --args "${reasons[@]}" <<< "$_CONTEXT_POLICY_DIRECTIVES"
     else
         echo "policy: $policy"
         [ ${#reasons[@]} -gt 0 ] && echo "reason: ${reasons[0]}"
+        _context_policy_directives "$policy" | jq -r '(.text // [])[] | "- " + .'
     fi
     return 0
 }

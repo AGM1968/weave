@@ -1,14 +1,33 @@
 ---
 id: code-search
 description:
-  "Two-surface code/graph search and how wv ready re-ranks unblocked work by recent-edit overlap.
-  Use when locating implementation or prior decisions, or to understand ready-list ordering."
+  "Focused search: define the target before searching, search the graph and the code with bounded
+  results, follow cross-references, and stop when the target is found. Use before broad exploration,
+  when locating implementation or prior decisions, or when a task names node ids, issues or files."
 fallback: "wv guide --procedure=code-search"
-adapters: [codex, copilot]
+adapters: [claude, codex, copilot]
 visibility: shared
+claude_skill: zero-in
 ---
 
 # Code Search
+
+A search starts from a named target and stops when the target is found. Searching "to see what is
+there" fills the context with files that are never used and pulls the work off its task.
+
+## Define the target first
+
+Before the first search, answer four questions:
+
+- **What** is wanted: a specific function, pattern or concept, not "anything related".
+- **Why**: how the result will be used.
+- **When to stop**: the success condition, set before searching.
+- **How many** results are useful: one exact match, the top five, or every instance.
+
+"Find where JWT tokens are validated" and "find three examples of the error-handling pattern" are
+targets; "see how authentication works" and "explore the API" are not.
+
+## Search surfaces
 
 Two search surfaces, different signals:
 
@@ -50,6 +69,56 @@ falls back to BM25.
 - Semble: `semble search "<query>" <dir>` (CLI) or `mcp__semble__search` (MCP, pass `repo` param)
 - Any tool works: ripgrep, semgrep, ast-grep, language server — Weave has no opinion here
 
+## Bounded search order
+
+Use the most specific tool first and widen only when it misses:
+
+1. Code search: `wv search --code "<concept>"` (hybrid), `--mode=fts` for an exact name, flag or
+   token, `--graph` to see which active nodes already touch the files. Results carry the file, line
+   range and snippet.
+2. Exact text search (ripgrep or grep) when code search misses or the file is not indexed; narrow it
+   by file type or path.
+3. A file-name listing (glob) only when the question is about structure.
+4. Read only the lines a search returned, not whole files.
+
+Boundaries:
+
+- Read at most three to five files in full; take line ranges otherwise.
+- Follow the directives of the session's context load policy, as `wv context-policy` states them.
+- Stop as soon as the target is found; never keep searching after the answer is in hand.
+
+## Report, then decide
+
+Before widening a search, report it: the target, each search and its hit count, what was found
+(`file:line`), whether that is enough, and the next step.
+
+- **Found**: read only that section and go on with the task; note the location for later.
+- **Not found**: check the terms (typo, synonym) and the assumption (wrong layer, different
+  pattern); ask the owner whether the target exists.
+- **Too many results**: add a type, path or glob filter, narrow the terms, or sample a few
+  representative hits rather than all of them.
+
+## Cross-references
+
+When a task, node or document names other work, extract the references and follow them on purpose:
+
+```bash
+wv refs <file>                       # or: wv refs -t "<text>", or text on stdin
+wv refs -t "<text>" --max=10 --json  # at most 10 per pass (the default)
+wv refs <file> --link --from=<id>    # also record edges from <id> to the nodes it names
+```
+
+| Reference        | Suggested follow-up     |
+| ---------------- | ----------------------- |
+| `wv-xxxxxx`      | `wv show wv-xxxxxx`     |
+| `#N`, `gh-N`     | `gh issue view N`       |
+| `See Note N`     | `rg -n "Note N" docs/`  |
+| `ADR-N`, `RFC-N` | `rg -l "ADR-N" docs/`   |
+| a file path      | read the file (bounded) |
+
+`wv refs` only suggests commands: review them, run the ones the task needs, and summarise what each
+reference held. Do not recurse; extract again from a followed reference only when it is needed.
+
 ## Ready Re-ranking
 
 `wv ready` re-ranks unblocked nodes by overlap between `metadata.touched_files` and the per-session
@@ -62,7 +131,8 @@ edits have been made yet.
 
 This signal is passive: it updates automatically as you edit files. No configuration needed.
 
-**When markers appear:** `[touched N]` fires only after the first `PostToolUse` hook in the session
-populates the recent-edits ring (Edit/Write tool calls; Bash reads do not count). Cold sessions and
-the first `wv ready` invocation show nodes in `created_at` order with no markers. JSON output
-silently sorts by overlap when present; falls back to `created_at` order otherwise.
+**When markers appear:** `[touched N]` fires only after the first file edit the host reports to
+`wv hook dispatch` in the session (the `after_edit` event of `contracts/hook-events-v1.schema.json`,
+whatever the host calls its edit tool) populates the recent-edits ring. Shell reads do not count.
+Cold sessions and the first `wv ready` invocation show nodes in `created_at` order with no markers.
+JSON output silently sorts by overlap when present; falls back to `created_at` order otherwise.

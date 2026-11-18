@@ -18,8 +18,9 @@ export WV_CALL_SOURCE=test
 #   - NOT PERSISTED named explicitly on stderr
 #   - NO success line, which is the part a warning alone never fixed
 #
-# The failure is injected by making WEAVE_DIR unwritable, so auto_sync cannot
-# create the temp file it writes state.sql through. That is a real auto_sync
+# The failure is injected by making WEAVE_DIR and everything under it
+# unwritable, so auto_sync cannot stage or publish the delta a write publishes
+# (wv-8595fb; before that, the state.sql temp file). That is a real auto_sync
 # failure rather than a stubbed one.
 set -uo pipefail
 export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
@@ -55,8 +56,8 @@ export WV_AUTO_CHECKPOINT=0
 mkdir -p "$WEAVE_DIR"
 cd "$TEST_DIR" || exit 1
 
-deny_writes()  { rm -f "$WV_HOT_ZONE/.last_sync"; chmod 500 "$WEAVE_DIR"; }
-allow_writes() { chmod 700 "$WEAVE_DIR"; }
+deny_writes()  { rm -f "$WV_HOT_ZONE/.last_sync"; chmod -R u-w "$WEAVE_DIR"; }
+allow_writes() { chmod -R u+w "$WEAVE_DIR"; }
 
 # ── baseline: the same commands succeed when persistence works ─────────────────
 

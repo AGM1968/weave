@@ -24,7 +24,7 @@ For a symptom in the graph or its tooling (a load that is not acknowledged, a no
 came back, a gate that refuses or passes unexpectedly):
 
 1. Clone the repository into a scratch directory and give the clone its own hot zone and config
-   directory, so nothing reads or writes the live graph:
+   directory; nothing then reads or writes the live graph:
    `git clone --shared --no-checkout . <scratch>/r && git -C <scratch>/r checkout --detach <rev>`,
    then run `wv load` (or the failing command) there with `WV_HOT_ZONE`, `WV_DB` and
    `WV_CONFIG_DIR` pointing inside `<scratch>`.

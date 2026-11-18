@@ -20,17 +20,6 @@ hook_progress() {
     printf '%s\n' "Weave pre-push: $1" >&2
 }
 
-# hook_duration_ms <start_nanos> — see pre-commit-weave.sh.
-hook_duration_ms() {
-    local _t0="$1" _t1 _d
-    _t1=$(date +%s%N 2>/dev/null || echo 0)
-    case "$_t0" in ''|*[!0-9]*) echo 0; return 0 ;; esac
-    case "$_t1" in ''|*[!0-9]*) echo 0; return 0 ;; esac
-    [ "$_t0" = "0" ] && { echo 0; return 0; }
-    _d=$(( (_t1 - _t0) / 1000000 ))
-    [ "$_d" -lt 0 ] && _d=0
-    echo "$_d"
-}
 
 # PROTECTED DISPATCHER (S2a, wv-1f98b6): see pre-commit-weave.sh. Where HEAD
 # carries this hook, the push gate is HEAD's committed scripts/ tree run from a
@@ -149,6 +138,40 @@ fi
 # Tag this hook's wv calls as hook traffic, keeping a test run's tag (wv-f47c10;
 # see pre-commit-weave.sh).
 [ "${WV_CALL_SOURCE:-}" = "test" ] || export WV_CALL_SOURCE=hook
+# Projection verdict (wv-65cd02), in every Weave repository, so before the
+# test-map and [heavy] handling below: a rebase or merge can keep another
+# copy's .weave/state.sql while both sides' operations travel, publishing a
+# snapshot that lacks operations committed with it. The graph decides (wv
+# status, reason projection_lags_operations); this hook asks and refuses. The
+# verdict is about HEAD's committed snapshot, so a ref pushed from another
+# commit is reported as unchecked, not refused.
+if [ -d "$REPO_ROOT/.weave" ]; then
+    _pp_proj_head=$(git rev-parse --verify --quiet HEAD 2>/dev/null) || _pp_proj_head=""
+    _pp_proj_asked=false
+    while read -r _pp_lref _pp_lsha _pp_rref _pp_rsha; do
+        [ -n "${_pp_lsha:-}" ] || continue
+        [ "$_pp_lsha" = "0000000000000000000000000000000000000000" ] && continue
+        if [ "$_pp_lsha" != "$_pp_proj_head" ]; then
+            # Only a ref whose pushed range adds graph operations is worth a
+            # word: a tag or a code-only branch carries nothing to check.
+            if [ -n "${_pp_rsha:-}" ] && [ "$_pp_rsha" != "0000000000000000000000000000000000000000" ] \
+                && ! git diff --quiet "$_pp_rsha" "$_pp_lsha" -- .weave/deltas 2>/dev/null; then
+                echo "⚠ Weave pre-push: $_pp_lref adds graph operations but is not the checked-out commit, so its .weave/state.sql was not checked against them" >&2
+            fi
+            continue
+        fi
+        [ "$_pp_proj_asked" = false ] || continue
+        _pp_proj_asked=true
+        _pp_proj=$("$WV" status --json 2>/dev/null) || _pp_proj=""
+        _pp_proj_reason=$(jq -r '.git_sync_reason // ""' <<< "$_pp_proj" 2>/dev/null) || _pp_proj_reason=""
+        case "$_pp_proj_reason" in
+            projection_lags_operations|projection_unverifiable)
+                echo "✗ Weave pre-push: $_pp_lref at ${_pp_lsha:0:12} is not pushed ($_pp_proj_reason):" >&2
+                echo "  $(jq -r '.git_sync_hint // ""' <<< "$_pp_proj" 2>/dev/null)" >&2
+                exit 1 ;;
+        esac
+    done <<< "$_pp_stdin"
+fi
 # A map that is there but cannot be read -- unreadable, a dangling symlink, or
 # inside a .weave/ that cannot be searched -- is not "no map": read that way,
 # the push went out with no heavy suite run (wv-b02828). Inline, before the
@@ -169,7 +192,7 @@ fi
 # Libraries beside this hook first (scripts/hooks/../lib, the source a checkout
 # runs), then the repository's, then the installed ones: the gate never mixes
 # this hook with libraries of another version when its own are at hand.
-for _pp_lib in wv-checkpoint-ci.sh wv-gate-pool.sh wv-gate-hold.sh; do
+for _pp_lib in wv-checkpoint-ci.sh wv-gate-pool.sh wv-gate-hold.sh wv-clock.sh; do
     for _pp_cand in "${_pp_lib_cands[@]}"; do
         if [ -f "$_pp_cand/$_pp_lib" ]; then
             # shellcheck source=/dev/null
@@ -180,7 +203,7 @@ for _pp_lib in wv-checkpoint-ci.sh wv-gate-pool.sh wv-gate-hold.sh; do
 done
 if ! command -v run_hook_suites >/dev/null 2>&1 || ! command -v gate_pool_estimates >/dev/null 2>&1 \
     || ! command -v gate_pool_launch_order >/dev/null 2>&1 || ! command -v wv_non_graph_state_paths >/dev/null 2>&1 \
-    || ! command -v gate_pool_require_present >/dev/null 2>&1 \
+    || ! command -v gate_pool_require_present >/dev/null 2>&1 || ! command -v wv_clock_since >/dev/null 2>&1 \
     || ! command -v gate_pool_execution_mode >/dev/null 2>&1; then
     echo "✗ Weave pre-push: the gate libraries (wv-gate-pool.sh, wv-checkpoint-ci.sh) were not found — refresh with $(_pp_refresh_cmd)" >&2
     exit 1
@@ -190,12 +213,26 @@ fi
 # session ran a second heavy tier beside the first (2026-11-08). The outcome is
 # recorded for the next session to read: running now, passed or failed (with
 # the suites that failed) when this shell exits, whichever path it takes.
-if ! command -v wv_gate_hold_acquire >/dev/null 2>&1; then
+if ! command -v wv_gate_hold_acquire >/dev/null 2>&1 || ! command -v wv_gate_hold_foreign_status >/dev/null 2>&1; then
     echo "✗ Weave pre-push: the gate lock library (wv-gate-hold.sh) was not found — refresh with $(_pp_refresh_cmd)" >&2
     exit 1
 fi
 _pp_subject=$(awk 'NF >= 2 { printf "%s%s %.9s", (n++ ? ", " : ""), $1, $2 }' <<< "$_pp_stdin")
 wv_gate_hold_acquire pre-push "$_pp_subject" || exit 1
+# ── A gate running in another worktree of this repository (wv-33cf11) ── Each
+# worktree has its own lock, so the one above never sees a peer's: a push from
+# a linked worktree published beneath the main worktree's running gate
+# (2026-11-17, 231f12018), the cross-worktree half of wv-44d74b. The hold
+# library judges the holder (pid plus start time); this hook asks it after
+# taking its own lock, so two worktrees pushing at once both refuse rather
+# than both pass. A dead holder's leftover record reads as nothing.
+_pp_foreign=$(wv_gate_hold_foreign_status "$REPO_ROOT")
+if [ -n "$_pp_foreign" ]; then
+    echo "✗ Weave pre-push: a $(jq -r '.kind // "gate"' <<< "$_pp_foreign" 2>/dev/null) gate held by $(jq -r '.agent_id // "unknown"' <<< "$_pp_foreign" 2>/dev/null) is running in another worktree of this repository (pid $(jq -r '.pid // "?"' <<< "$_pp_foreign" 2>/dev/null), since $(jq -r '.started_at // "?"' <<< "$_pp_foreign" 2>/dev/null)); this push is not sent beneath it." >&2
+    echo "  Wait for that gate to finish, then fetch, rebase onto the remote and push again." >&2
+    wv_gate_hold_release
+    exit 1
+fi
 _pp_hold_finish() {
     local rc="$1"
     if [ "$rc" = 0 ]; then
@@ -408,11 +445,13 @@ export WV_GATE_PHASE=pre-push
 WV_GATE_ID="pp-$(date +%s%N 2>/dev/null || date +%s)-$$"
 export WV_GATE_ID
 _pp_gate_t0=$(date +%s%N 2>/dev/null || echo 0)
+wv_clock_ms _pp_gate_c0 _pp_gate_k0 2>/dev/null || _pp_gate_k0=unknown
 _pp_gate_pressure0=$(gate_pressure_totals 2>/dev/null)
 _pp_gate_finish() {
-    local rc=$? suites
+    local rc=$? suites ms=0 clock=unknown
     suites=$(jq -r '[.[].name] | join(",")' <<< "$_pp_heavy_json" 2>/dev/null)
-    "$WV" test-record gate --gate --exit="$rc" --duration="$(hook_duration_ms "$_pp_gate_t0")" \
+    wv_clock_since ms clock "${_pp_gate_c0:-}" "$_pp_gate_k0" 2>/dev/null || clock=unknown
+    "$WV" test-record gate --gate --exit="$rc" --duration="$ms" --clock="$clock" \
         --execution-mode="${WV_GATE_EXECUTION_MODE:-}" \
         --suite-modes="$(gate_pool_suite_modes "$suites")" \
         --suites="$suites" \

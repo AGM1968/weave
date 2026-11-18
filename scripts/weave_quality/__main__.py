@@ -143,7 +143,24 @@ log = logging.getLogger(__name__)
 __all__ = ["cmd_findings_promote"]
 
 _VERSION_FILE = Path(__file__).parent.parent / "lib" / "VERSION"
-_SCANNER_VERSION = _VERSION_FILE.read_text().strip() if _VERSION_FILE.exists() else ""
+
+
+def _scanner_identity() -> str:
+    """The release version plus a digest of this package's own sources.
+
+    Cached results and incremental scans are keyed on it, so a change to any
+    analyzer invalidates them, not only a release bump: keyed on VERSION alone,
+    a bash-parser fix kept serving results the old parser produced (wv-70c888).
+    """
+    digest = hashlib.sha256()
+    for source in sorted(Path(__file__).parent.glob("*.py")):
+        digest.update(source.name.encode())
+        digest.update(source.read_bytes())
+    version = _VERSION_FILE.read_text().strip() if _VERSION_FILE.exists() else ""
+    return f"{version}+{digest.hexdigest()[:12]}"
+
+
+_SCANNER_VERSION = _scanner_identity()
 _MSG_NO_DB = "No quality.db found. Run 'wv quality scan' first."
 _MSG_NO_SCAN = "No scan data. Run 'wv quality scan' first."
 _MSG_NO_PATTERN_SCAN = "No pattern scan data. Run 'wv quality patterns scan' first."

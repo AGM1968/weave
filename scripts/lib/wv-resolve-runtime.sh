@@ -39,7 +39,7 @@ is_sandboxed_runtime() {
     # is kept as an alias (wv-21698b). For agent identity (claimed_by, delta
     # provenance) use resolve_agent_id, which keeps the harnesses distinct.
     [ -n "${CODEX_THREAD_ID:-}" ] || [ "${CODEX_CI:-}" = "1" ] \
-        || [ "${COPILOT_AGENT:-}" = "1" ] || [ "${CLAUDECODE:-}" = "1" ] \
+        || [ "${COPILOT_AGENT:-}" = "1" ] || [ "${COPILOT_CLI:-}" = "1" ] || [ "${CLAUDECODE:-}" = "1" ] \
         || [ -n "${CLAUDE_CODE_SSE_PORT:-}" ]
 }
 
@@ -83,6 +83,11 @@ is_codex_runtime() {
 # innermost agent sets it (Claude Code, pi and Amp observed; Codex does not),
 # overwriting an inherited value, so in a tie it ranks above claude and codex,
 # whose markers leak to children. copilot keeps top precedence.
+#
+# Copilot CLI (wv-6781d7, observed on 1.0.112) sets COPILOT_CLI=1 in its tool
+# shell and hooks, never COPILOT_AGENT. Every process it starts inherits it, as
+# with CLAUDECODE, so it ranks with the leaking markers: after AI_AGENT, before
+# claude. Claude Code started from a Copilot CLI shell still resolves claude.
 resolve_agent_harness() {
     if [ -n "${_WV_AGENT_HARNESS:-}" ]; then
         printf '%s\n' "$_WV_AGENT_HARNESS"
@@ -93,10 +98,22 @@ resolve_agent_harness() {
     ai=$(_wv_ai_agent_label)
     [ "${COPILOT_AGENT:-}" = "1" ] && present="${present} copilot"
     case " $present " in *" $ai "*) ;; *) [ -z "$ai" ] || present="${present} ${ai}" ;; esac
+    case " $present " in *" copilot "*) ;; *)
+        [ "${COPILOT_CLI:-}" = "1" ] && present="${present} copilot" ;; esac
     case " $present " in *" claude "*) ;; *)
         [ "${CLAUDECODE:-}" = "1" ] && present="${present} claude" ;; esac
     case " $present " in *" codex "*) ;; *)
         { [ -n "${CODEX_THREAD_ID:-}" ] || [ "${CODEX_CI:-}" = "1" ]; } && present="${present} codex" ;; esac
+    # Session-variable fallback (wv-55a24d): an Amp or pi process that does not
+    # export AI_AGENT still carries its own session variable. Counted last, and
+    # only when AI_AGENT names no harness: AI_AGENT is set by the innermost
+    # agent and stays decisive, so Claude Code inside Amp is not made ambiguous.
+    # Alone it names the harness; beside an inherited marker it does not win,
+    # but the diagnostic names it instead of the parent winning silently.
+    if [ -z "$ai" ]; then
+        [ -n "${AMP_CURRENT_THREAD_ID:-}" ] && present="${present} amp"
+        [ -n "${PI_SESSION_ID:-}" ] && present="${present} pi"
+    fi
     present="${present# }"
 
     local result
@@ -107,7 +124,9 @@ resolve_agent_harness() {
     elif [ "$n" -eq 1 ]; then
         result="$present"
     else
-        # present is built in precedence order: copilot > AI_AGENT > claude > codex.
+        # present is built in precedence order:
+        # copilot > AI_AGENT > copilot (COPILOT_CLI) > claude > codex > amp/pi
+        # session variable.
         local host user suggested
         result="${present%% *}"
         host=$(hostname 2>/dev/null || echo "host")
@@ -144,12 +163,17 @@ _wv_ai_agent_label() {
 # wv-99978b; pi and Amp tool processes, docs/findings/harness-env-probe-2026-11-04).
 # Prints the variable NAME or nothing. This table is a convenience,
 # not the contract: any host supplies a session through WV_SESSION_ID.
+# Copilot CLI's tool shell carries COPILOT_AGENT_SESSION_ID, the sessionId its
+# hook payloads carry (wv-6781d7, 1.0.112); its hooks get the payload only. It
+# applies only with COPILOT_CLI=1: a COPILOT_AGENT=1 process was not observed
+# with it, and naming an absent variable would refuse that session ownership.
 _wv_session_var_for() {
     case "$1" in
         claude) printf 'CLAUDE_CODE_SESSION_ID\n' ;;
         codex)  printf 'CODEX_THREAD_ID\n' ;;
         pi)     printf 'PI_SESSION_ID\n' ;;
         amp)    printf 'AMP_CURRENT_THREAD_ID\n' ;;
+        copilot) [ "${COPILOT_CLI:-}" != "1" ] || printf 'COPILOT_AGENT_SESSION_ID\n' ;;
     esac
 }
 
@@ -247,6 +271,22 @@ _wv_agent_session_sid() {
     [ -z "$_WV_SESSION_SID" ] || printf '%s\n' "$_WV_SESSION_SID"
 }
 
+# wv_session_file <hot_zone> <name> — this session's own copy of a
+# session-scoped hot-zone file (epoch, heartbeat, laststop, sentinel):
+# .session_<name>.<digest16> when the session is known, else the flat
+# .session_<name>. Two sessions in one checkout share the hot zone, and one
+# flat file let the second's start overwrite the first's state (wv-9a867a).
+wv_session_file() {
+    local sid
+    _wv_session_sid_compute
+    sid="$_WV_SESSION_SID"
+    if [ -n "$sid" ]; then
+        printf '%s/.session_%s.%s\n' "$1" "$2" "$sid"
+    else
+        printf '%s/.session_%s\n' "$1" "$2"
+    fi
+}
+
 # resolve_agent_legacy_session_id — the -s<sid12> identity this session had
 # before wv-24d57b (the id reduced to [A-Za-z0-9], first 12). Used only so an
 # explicit `wv work --continue` can adopt this session's own pre-change claim,
@@ -292,7 +332,8 @@ resolve_agent_coarse_id() {
 
 # wv_adopt_hook_session_id <payload> — when the harness has a built-in session
 # variable but the hook process lacks it, and WV_SESSION_ID is unset, export
-# the payload's session_id (Claude Code) or thread_id (Codex) as WV_SESSION_ID,
+# the payload's session_id (Claude Code, and Copilot CLI with PascalCase
+# events), thread_id (Codex) or sessionId (Copilot CLI's own format) as WV_SESSION_ID,
 # the neutral channel, so a hook resolves the same owner as the shell (owner
 # ruling 2026-11-04, wv-43d6be). Every hook entry calls it before it resolves
 # an owner. An id already in the environment always wins.
@@ -305,7 +346,7 @@ wv_adopt_hook_session_id() {
     var=$(_wv_session_var_for "$(resolve_agent_harness 2>/dev/null)")
     [ -n "$var" ] || return 0
     [ -z "${!var:-}" ] || return 0
-    sid=$(printf '%s' "$1" | jq -r '(.session_id // .thread_id // empty) | strings' 2>/dev/null) || return 0
+    sid=$(printf '%s' "$1" | jq -r '(.session_id // .thread_id // .sessionId // empty) | strings' 2>/dev/null) || return 0
     [ -n "$sid" ] || return 0
     export WV_SESSION_ID="$sid"
     _WV_AGENT_ID_RESOLVED=""

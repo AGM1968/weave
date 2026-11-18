@@ -67,6 +67,12 @@ _git_pending_hint() {
         no_upstream)
             echo "configure an upstream before retrying recovery"
             ;;
+        projection_lags_operations)
+            echo "the committed .weave/state.sql lacks operations committed with it (a rebase or merge kept another copy's snapshot): run wv load, then wv sync, then commit .weave/ and push"
+            ;;
+        projection_unverifiable)
+            echo "the committed .weave/state.sql could not be checked against the operations committed with it: run wv load and read its output, then wv sync and commit .weave/"
+            ;;
         dirty_outside_weave)
             echo "commit or stash non-.weave changes before retrying recovery"
             ;;
@@ -89,7 +95,9 @@ _detect_git_pending() {
     local ahead_count=0 has_non_weave=false has_ambiguous_empty=false sha
 
     git_root=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
-    if [ -z "$git_root" ] || [ ! -d "$git_root/.git" ]; then
+    # -e, not -d: in a linked worktree .git is a file naming the gitdir, and -d
+    # reported every worktree as not a repository, skipping the whole verdict.
+    if [ -z "$git_root" ] || [ ! -e "$git_root/.git" ]; then
         jq -n \
             --argjson pending false \
             --arg state "clean" \
@@ -128,6 +136,17 @@ _detect_git_pending() {
         done <<< "$ahead_shas"
     fi
 
+    # Whether the committed snapshot reflects the operations committed with it
+    # (wv-65cd02). Only commits ahead can carry a lagging snapshot, so a tree at
+    # its upstream pays nothing. The graph decides here; the pre-push hook asks.
+    local projection='{"verdict":"unchecked","applied":0,"checked":0,"detail":"nothing ahead of the upstream"}'
+    if [ "$ahead_count" -gt 0 ] 2>/dev/null && command -v wv_projection_lag >/dev/null 2>&1; then
+        projection=$(wv_projection_lag "$git_root" 2>/dev/null) \
+            || projection='{"verdict":"unchecked","applied":0,"checked":0,"detail":"the check did not run"}'
+    fi
+    local projection_verdict
+    projection_verdict=$(jq -r '.verdict // "unchecked"' <<< "$projection" 2>/dev/null) || projection_verdict=unchecked
+
     if [ "$weave_dirty_bool" = true ] || [ "$ahead_count" -gt 0 ] 2>/dev/null; then
         pending=true
     fi
@@ -136,6 +155,15 @@ _detect_git_pending() {
         if [ -z "$upstream" ]; then
             state="unresolvable"
             reason="no_upstream"
+        elif [ "$projection_verdict" = lags ]; then
+            # Before every other reason: what would be pushed is a snapshot that
+            # misses its own operations, whatever else the tree holds.
+            state="recoverable"
+            action="load_and_sync"
+            reason="projection_lags_operations"
+        elif [ "$projection_verdict" = error ]; then
+            state="unresolvable"
+            reason="projection_unverifiable"
         elif [ "$outside_dirty" = true ]; then
             state="unresolvable"
             reason="dirty_outside_weave"
@@ -189,8 +217,10 @@ _detect_git_pending() {
         --argjson ref_maybe_stale "$ref_maybe_stale" \
         --argjson weave_dirty "$weave_dirty_bool" \
         --argjson outside_dirty "$outside_dirty" \
+        --arg projection "$projection" \
         '{pending:$pending, state:$state, action:$action, reason:$reason, hint:$hint,
           upstream:$upstream, ahead_count:$ahead_count,
           recorded_pushed:$recorded_pushed, ref_maybe_stale:$ref_maybe_stale,
-          weave_dirty:$weave_dirty, outside_dirty:$outside_dirty}'
+          weave_dirty:$weave_dirty, outside_dirty:$outside_dirty,
+          projection:(try ($projection | fromjson) catch {verdict:"unchecked"})}'
 }

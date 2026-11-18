@@ -100,6 +100,76 @@ _hc_refresh() {
     WV="${WV:-${WV_CLI:-$_HC_PROJECT_DIR/scripts/wv}}"
 }
 
+# ─── The guard's wait budget (wv-3a8c06) ─────────────────────────────────────
+# The host kills a PreToolUse hook at its own limit (10 s as installed), and a
+# killed guard admits the edit. Its wv calls wait on whatever holds the graph
+# -- the schema lock (10 s each), a load, a sync, a gate -- with no bound of
+# their own: measured 17 such kills, 2026-09-19..11-10. So every wv call the
+# guard makes shares one budget, WV_PTU_WAIT_BUDGET_MS (default 7000) from the
+# guard's start, and a call still waiting when it runs out is ended and the
+# edit refused: an edit the guard cannot judge in time is never admitted.
+
+# _hc_now_us -- microseconds since the epoch, without a fork where bash has
+# EPOCHREALTIME (bash 5).
+_hc_now_us() {
+    if [ -n "${EPOCHREALTIME:-}" ]; then
+        printf '%s\n' "${EPOCHREALTIME/[.,]/}"
+    else
+        printf '%s000000\n' "$(date +%s)"
+    fi
+}
+
+# _hc_wv_budget_start -- start the budget now. The guard calls it first; a
+# caller that never did starts it at its first _hc_wv.
+_hc_wv_budget_start() {
+    _HC_WV_START_US=$(_hc_now_us)
+}
+
+# _hc_wv <wv args...> -- run "$WV" inside the guard's budget. Sets _HC_WV_OUT
+# to its stdout (stderr is dropped). Returns wv's status, or 124 when the
+# budget ran out before wv finished, with _HC_WV_WAITED naming the call.
+_hc_wv() {
+    local budget_ms="${WV_PTU_WAIT_BUDGET_MS:-7000}" left_us secs rc=0
+    [[ "$budget_ms" =~ ^[0-9]+$ ]] || budget_ms=7000
+    [ -n "${_HC_WV_START_US:-}" ] || _hc_wv_budget_start
+    left_us=$(( _HC_WV_START_US + budget_ms * 1000 - $(_hc_now_us) ))
+    _HC_WV_OUT="" _HC_WV_WAITED="wv $1"
+    [ "$left_us" -gt 0 ] || return 124
+    secs=$(printf '%d.%03d' $(( left_us / 1000000 )) $(( left_us % 1000000 / 1000 )))
+    if command -v timeout >/dev/null 2>&1; then
+        # -k: a call that ignores TERM is killed a second later, still inside
+        # the host's limit. timeout signals wv's whole process group, so a
+        # flock or sqlite3 it is waiting in goes with it.
+        _HC_WV_OUT=$(timeout -k 1 "$secs" "$WV" "$@" 2>/dev/null) || rc=$?
+        # 124 ends on TERM, 137 on the KILL that follows.
+        [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ] && return 124
+    else
+        # No timeout(1) (macOS without coreutils): a watchdog ends wv instead.
+        _HC_WV_OUT=$(
+            "$WV" "$@" 2>/dev/null & pid=$!
+            ( sleep "$secs"; kill -TERM "$pid" ) >/dev/null 2>&1 & dog=$!
+            wait "$pid"; r=$?
+            kill "$dog" 2>/dev/null
+            exit "$r"
+        ) || rc=$?
+        [ "$rc" -gt 128 ] && [ "$(( _HC_WV_START_US + budget_ms * 1000 ))" -le "$(_hc_now_us)" ] && return 124
+    fi
+    return "$rc"
+}
+
+# _hc_wv_refuse_late -- the refusal when the budget ran out (exit 2 for the caller).
+_hc_wv_refuse_late() {
+    _hc_observe edit_guard_judged_in_time deny
+    cat >&2 <<EOF
+🛑 Weave edit guard could not judge this edit in time: ${_HC_WV_WAITED:-wv} was
+still waiting on the graph after the guard's ${WV_PTU_WAIT_BUDGET_MS:-7000} ms budget
+(another wv process holds it: a load, sync, migration or gate).
+The edit is refused rather than admitted unchecked. Retry it once that work
+finishes; wv status shows when the graph answers again (wv-3a8c06).
+EOF
+    return 2
+}
+
 # _hc_db_preflight — verify the hot-zone DB exists before attempting wv queries.
 # Args: [db_path] — defaults to $_HC_DB.
 # Returns:
@@ -124,6 +194,7 @@ _hc_init_hygiene_tally() {
     _HC_WITH_ACTIVE=""
     if _wf_in_list "$tool" "${_WF_HOOK_EDIT_TOOLS[@]}"; then
         _HC_TALLY_FILE="${_HC_HOT_ZONE}/session-edits.json"
+        declare -F wv_session_edits_file >/dev/null && _HC_TALLY_FILE=$(wv_session_edits_file "$_HC_HOT_ZONE")
         local prior total with_active
         prior=$(cat "$_HC_TALLY_FILE" 2>/dev/null || echo '{}')
         total=$(echo "$prior" | jq -r '.total // 0' 2>/dev/null || echo 0)
@@ -231,7 +302,7 @@ _hc_classify_tool() {
         _HC_MALFORMED_REASON="missing_required_field: tool_name"
         return 0
     fi
-    if [ -n "$tool_input" ] && ! printf '%s' "$tool_input" | jq -e 'type == "object" or type == "null"' >/dev/null 2>&1; then
+    if [ -n "$tool_input" ] && ! printf '%s' "$tool_input" | jq -se 'length == 1 and (.[0] | type == "object" or type == "null")' >/dev/null 2>&1; then
         _HC_MALFORMED=true
         _HC_MALFORMED_REASON="invalid_required_field: tool_input must be an object"
         return 0
@@ -374,7 +445,11 @@ _hc_check_active_node() {
     # Only the caller's own claims admit an edit (owner ruling 2026-11-04,
     # wv-43d6be): another session's active node never does, and an
     # unverifiable session has none (list --claimed-by=current refuses it).
-    _HC_ACTIVE_NODES=$("$WV" list --status=active --claimed-by=current --json 2>/dev/null || echo "[]")
+    local _hc_rc=0
+    _hc_wv list --status=active --claimed-by=current --json || _hc_rc=$?
+    [ "$_hc_rc" -ne 124 ] || { _hc_wv_refuse_late; return 2; }
+    _HC_ACTIVE_NODES="$_HC_WV_OUT"
+    [ "$_hc_rc" -eq 0 ] && [ -n "$_HC_ACTIVE_NODES" ] || _HC_ACTIVE_NODES="[]"
     _HC_ACTIVE_COUNT=$(echo "$_HC_ACTIVE_NODES" | jq 'length' 2>/dev/null || echo "0")
 
     if [ -n "$new_total" ] && [ -n "$edits_file" ]; then
@@ -432,7 +507,15 @@ EOF
 #   0 → node is current, or epoch data unavailable; caller continues
 #   2 → stale node; caller: exit 2
 _hc_check_stale_node() {
+    # This session's own epoch (wv-9a867a): a peer starting in the same
+    # checkout no longer moves it. The flat file is a session without an id,
+    # or one started before the per-session files.
     local session_epoch_file="${_HC_HOT_ZONE}/.session_epoch"
+    if declare -F wv_session_file >/dev/null; then
+        local own
+        own=$(wv_session_file "$_HC_HOT_ZONE" epoch)
+        [ -f "$own" ] && session_epoch_file="$own"
+    fi
     [ -f "$session_epoch_file" ] || return 0
 
     local session_epoch node_updated
@@ -512,14 +595,22 @@ _hc_check_context_pack() {
         return 0
     fi
 
-    _HC_CONTEXT_PACK=$("$WV" context "$node_id" --json 2>/dev/null || echo "")
+    local _hc_rc=0
+    _hc_wv context "$node_id" --json || _hc_rc=$?
+    [ "$_hc_rc" -ne 124 ] || { _hc_wv_refuse_late; return 2; }
+    _HC_CONTEXT_PACK=""
+    [ "$_hc_rc" -ne 0 ] || _HC_CONTEXT_PACK="$_HC_WV_OUT"
 
+    # A pack that cannot be made leaves the edit unjudged, so it is refused
+    # (wv-187945); exit 1 was a host error that let the edit through.
     if [ -z "$_HC_CONTEXT_PACK" ]; then
+        _hc_observe edit_guard_judged_in_time deny
         cat >&2 <<EOF
-⚠️  Context Pack generation failed for node $node_id.
+🛑 Context Pack generation failed for node $node_id; the edit is refused
+until the guard can judge it.
 Check: wv show $node_id / wv status
 EOF
-        return 1
+        return 2
     fi
     return 0
 }

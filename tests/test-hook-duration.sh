@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# test-hook-duration.sh — hook_duration_ms in the pre-commit and pre-push hooks.
+# test-hook-duration.sh — hook_duration_ms, the wall-clock helper both gates
+# load from scripts/lib/wv-clock.sh.
 #
-# Both gates record each suite's wall-clock cost with this helper, and the
-# suite ledger's timings (and the [heavy] tier chosen from them) are only as
-# good as it is. Flipping its negative clamp to '-ge 0' zeroed every recorded
-# duration and no suite noticed (wv-8561b6, S0 re-measure). The helper is
-# defined in each hook, so each copy is extracted from its own file and driven
-# directly.
+# The gates time a suite or lane the supervisor gave no monotonic reading for
+# with this helper (labelled clock=wall, wv-b17a85), and those timings are only
+# as good as it is. Flipping its negative clamp to '-ge 0' zeroed every
+# recorded duration and no suite noticed (wv-8561b6, S0 re-measure). Each hook
+# once carried its own copy; the one copy is now the library's, loaded here
+# with no caller definition in place and driven directly.
 #
 # Exit codes:
 #   0 - All tests passed
@@ -34,16 +35,17 @@ check() {
     fi
 }
 
-for hook in pre-commit-weave.sh pre-push-weave.sh; do
-    src="$ROOT/scripts/hooks/$hook"
-    body=$(awk '/^hook_duration_ms\(\) \{/ {on=1} on {print} on && /^\}/ {exit}' "$src")
-    check "$hook: defines hook_duration_ms" test -n "$body"
-    [ -n "$body" ] || continue
-    eval "$body"
-
-    now=$(date +%s%N)
-    case "$now" in *[!0-9]*) echo "  (nanosecond date unavailable; timing cases skipped)"; continue ;; esac
-
+hook=wv-clock.sh
+unset -f hook_duration_ms
+# shellcheck source=scripts/lib/wv-clock.sh
+source "$ROOT/scripts/lib/$hook"
+check "$hook: defines hook_duration_ms" declare -F hook_duration_ms
+now=$(date +%s%N)
+if ! declare -F hook_duration_ms >/dev/null; then
+    :
+elif [[ "$now" == *[!0-9]* ]]; then
+    echo "  (nanosecond date unavailable; timing cases skipped)"
+else
     past=$(hook_duration_ms "$((now - 2000000000))")
     check "$hook: a start 2s ago reports about 2000ms (got $past)" \
         test "$past" -ge 1900 -a "$past" -lt 60000
@@ -52,8 +54,7 @@ for hook in pre-commit-weave.sh pre-push-weave.sh; do
     check "$hook: the 0 sentinel reports 0" test "$(hook_duration_ms 0)" = 0
     check "$hook: a non-numeric start reports 0" test "$(hook_duration_ms 12N)" = 0
     check "$hook: an empty start reports 0" test "$(hook_duration_ms '')" = 0
-    unset -f hook_duration_ms
-done
+fi
 
 echo ""
 echo "Results: $((TESTS_RUN - TESTS_FAILED))/$TESTS_RUN passed"

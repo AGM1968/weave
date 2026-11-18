@@ -40,4 +40,21 @@ bash "$ROOT/scripts/project-procedures.sh" --source="$WRAP" --repo="$WREPO"
 grep -qF 'Wrapped desc first line second line here' "$WREPO/.claude/skills/wv-wrapped/SKILL.md"
 [ "$(jq -r '.procedures[0].description' "$WREPO/.codex/weave.json")" = 'Wrapped desc first line second line here' ]
 grep -qF 'Wrapped desc first line second line here' "$WREPO/.github/copilot-instructions.md"
-printf '%s\n' 'Results: 14/14 passed'
+
+# Run from a checkout with no --source and no WV_CONFIG_DIR, the projector reads
+# the checkout's templates/procedures, not a stale installed copy (wv-720adc).
+CK="$TMP/checkout"
+mkdir -p "$CK/scripts/lib" "$CK/templates/procedures" "$TMP/home/.config/weave/procedures" "$TMP/ckrepo"
+cp "$ROOT/scripts/project-procedures.sh" "$ROOT/scripts/gen-procedures.sh" "$CK/scripts/"
+cp "$ROOT/scripts/lib/wv-repository-class.sh" "$ROOT/scripts/lib/wv-skill-retirement.sh" "$CK/scripts/lib/"
+for side in checkout installed; do
+    dir="$CK/templates/procedures"; [ "$side" = installed ] && dir="$TMP/home/.config/weave/procedures"
+    printf '%s\n' '---' 'id: probe' "description: Probe from the $side copy" 'fallback: "wv guide --procedure=probe"' \
+        'adapters: [claude]' 'visibility: shared' 'claude_skill: wv-probe' '---' '# Body' > "$dir/probe.md"
+done
+env -u WV_CONFIG_DIR HOME="$TMP/home" bash "$CK/scripts/project-procedures.sh" --repo="$TMP/ckrepo" --agent=claude
+grep -qF 'Probe from the checkout copy' "$TMP/ckrepo/.claude/skills/wv-probe/SKILL.md"
+# An explicit WV_CONFIG_DIR still chooses the installed set.
+env WV_CONFIG_DIR="$TMP/home/.config/weave" HOME="$TMP/home" bash "$CK/scripts/project-procedures.sh" --repo="$TMP/ckrepo" --agent=claude
+grep -qF 'Probe from the installed copy' "$TMP/ckrepo/.claude/skills/wv-probe/SKILL.md"
+printf '%s\n' 'Results: 16/16 passed'

@@ -192,7 +192,27 @@ WV_SUITE_LOG_DEFAULT="${WV_SUITE_LOG_DEFAULT:-$HOME/.local/share/weave/suite_run
 # session-edits.json, the other session counter health reads. WV_BUDGET_DIR
 # still overrides the directory for both.
 wv_session_budget_file() {
-    printf '%s/session-budget.json\n' "${WV_BUDGET_DIR:-$1}"
+    wv_session_counter_file "${WV_BUDGET_DIR:-$1}" session-budget
+}
+
+# wv_session_edits_file <hot-zone> — the edit-discipline tally (hooks write,
+# wv health reads), in the hot zone.
+wv_session_edits_file() {
+    wv_session_counter_file "$1" session-edits
+}
+
+# wv_session_counter_file <dir> <base> — <dir>/<base>.<digest16>.json for a
+# known session, else <dir>/<base>.json. Two sessions in one checkout share the
+# hot zone; one file per counter mixed their tallies and lost updates in
+# read-modify-write races (wv-9a867a).
+wv_session_counter_file() {
+    local sid=""
+    declare -F _wv_agent_session_sid >/dev/null && sid=$(_wv_agent_session_sid 2>/dev/null)
+    if [ -n "$sid" ]; then
+        printf '%s/%s.%s.json\n' "$1" "$2" "$sid"
+    else
+        printf '%s/%s.json\n' "$1" "$2"
+    fi
 }
 
 _WV_ENV_OVERRIDE_HOT_ZONE=$(resolve_env_override_hot_zone)
@@ -464,7 +484,7 @@ _wv_concurrent_session() {
         hops=$((hops + 1))
     done
 
-    local pid_dir pid cwd comm cmd
+    local pid_dir pid cwd comm exe cmd
     for pid_dir in /proc/[0-9]*; do
         pid="${pid_dir#/proc/}"
         case "$self_chain" in *" $pid "*) continue ;; esac
@@ -479,17 +499,91 @@ _wv_concurrent_session() {
         # prefix would catch pip/ping/pipewire. AI_AGENT in environ is not a
         # usable signal — the harness sets it for its children, not itself,
         # so it would flag this session's own non-ancestor shells.
+        # The exe basename is checked too (wv-e6a111): Copilot CLI's main
+        # thread renames itself, so its comm is `MainThread` while its exe is
+        # .../copilot. readlink fails on other users' processes; comm alone
+        # then decides, as before.
         comm=$(cat "$pid_dir/comm" 2>/dev/null)
-        [ -n "$comm" ] || continue
-        case "$comm" in
-            codex*|claude*|copilot*|pi|amp) ;;
-            *) continue ;;
-        esac
+        exe=$(_wv_exe_basename "$pid")
+        _wv_agent_name_match "$comm" || _wv_agent_name_match "$exe" || continue
         cmd=$(tr '\0' ' ' < "$pid_dir/cmdline" 2>/dev/null)
-        [ -n "$cmd" ] || cmd="$comm"
+        [ -n "$cmd" ] || cmd="${comm:-$exe}"
         printf 'another live agent process (pid %s: %s) has a working directory inside this repo -- working-tree edits are not coordinated between sessions (wv-fa566a)' \
             "$pid" "$(printf '%s' "$cmd" | cut -c1-80)"
         return 0
+    done
+    _wv_copilot_lock_peer "$repo_root" "$self_chain"
+}
+
+# _wv_agent_name_match <name> — the agent-name rule applied to both comm and
+# the exe basename. comm is truncated to 15 chars, so codex/claude/copilot
+# match by prefix; pi and amp stay exact so pip, ping and pipewire never match.
+_wv_agent_name_match() {
+    case "$1" in
+        codex*|claude*|copilot*|pi|amp) return 0 ;;
+    esac
+    return 1
+}
+
+# _wv_exe_basename <pid> — basename of /proc/<pid>/exe, without the
+# " (deleted)" suffix the kernel adds after the binary is replaced (an
+# auto-update); empty when unreadable.
+_wv_exe_basename() {
+    local exe
+    exe=$(readlink "/proc/$1/exe" 2>/dev/null) || return 0
+    exe="${exe% (deleted)}"
+    printf '%s' "${exe##*/}"
+}
+
+# _wv_copilot_lock_peer <repo_root> <self_chain> — wv-e6a111: VS Code's
+# Copilot runtime works in a repo while its process cwd stays $HOME (the
+# workspace arrives over --stdio), so the cwd scan above cannot see it.
+# Both Copilot clients (CLI: client_name github/cli; VS Code:
+# vscode-agent-host) hold ${COPILOT_HOME:-~/.copilot}/session-state/<id>/
+# inuse.<pid>.lock next to a workspace.yaml naming cwd and git_root.
+# A lock counts only when its pid is live, outside the caller's chain, runs
+# an exe named copilot or copilot-runtime, started no later than the lock was
+# written (a dead session's lock whose pid was reused is older than the new
+# process), and its workspace.yaml names this repo. Locks without a
+# workspace.yaml are skipped. Echoes a description and returns 0 on a hit.
+_wv_copilot_lock_peer() {
+    local repo_root="$1" self_chain="$2"
+    local state_dir="${COPILOT_HOME:-$HOME/.copilot}/session-state"
+    [ -d "$state_dir" ] || return 1
+    local btime tck lock pid start ws client line val
+    btime=$(awk '/^btime /{print $2}' /proc/stat 2>/dev/null)
+    tck=$(getconf CLK_TCK 2>/dev/null)
+    [ -n "$btime" ] && [ -n "$tck" ] || return 1
+    for lock in "$state_dir"/*/inuse.*.lock; do
+        [ -f "$lock" ] || continue
+        pid="${lock##*/inuse.}"
+        pid="${pid%.lock}"
+        case "$pid" in '' | *[!0-9]*) continue ;; esac
+        case "$self_chain" in *" $pid "*) continue ;; esac
+        case "$(_wv_exe_basename "$pid")" in copilot | copilot-runtime) ;; *) continue ;; esac
+        # Field 22 of /proc/<pid>/stat is the start time in ticks since boot.
+        # comm (field 2) may hold spaces or ')', so strip through the last
+        # ") "; field 22 is then the 20th.
+        start=$(sed 's/^.*) //' "/proc/$pid/stat" 2>/dev/null | awk '{print $20}')
+        [ -n "$start" ] || continue
+        [ "$(stat -c %Y "$lock" 2>/dev/null || echo 0)" -ge $((btime + start / tck)) ] || continue
+        ws="${lock%/*}/workspace.yaml"
+        [ -f "$ws" ] || continue
+        client=$(awk -F': *' '$1=="client_name"{print $2; exit}' "$ws" 2>/dev/null)
+        while IFS= read -r line; do
+            case "$line" in cwd:* | git_root:*) ;; *) continue ;; esac
+            val="${line#*:}"
+            val="${val# }"
+            val="${val#\"}"
+            val="${val%\"}"
+            case "$val" in
+                "$repo_root" | "$repo_root"/*)
+                    printf 'another live agent session (pid %s: %s, Copilot session %s) is working inside this repo -- working-tree edits are not coordinated between sessions (wv-fa566a)' \
+                        "$pid" "${client:-copilot}" "$(basename "${lock%/*}")"
+                    return 0
+                    ;;
+            esac
+        done <"$ws"
     done
     return 1
 }

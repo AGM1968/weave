@@ -1,214 +1,69 @@
-#!/bin/bash
-# Weave Graph Audit Report
-# Generates a comprehensive report of graph health and issues
-
+#!/usr/bin/env bash
+# Weave graph audit report: what wv health scores, plus the work-queue checks
+# it does not (old unclaimed todo, stuck active, done without a learning).
+# Read-only. Installed beside the graph-hygiene procedure; run it in the repo.
 set -euo pipefail
 
-echo "=== Weave Graph Audit Report ==="
-echo ""
-echo "Generated: $(date)"
-echo ""
+STALE_TODO_DAYS="${WV_AUDIT_TODO_DAYS:-7}"
+STUCK_ACTIVE_DAYS="${WV_AUDIT_ACTIVE_DAYS:-2}"
+SHOW="${WV_AUDIT_SHOW:-10}"
 
+command -v wv >/dev/null 2>&1 || { echo "audit-report: wv not found on PATH" >&2; exit 1; }
+command -v jq >/dev/null 2>&1 || { echo "audit-report: jq not found on PATH" >&2; exit 1; }
+
+cutoff() { # days -> UTC date, GNU or BSD date
+    date -u -d "$1 days ago" '+%Y-%m-%d' 2>/dev/null || date -u -v-"$1"d '+%Y-%m-%d'
+}
+TODO_CUTOFF=$(cutoff "$STALE_TODO_DAYS")
+ACTIVE_CUTOFF=$(cutoff "$STUCK_ACTIVE_DAYS")
+
+# One read of the graph; every section filters this snapshot.
+nodes=$(wv list --all --json)
+# wv health exits nonzero when its status is not healthy; the report is still
+# complete, so judge the payload instead: no score means no report.
+health=$(wv health --json 2>/dev/null) || true
+jq -e '.score | numbers' <<< "$health" >/dev/null 2>&1 \
+    || { echo "audit-report: wv health --json returned no score" >&2; exit 1; }
+
+# section <title> <jq condition over one node>: the count, then the first $SHOW
+# matches. jq truncates the list itself: piping into head would SIGPIPE jq and,
+# under pipefail, abort the report on any graph with more matches than shown.
+section() {
+    local title="$1" condition="$2"
+    jq -r --arg todo "$TODO_CUTOFF" --arg active "$ACTIVE_CUTOFF" --argjson show "$SHOW" --arg title "$title" "
+        [.[] | select($condition)] as \$hits
+        | \"### \(\$title): \(\$hits | length)\",
+          (\$hits[:\$show][] | \"- \(.id): \(.text[:100])\")" <<< "$nodes"
+    echo ""
+}
+
+# A learning is stored as metadata.learning or as decision/pattern/pitfall keys.
+# A memory or session-history node is itself the record, so it is not counted.
+# shellcheck disable=SC2016  # $k is a jq variable
+LEARNED='(.metadata | (try fromjson catch {}) | (has("learning") or has("decision") or has("pattern") or has("pitfall")
+    or ((.node_kind // .type) as $k | $k == "memory" or $k == "session_history")))'
+
+echo "# Weave Graph Audit"
+echo ""
+echo "Generated: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+echo ""
 echo "## Summary"
-total=$(wv list --all --json 2>/dev/null | jq 'length' || echo "0")
-active=$(wv list --status=active --json --all 2>/dev/null | jq 'length' || echo "0")
-blocked=$(wv list --status=blocked --json --all 2>/dev/null | jq 'length' || echo "0")
-todo=$(wv list --status=todo --json --all 2>/dev/null | jq 'length' || echo "0")
-done=$(wv list --all --status=done --json 2>/dev/null | jq 'length' || echo "0")
-
-echo "Total nodes: $total"
-echo "Active: $active"
-echo "Blocked: $blocked"
-echo "Todo: $todo"
-echo "Done: $done"
 echo ""
-
-echo "## Issues Found"
+jq -r 'group_by(.status)[] | "- \(.[0].status): \(length)"' <<< "$nodes"
+echo "- total: $(jq 'length' <<< "$nodes")"
+jq -r '"- wv health: \(.score)/100 (\(.status))"' <<< "$health"
 echo ""
-
-echo "### Orphaned Nodes (todo >7 days)"
-CUTOFF_DATE=$(date -d '7 days ago' '+%Y-%m-%d' 2>/dev/null || date -v-7d '+%Y-%m-%d' 2>/dev/null || echo "2020-01-01")
-orphaned=$(wv list --json --all 2>/dev/null | jq -r --arg date "$CUTOFF_DATE" \
-  '.[] | select(.status=="todo" and .created_at < $date) | "- \(.id): \(.text)"' | head -10)
-
-if [ -n "$orphaned" ]; then
-  echo "$orphaned"
-else
-  echo "None found ✓"
-fi
+echo "## Findings"
 echo ""
-
-echo "### Stuck Active Nodes (>2 days)"
-STUCK_DATE=$(date -d '2 days ago' '+%Y-%m-%d' 2>/dev/null || date -v-2d '+%Y-%m-%d' 2>/dev/null || echo "2020-01-01")
-stuck=$(wv list --json --all 2>/dev/null | jq -r --arg date "$STUCK_DATE" \
-  '.[] | select(.status=="active" and .updated_at < $date) | "- \(.id): \(.text)"' | head -10)
-
-if [ -n "$stuck" ]; then
-  echo "$stuck"
-else
-  echo "None found ✓"
-fi
+# shellcheck disable=SC2016  # $todo and $active are jq variables, not shell
+section "Todo unclaimed for more than $STALE_TODO_DAYS days" '.status == "todo" and .created_at < $todo'
+# shellcheck disable=SC2016  # jq variable
+section "Active and untouched for more than $STUCK_ACTIVE_DAYS days" '.status == "active" and .updated_at < $active'
+section "Done without a learning" ".status == \"done\" and ($LEARNED | not)"
+echo "### wv health issues"
+jq -r '(.issues // {}) | to_entries
+    | map(select((.value | type) == "number" and .value > 0 and .key != "intentional_standalones"))
+    | if length == 0 then "- none" else .[] | "- \(.key): \(.value)" end' <<< "$health"
+jq -r '(.issues.orphan_ids // []) | select(length > 0) | "  orphans: \(join(" "))"' <<< "$health"
 echo ""
-
-echo "### Nodes Missing Type"
-no_type=$(wv list --json --all 2>/dev/null | jq -r '.[] | select(.type == null) | "- \(.id): \(.text)"' | head -10)
-
-if [ -n "$no_type" ]; then
-  echo "$no_type"
-else
-  echo "All nodes have type ✓"
-fi
-echo ""
-
-echo "### Nodes Missing Priority"
-no_priority=$(wv list --json --all 2>/dev/null | jq -r '.[] | select(.priority == null) | "- \(.id): \(.text)"' | head -10)
-
-if [ -n "$no_priority" ]; then
-  echo "$no_priority"
-else
-  echo "All nodes have priority ✓"
-fi
-echo ""
-
-echo "### Done Nodes Without Learnings"
-no_learnings=$(wv list --all --json 2>/dev/null | jq -r '.[] | select(.status=="done") |
-  select(
-    (.metadata | fromjson | has("decision")) == false and
-    (.metadata | fromjson | has("pattern")) == false and
-    (.metadata | fromjson | has("pitfall")) == false
-  ) | "- \(.id): \(.text)"' | head -10)
-
-if [ -n "$no_learnings" ]; then
-  echo "$no_learnings"
-else
-  echo "All completed nodes have learnings ✓"
-fi
-echo ""
-
-echo "### Epics With No Tracked Children"
-epics_no_children=$(wv list --json --all 2>/dev/null | jq -r '
-  .[] | select(
-    .status != "done" and
-    ((.metadata // "{}") | try fromjson catch {} | .type) == "epic"
-  ) | .id' 2>/dev/null | while read -r eid; do
-    child_count=$(wv list --json --all 2>/dev/null | jq --arg eid "$eid" \
-      '[.[] | select(.metadata != null) | select((.metadata | try fromjson catch {}) | .parent == $eid)] | length' 2>/dev/null || echo "0")
-    # Check via edges (implements edges pointing to this epic)
-    edge_count=$(sqlite3 "${WV_DB:-/dev/null}" \
-      "SELECT COUNT(*) FROM edges WHERE target='$eid' AND type='implements';" 2>/dev/null || echo "0")
-    if [ "$edge_count" = "0" ] && [ "${child_count:-0}" = "0" ]; then
-      wv show "$eid" 2>/dev/null | grep "Text:" | sed "s/Text:/- $eid:/"
-    fi
-  done)
-
-if [ -n "$epics_no_children" ]; then
-  echo "$epics_no_children"
-else
-  echo "All open epics have tracked children ✓"
-fi
-echo ""
-
-echo "## Health Score"
-echo ""
-
-# Calculate health score (100 = perfect)
-score=100
-
-# Deduct for orphaned nodes
-orphaned_count=$(wv list --json --all 2>/dev/null | jq --arg date "$CUTOFF_DATE" \
-  '[.[] | select(.status=="todo" and .created_at < $date)] | length' || echo "0")
-score=$((score - orphaned_count * 5))
-
-# Deduct for stuck active nodes
-stuck_count=$(wv list --json --all 2>/dev/null | jq --arg date "$STUCK_DATE" \
-  '[.[] | select(.status=="active" and .updated_at < $date)] | length' || echo "0")
-score=$((score - stuck_count * 10))
-
-# Deduct for missing metadata
-no_type_count=$(wv list --json --all 2>/dev/null | jq '[.[] | select(.type == null)] | length' || echo "0")
-score=$((score - no_type_count * 2))
-
-no_priority_count=$(wv list --json --all 2>/dev/null | jq '[.[] | select(.priority == null)] | length' || echo "0")
-score=$((score - no_priority_count * 2))
-
-# Deduct for missing learnings
-no_learnings_count=$(wv list --all --json 2>/dev/null | jq '[.[] | select(.status=="done") |
-  select(
-    (.metadata | fromjson | has("decision")) == false and
-    (.metadata | fromjson | has("pattern")) == false and
-    (.metadata | fromjson | has("pitfall")) == false
-  )] | length' || echo "0")
-score=$((score - no_learnings_count * 3))
-
-# Deduct for epics with no tracked children (flat graph, navigation broken)
-epics_no_children_count=0
-while IFS= read -r eid; do
-  [ -z "$eid" ] && continue
-  edge_count=$(sqlite3 "${WV_DB:-/dev/null}" \
-    "SELECT COUNT(*) FROM edges WHERE target='$eid' AND type='implements';" 2>/dev/null || echo "0")
-  if [ "$edge_count" = "0" ]; then
-    epics_no_children_count=$((epics_no_children_count + 1))
-  fi
-done < <(wv list --json --all 2>/dev/null | jq -r '.[] | select(.status != "done") | select(((.metadata // "{}") | try fromjson catch {} | .type) == "epic") | .id' 2>/dev/null || true)
-score=$((score - epics_no_children_count * 15))
-
-# Ensure score doesn't go below 0
-[ "$score" -lt 0 ] && score=0
-
-echo "Overall Health: $score/100"
-echo ""
-
-if [ "$score" -ge 90 ]; then
-  echo "Status: ✅ Excellent - Graph is in great shape"
-elif [ "$score" -ge 70 ]; then
-  echo "Status: ✓ Good - Minor issues to address"
-elif [ "$score" -ge 50 ]; then
-  echo "Status: ⚠️  Fair - Some housekeeping needed"
-else
-  echo "Status: 🔴 Needs Attention - Significant issues found"
-fi
-echo ""
-
-echo "## Recommendations"
-echo ""
-
-if [ "$orphaned_count" -gt 0 ]; then
-  echo "1. Review $orphaned_count orphaned nodes and either complete or archive them"
-fi
-
-if [ "$stuck_count" -gt 0 ]; then
-  echo "2. Update $stuck_count stuck active nodes or complete them"
-fi
-
-if [ "$no_type_count" -gt 0 ]; then
-  echo "3. Add type metadata to $no_type_count nodes for better organization"
-fi
-
-if [ "$no_priority_count" -gt 0 ]; then
-  echo "4. Add priority metadata to $no_priority_count nodes"
-fi
-
-if [ "$no_learnings_count" -gt 0 ]; then
-  echo "5. Capture learnings for $no_learnings_count completed nodes (if non-trivial)"
-fi
-
-if [ "$epics_no_children_count" -gt 0 ]; then
-  echo "6. Link sub-tasks to $epics_no_children_count epic(s) with no children — use 'wv add ... --parent=<epic-id>' or 'wv link <child> <epic> --type=implements'"
-fi
-
-# Check if pruning is recommended
-pruneable=$(wv list --all --json 2>/dev/null | jq --arg date "$(date -d '7 days ago' '+%Y-%m-%d' 2>/dev/null || date -v-7d '+%Y-%m-%d' 2>/dev/null || echo "2020-01-01")" \
-  '[.[] | select(.status=="done" and .updated_at < $date)] | length' || echo "0")
-
-if [ "$pruneable" -gt 0 ]; then
-  echo "6. Run 'wv prune --age=168' to archive $pruneable old completed nodes"
-fi
-
-if [ "$score" -ge 90 ]; then
-  echo ""
-  echo "Graph is healthy! Keep up the good work."
-fi
-
-echo ""
-echo "---"
-echo "Next audit: $(date -d '+7 days' '+%Y-%m-%d' 2>/dev/null || date -v+7d '+%Y-%m-%d' 2>/dev/null || echo 'Next week')"
+echo "Next: wv guide --procedure=graph-hygiene (classify orphans before wv prune)."

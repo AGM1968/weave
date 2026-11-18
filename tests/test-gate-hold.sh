@@ -157,7 +157,26 @@ git -C "$R" worktree add -q --detach "$T/wt" HEAD
 hold
 OUT=$(cd "$T/wt" && env -i PATH="$PATH" HOME="$HOME" bash -c ". '$LIB'; wv_gate_hold_acquire pre-commit x" 2>&1); RC=$?
 check "a linked worktree has its own lock" "0" "$RC"
+# wv-8abb6a: a gate holding another worktree of the repository.
+fst=$(cd "$T/wt" && env -i PATH="$PATH" HOME="$HOME" bash -c ". '$LIB'; wv_gate_hold_foreign_status")
+check "the linked worktree sees the main worktree's live gate as foreign" "$HOLDER" "$(jq -r '.pid' <<< "$fst" 2>/dev/null)"
+check "...while the main worktree does not count its own gate as foreign" "" "$(in_env -- "wv_gate_hold_foreign_status")"
 drop
+check "a dead holder's record in another worktree reads as nothing" "" \
+    "$(cd "$T/wt" && env -i PATH="$PATH" HOME="$HOME" bash -c ". '$LIB'; wv_gate_hold_foreign_status")"
+rm -f "$T/ready"
+(cd "$T/wt" && exec env -i PATH="$PATH" HOME="$HOME" bash -c ". '$LIB'; wv_gate_hold_acquire pre-push x && echo \$\$ > '$T/ready.tmp' && mv '$T/ready.tmp' '$T/ready' && sleep 60") &
+pids+=("$!")
+i=0; while [ ! -f "$T/ready" ] && [ "$i" -lt 100 ]; do sleep 0.05; i=$((i+1)); done
+HOLDER=$(cat "$T/ready" 2>/dev/null); pids+=("$HOLDER")
+check "the main worktree sees a linked worktree's live gate as foreign" "$HOLDER" "$(in_env -- "wv_gate_hold_foreign_status" | jq -r '.pid' 2>/dev/null)"
+check "...and the linked worktree does not count its own" "" \
+    "$(cd "$T/wt" && env -i PATH="$PATH" HOME="$HOME" bash -c ". '$LIB'; wv_gate_hold_foreign_status")"
+drop
+wtrec="$(git -C "$R" rev-parse --path-format=absolute --git-common-dir)/worktrees/wt/weave-gate.holder.json"
+jq -cn --arg p "$$" '{kind:"pre-push", pid:($p | tonumber), start:"Thu Jan  1 00:00:00 1970", agent_id:"ghost"}' > "$wtrec"
+check "a foreign record whose pid now names another process reads as nothing" "" "$(in_env -- "wv_gate_hold_foreign_status")"
+rm -f "$wtrec"
 
 echo "last push outcome"
 rm -f "$T/ready"

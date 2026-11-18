@@ -802,6 +802,10 @@ assert_contains "$(cat "$REPO6/.gitattributes")" "-diff linguist-generated"  "gi
 assert_contains "$(cat "$REPO6/.gitattributes")" "state.sql.txt-dump"        "gitattr: has txt-dump entry"
 assert_contains "$(cat "$REPO6/.gitattributes")" "quality-adjudications.jsonl merge=union" "gitattr: adjudications use union merge"
 assert_contains "$(cat "$REPO6/.gitattributes")" "deltas/**/*.sql merge=theirs" "gitattr: has deltas merge=theirs"
+# wv-8595fb: concurrent trails notes merge through the installed driver.
+assert_contains "$(cat "$REPO6/.gitattributes")" ".weave/trails.md merge=wv-trails" "gitattr: trails.md uses the notes-aware driver"
+assert_contains "$(git -C "$REPO6" config --get merge.wv-trails.driver)" "$WV_LIB_DIR/merge-trails.py" "gitattr: the trails driver runs the installed script"
+assert_file_exists "$WV_LIB_DIR/merge-trails.py" "install: the trails merge driver is installed"
 assert_contains "$(cat "$REPO6/.gitignore")" "!.weave/quality-adjudications.jsonl" "gitignore: adjudication projection remains tracked"
 
 # --- .gitattributes: upgrade bare entries to marker block ---
@@ -960,29 +964,51 @@ cd "$REPO_MN"
 "$WV" remember "A memory in a repo whose CLAUDE.md has no block" >/dev/null 2>&1
 "$WV" init-repo --update --agent=claude >/dev/null 2>&1
 assert_equals "0" "$(grep -c 'WEAVE:MEMORY' CLAUDE.md || true)" "memory index: --update adds no block to a CLAUDE.md without one"
-# --- the skills a consumer gets are the skills install.sh installs (wv-b49316) ---
-# install.sh names its skills twice: WV_CONFIG_SKILLS (what it writes to CONFIG_DIR) and the SKILLS
-# array wv init-repo copies into a consumer. The breadcrumbs -> trails rename
+# --- the skills a consumer gets are the skills install.sh installs (wv-b49316, wv-fb2c31) ---
+# install.sh named its skills twice: WV_CONFIG_SKILLS (what it writes to CONFIG_DIR) and a SKILLS
+# array wv init-repo copied into a consumer. The breadcrumbs -> trails rename
 # reached only the first, so consumers kept a deprecated skill and never got
-# trails. The two lists must agree, and --update must deliver trails.
+# trails. wv-b49316 tested that the two lists agreed; wv-fb2c31 removed the
+# second list: wv init-repo reads the manifest install.sh writes from
+# WV_CONFIG_SKILLS, so the two cannot disagree. --update must deliver trails.
 echo ""
 echo "--- consumer skills match the installed skills ---"
-SK_CONFIG=$(sed -n '/^WV_CONFIG_SKILLS=(/,/)/p' "$PROJECT_ROOT/install.sh" \
-    | sed 's/^WV_CONFIG_SKILLS=(//; s/)//' | tr ' ' '\n' | grep . | sort -u | tr '\n' ' ')
-SK_ARRAY=$(grep -oE '^ +SKILLS=\([^)]*\)' "$PROJECT_ROOT/install.sh" | sed -n 1p \
-    | sed 's/.*(//; s/)//' | tr ' ' '\n' | grep . | sort -u | tr '\n' ' ')
-assert_equals "$SK_CONFIG" "$SK_ARRAY" "skills: the init-repo SKILLS array is the CONFIG_DIR skill set"
-if [ -f "$WV_CONFIG_DIR/skills/trails/SKILL.md" ]; then
-    REPO_SK=$(make_test_repo "skills-trails")
-    cd "$REPO_SK"
+SK_INIT=$(sed -n "/^cat > \"\$INSTALL_DIR\/wv-init-repo\" << 'INITEOF'/,/^INITEOF\$/p" "$PROJECT_ROOT/install.sh")
+assert_equals "0" "$(grep -cE '^ +SKILLS=\([a-z]' <<< "$SK_INIT" || true)" \
+    "skills: wv init-repo carries no skill list of its own"
+# Join lines until the closing paren: a /start/,/)/ range looks for its end
+# only from the next line, so a one-line array ran on to a later ')' (wv-1fc64f).
+SK_CONFIG=$(sed -n '/^WV_CONFIG_SKILLS=(/{:a;/)/!{N;ba;};p;}' "$PROJECT_ROOT/install.sh" | tr '\n' ' ' \
+    | sed 's/^WV_CONFIG_SKILLS=(//; s/)//' | tr ' ' '\n' | { grep . || true; } | sort -u | tr '\n' ' ')
+# Both sets are empty since every Weave skill is a projection (wv-c7f784); an
+# empty grep must not end the suite under pipefail.
+SK_MANIFEST=$({ grep . "$WV_CONFIG_DIR/skills/.weave-installed" 2>/dev/null || true; } | sort -u | tr '\n' ' ')
+assert_equals "$SK_CONFIG" "$SK_MANIFEST" "skills: the installed manifest is the WV_CONFIG_SKILLS set"
+# Negative control: a skill named only in the manifest reaches the consumer,
+# so the manifest is what wv init-repo reads.
+if [ -f "$WV_CONFIG_DIR/skills/.weave-installed" ]; then
+    cp "$WV_CONFIG_DIR/skills/.weave-installed" "$TEST_INSTALL/manifest.saved"
+    mkdir -p "$WV_CONFIG_DIR/skills/zz-manifest-probe"
+    printf -- '---\nname: zz-manifest-probe\n---\nprobe\n' > "$WV_CONFIG_DIR/skills/zz-manifest-probe/SKILL.md"
+    echo zz-manifest-probe >> "$WV_CONFIG_DIR/skills/.weave-installed"
+    REPO_SKM=$(make_test_repo "skills-manifest")
+    cd "$REPO_SKM"
     "$WV" init-repo --update --agent=claude >/dev/null 2>&1
-    assert_file_exists "$REPO_SK/.claude/skills/trails/SKILL.md" "skills: --update delivers trails to a consumer"
-    assert_equals "absent" "$([ -e "$REPO_SK/.claude/skills/breadcrumbs" ] && echo present || echo absent)" \
-        "skills: --update no longer delivers the deprecated breadcrumbs skill"
-else
-    TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1))
-    echo -e "${YELLOW}⊘${NC} skills: delivery skipped (trails not installed)"
+    assert_file_exists "$REPO_SKM/.claude/skills/zz-manifest-probe/SKILL.md" \
+        "skills: a skill named only in the manifest is delivered (the manifest is read)"
+    cp "$TEST_INSTALL/manifest.saved" "$WV_CONFIG_DIR/skills/.weave-installed"
+    rm -rf "$WV_CONFIG_DIR/skills/zz-manifest-probe"
 fi
+# trails is a projection of the agent-memory procedure (wv-d231af), not an
+# install.sh skill: --update delivers it through project-procedures.sh.
+REPO_SK=$(make_test_repo "skills-trails")
+cd "$REPO_SK"
+"$WV" init-repo --update --agent=claude >/dev/null 2>&1
+assert_file_exists "$REPO_SK/.claude/skills/trails/SKILL.md" "skills: --update delivers trails to a consumer"
+assert_contains "$(cat "$REPO_SK/.claude/skills/trails/SKILL.md" 2>/dev/null)" "WEAVE-MANAGED-SKILL" \
+    "skills: the delivered trails is the agent-memory procedure's projection"
+assert_equals "absent" "$([ -e "$REPO_SK/.claude/skills/breadcrumbs" ] && echo present || echo absent)" \
+    "skills: --update no longer delivers the deprecated breadcrumbs skill"
 
 # --- scripts/hooks/ vendor refresh is gated on --update/--force (wv-d6e9ba) ---
 # install.sh overwrote a differing vendored hook source on every run, so a plain

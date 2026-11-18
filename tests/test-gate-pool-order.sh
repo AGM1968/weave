@@ -178,6 +178,50 @@ out=$(skip_case)
 check "a failure raises the stop flag for waiters" "failed=1 stop=yes skipped=[tests/test-waited.sh]" "$(grep '^failed=' <<< "$out")"
 check "...the stopped waiter is not reported FAILED" "0" "$(grep -c 'FAILED tests/test-waited.sh' <<< "$out")"
 check "...and only the suite that ran is recorded" "recorded=1" "$(grep '^recorded=' <<< "$out")"
+
+# elapsed_in_range <report> — "yes" when the supervisor's report is
+# "<ms> monotonic" for the 0.2 s command below, else what it holds.
+elapsed_in_range() {
+    if [[ "$1" =~ ^([0-9]+)\ monotonic$ ]] && [ "${BASH_REMATCH[1]}" -ge 150 ] && [ "${BASH_REMATCH[1]}" -lt 5000 ]; then
+        echo yes
+    else
+        echo "no (${1:-none})"
+    fi
+}
+# suspend_supervisor_cases — the supervisor's elapsed report (wv-b17a85).
+suspend_supervisor_cases() {
+    local rc=0 out
+    out=$(WV_GATE_ELAPSED="$ST/el" python3 -I "$SUP" el 60 bash -c 'sleep 0.2; echo "${WV_GATE_ELAPSED-unset}"') || rc=$?
+    check "the supervisor reports the command's monotonic elapsed ms, and the setting does not reach the command" "0 unset yes" \
+        "$rc $out $(elapsed_in_range "$(cat "$ST/el" 2>/dev/null)")"
+    rc=0; WV_GATE_ELAPSED="$ST/no-such-dir/el" python3 -I "$SUP" el 60 sh -c 'exit 3' 2>/dev/null || rc=$?
+    check "an elapsed report it cannot write never changes the command's status" "3" "$rc"
+}
+echo "time the host spends suspended is not suite time (wv-b17a85)"
+# The supervisor times the command on the monotonic clock, which stops while
+# the host is suspended, and the pool records that reading. The wall clock
+# counts a suspend: here it reports two hours, as across a hibernation.
+suspend_supervisor_cases
+# suspended_pool [nosupervisor] — one suite through the pool, the wall clock
+# reporting a two-hour suspend; prints the recorded duration.
+suspended_pool() {
+    : > "$ST/calls.log"
+    (
+        export REPO_ROOT="$ST/repo" WV="$ST/wv-stub" WV_GATE_JOBS=1
+        unset WV_GATE_SLOTS WV_GATE_BASE
+        _pc_pool_reuse=off
+        hook_duration_ms() { echo 7200000; }
+        [ "${1:-}" != nosupervisor ] || gate_run_bounded() { shift 2; "$@"; }
+        git -C "$REPO_ROOT" add -A
+        export WV_GATE_TREE=$(git -C "$REPO_ROOT" write-tree)
+        run_hook_suites <<< "0	tests/test-quick.sh	1"
+    ) >/dev/null 2>&1
+    sed -n 's/^test-record tests\/test-quick.sh .*--duration=\([0-9]*\).*/\1/p' "$ST/calls.log"
+}
+dur=$(suspended_pool)
+check "a suite whose wall time spans a suspend is recorded on the monotonic clock" "yes" \
+    "$(if [ -n "$dur" ] && [ "$dur" -lt 7200000 ]; then echo yes; else echo "no (duration=${dur:-none})"; fi)"
+check "(control) with no monotonic reading the pool falls back to the wall clock" "7200000" "$(suspended_pool nosupervisor)"
 rm -rf "$ST"
 
 echo "the pool bound takes a lane's bound first"

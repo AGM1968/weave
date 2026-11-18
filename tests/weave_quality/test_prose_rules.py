@@ -786,6 +786,24 @@ def test_line_scope_self_exempt_is_a_whole_identifier_not_a_substring(
     assert [finding.line for finding in found] == [1]
 
 
+def test_trail_completion_header_alias_is_exempt_but_body_is_not(tmp_path: Path) -> None:
+    # Owner ruling on wv-56ef11: an append-only trail header keeps the alias a
+    # node had at close; only the exact header shape is exempt.
+    rule_path = MANAGED_PATTERNS / "prose-self-attested-virtue.yaml"
+    doc = _write(
+        tmp_path / "trails.md",
+        "## 2026-09-25 16:06 — Completed wv-e174eb (list-cap-honest)\n"
+        "\n"
+        "The count is honest now.\n"
+        "\n"
+        "## 2026-09-30 13:39 -- Completed wv-5c92d1 (durability-honesty)\n"
+        "\n"
+        "## 2026-09-30 13:40 — Completed wv-5c92d1 honestly this time\n",
+    )
+    found = run_prose_rule("prose-self-attested-virtue", rule_path, doc, scan_id=1)
+    assert [finding.line for finding in found] == [3, 7]
+
+
 def test_verbatim_marker_exempts_line_scope_rule(tmp_path: Path) -> None:
     rule_path = _write(
         tmp_path / "markdown-legacy.yaml",

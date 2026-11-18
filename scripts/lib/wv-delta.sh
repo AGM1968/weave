@@ -504,6 +504,53 @@ wv_load_attempt_finish() {
 # load attempt did not complete.
 wv_load_ack() { python3 "$_WV_LOAD_ACK_PY" show "$1"; }
 
+# wv_deltas_emitted DB PATH... — record delta files (relative to .weave) this
+# database published, so wv_unloaded_fence does not count them as foreign.
+# A failure leaves them unrecorded, which can only fence: the safe direction.
+wv_deltas_emitted() { python3 "$_WV_LOAD_ACK_PY" emitted "$@" >/dev/null 2>&1 || true; }
+
+# wv_unloaded_fence DB WEAVE_DIR — 0 when every published delta file was
+# absorbed by DB's last complete load or published by DB since. Otherwise prints
+# those it lacks, one per line, and returns 1 (wv-287e89): a pull or another
+# session's sync brought changes DB never replayed, and writing state.sql from
+# it drops them from the snapshot. A failure to check also fences.
+wv_unloaded_fence() {
+    local out rc=0
+    out=$(python3 "$_WV_LOAD_ACK_PY" unloaded "$1" "$2" 2>&1) || rc=$?
+    [ "$rc" -eq 0 ] && return 0
+    printf '%s\n' "${out:-could not list the delta catalog}"
+    return 1
+}
+
+# _wv_unloaded_explain WHAT MISSING — the fence message for wv_unloaded_fence.
+_wv_unloaded_explain() {
+    local n
+    n=$(printf '%s\n' "$2" | grep -c .)
+    {
+        echo "⚠  wv: $1: ${n} delta file(s) in ${WEAVE_DIR:-.weave}/deltas/ this database neither loaded nor published: they came from elsewhere (a pull or another session's sync), or predate this check (wv-287e89):"
+        printf '%s\n' "$2" | head -3 | sed 's/^/      /'
+        [ "$n" -le 3 ] || echo "      ... and $((n - 3)) more"
+        echo "    Writing state.sql from it would drop those changes from the snapshot."
+        echo "    Recover with 'wv load': it publishes this database's unsynced changes as deltas,"
+        echo "    then reloads state.sql and replays every delta, theirs and yours."
+    } >&2
+}
+
+# wv_state_writer_fence WHAT — 0 when state.sql may be written from WV_DB;
+# otherwise prints why (compaction or unloaded deltas) and returns 1.
+wv_state_writer_fence() {
+    local fenced
+    if ! fenced=$(wv_compaction_fence "$WV_DB" "$WEAVE_DIR"); then
+        _wv_fence_explain "$1" "$fenced"
+        return 1
+    fi
+    if ! fenced=$(wv_unloaded_fence "$WV_DB" "$WEAVE_DIR"); then
+        _wv_unloaded_explain "$1" "$fenced"
+        return 1
+    fi
+    return 0
+}
+
 # wv_lineage_stamp DB ACTOR_ID SEQ [MAX_ID] — record (SEQ, ACTOR_ID) as the last
 # writer on every node and edge that changed since the last reset (wv-cdb45a).
 #
@@ -1544,4 +1591,122 @@ finally:
         manifest_fh.close()
 print(written)
 PY
+}
+
+# ── Projection verdict (wv-65cd02) ──────────────────────────────────────────
+# wv_projection_lag GIT_ROOT [BASE TIP] — does the committed .weave/state.sql at
+# TIP reflect the Delta v2 operations committed with it? A rebase or merge keeps
+# one side's state.sql (.gitattributes merge=ours) while both sides' operations
+# travel, so a snapshot can be published that lags its own operations. The
+# operations added in BASE..TIP are replayed into a throwaway database built
+# from TIP's snapshot by the loader's own evaluator; one that still applies is
+# lag. Prints one JSON object {verdict, applied, checked, base, tip, detail}:
+#   ok         every operation in the range is already in TIP's snapshot
+#   lags       `applied` of them would still change it: run wv load, then wv sync
+#   error      TIP's snapshot does not build or the replay aborted
+#   unchecked  no upstream, no committed snapshot, or no python3/sqlite3
+# Reads committed objects only, never the working tree or the live database.
+# BASE and TIP default to HEAD's upstream and HEAD. The range sets the cost,
+# not the answer: an operation TIP's snapshot does not reflect is lag wherever
+# it came from. ok and lags are cached per (base, tip) in the hot zone.
+wv_projection_lag() {
+    local root="$1" base="${2:-}" tip="${3:-HEAD}"
+    local tip_sha="" base_sha="" cache="" tmp="" line
+    _wv_pl_out() {
+        jq -cn --arg v "$1" --arg a "${2:-0}" --arg c "${3:-0}" \
+            --arg b "$base_sha" --arg t "$tip_sha" --arg d "${4:-}" \
+            '{verdict:$v, applied:($a|tonumber), checked:($c|tonumber), base:$b, tip:$t, detail:$d}'
+    }
+    tip_sha=$(git -C "$root" rev-parse --verify --quiet "${tip}^{commit}" 2>/dev/null) || tip_sha=""
+    [ -n "$tip_sha" ] || { _wv_pl_out unchecked 0 0 "no commit at $tip"; return 0; }
+    if [ -n "$base" ]; then
+        base_sha=$(git -C "$root" rev-parse --verify --quiet "${base}^{commit}" 2>/dev/null) || base_sha=""
+    else
+        base_sha=$(git -C "$root" rev-parse --verify --quiet '@{upstream}^{commit}' 2>/dev/null) || base_sha=""
+    fi
+    [ -n "$base_sha" ] || { _wv_pl_out unchecked 0 0 "no upstream to compare with"; return 0; }
+    if [ -n "${WV_HOT_ZONE:-}" ] && [ -d "$WV_HOT_ZONE" ]; then
+        cache="$WV_HOT_ZONE/.projection-verdict"
+        if [ -f "$cache" ] && IFS= read -r line < "$cache" \
+            && [ "${line%% *}" = "$base_sha:$tip_sha" ]; then
+            printf '%s\n' "${line#* }"
+            return 0
+        fi
+    fi
+    if ! git -C "$root" cat-file -e "$tip_sha:.weave/state.sql" 2>/dev/null; then
+        _wv_pl_out unchecked 0 0 "no committed .weave/state.sql at the tip"
+        return 0
+    fi
+    local -a paths=() files=()
+    mapfile -t paths < <(git -C "$root" diff --name-only --diff-filter=A "$base_sha" "$tip_sha" -- .weave/deltas 2>/dev/null \
+        | grep -E -- '^\.weave/deltas/[^/]+/v2/[^/]+\.json$')
+    local result=""
+    if [ "${#paths[@]}" -eq 0 ]; then
+        result=$(_wv_pl_out ok 0 0 "no operations added in the range")
+    elif ! command -v python3 >/dev/null 2>&1 || ! command -v sqlite3 >/dev/null 2>&1; then
+        _wv_pl_out unchecked 0 "${#paths[@]}" "python3 and sqlite3 are needed to replay the range"
+        return 0
+    else
+        local replay_py rc=0 out cut applied
+        replay_py="$(dirname "${BASH_SOURCE[0]}")/wv-delta-v2-replay.py"
+        tmp=$(mktemp -d "${TMPDIR:-/tmp}/wv-projection.XXXXXX") || {
+            _wv_pl_out unchecked 0 "${#paths[@]}" "no scratch directory"; return 0; }
+        if ! git -C "$root" show "$tip_sha:.weave/state.sql" 2>/dev/null | sqlite3 "$tmp/s.db" >/dev/null 2>&1; then
+            rm -rf "$tmp"
+            _wv_pl_out error 0 "${#paths[@]}" "the tip's .weave/state.sql does not build a database"
+            return 0
+        fi
+        # One git process for every operation blob: the range can hold thousands.
+        mapfile -t files < <(printf '%s\n' "${paths[@]}" | python3 -c '
+import os, subprocess, sys
+root, tip, out = sys.argv[1:4]
+paths = [p.rstrip("\n") for p in sys.stdin if p.strip()]
+os.makedirs(out, exist_ok=True)
+buf = subprocess.run(["git", "-C", root, "cat-file", "--batch"], check=True,
+                     input="".join(f"{tip}:{p}\n" for p in paths).encode(),
+                     stdout=subprocess.PIPE).stdout
+i = 0
+for p in paths:
+    j = buf.index(b"\n", i)
+    head = buf[i:j].split()
+    i = j + 1
+    if len(head) < 3 or head[1] != b"blob":
+        sys.exit(f"wv: {p} is not a blob at {tip}")
+    size = int(head[2])
+    dst = os.path.join(out, os.path.basename(p))
+    with open(dst, "wb") as fh:
+        fh.write(buf[i:i + size])
+    i += size + 1
+    print(dst)
+' "$root" "$tip_sha" "$tmp/ops" | LC_ALL=C sort)
+        if [ "${#files[@]}" -ne "${#paths[@]}" ]; then
+            rm -rf "$tmp"
+            _wv_pl_out error 0 "${#paths[@]}" "could not read the range's operations from the tip"
+            return 0
+        fi
+        local -a args=("$tmp/s.db" --ops-from=-)
+        cut=$(git -C "$root" show "$tip_sha:.weave/causal-cutover" 2>/dev/null \
+            | sed -n 's/.*"lineage_seq"[[:space:]]*:[[:space:]]*\([0-9]\{1,\}\).*/\1/p' | sed -n 1p)
+        [ -n "$cut" ] && args+=(--cutover-seq "$cut")
+        out=$(printf '%s\n' "${files[@]}" | python3 "$replay_py" "${args[@]}" 2>&1) || rc=$?
+        rm -rf "$tmp"
+        if [ "$rc" -ne 0 ]; then
+            _wv_pl_out error 0 "${#paths[@]}" "the replay aborted (rc=$rc) on an operation in the range"
+            return 0
+        fi
+        applied=$(printf '%s\n' "$out" | tail -1 | jq -r '.summary.applied // 0' 2>/dev/null) || applied=""
+        case "$applied" in
+            ''|*[!0-9]*)
+                _wv_pl_out error 0 "${#paths[@]}" "the replay printed no summary"
+                return 0 ;;
+        esac
+        if [ "$applied" -gt 0 ]; then
+            result=$(_wv_pl_out lags "$applied" "${#paths[@]}" \
+                "$applied of ${#paths[@]} operation(s) committed in the range are missing from the committed snapshot")
+        else
+            result=$(_wv_pl_out ok 0 "${#paths[@]}" "the committed snapshot reflects every operation in the range")
+        fi
+    fi
+    [ -z "$cache" ] || printf '%s %s\n' "$base_sha:$tip_sha" "$result" > "$cache" 2>/dev/null || true
+    printf '%s\n' "$result"
 }

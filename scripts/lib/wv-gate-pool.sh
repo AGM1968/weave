@@ -3,17 +3,20 @@
 # and pre-push gates (wv-8138ec, wv-862ac0).
 #
 # Sourced by: scripts/hooks/pre-commit-weave.sh, scripts/hooks/pre-push-weave.sh
-# The caller provides: hook_progress <msg>, hook_duration_ms <start_ns>,
-# REPO_ROOT, WV, _pc_files_csv (the file set results are keyed on), and
+# The caller provides: hook_progress <msg>, REPO_ROOT, WV, _pc_files_csv (the file set results are keyed on), and
 # optionally _pc_pool_context (precommit|prepush, passed to suites as
 # WV_GATE_CONTEXT), _pc_pool_reuse (staged|worktree, which content the
 # ledger reuse check fingerprints; off, none: every suite runs) and
 # _pc_pool_record (0: write no ledger rows; a candidate lane, S2b wv-7ee8fe).
+# wv-clock.sh, sourced here, provides the clock readings and hook_duration_ms
+# (kept where the caller defines its own).
 # Entry point: run_hook_suites.
 
 # Resolve beside this pool, including in a protected candidate tree.
 # shellcheck source=scripts/lib/wv-scratch.sh
 source "$(dirname "${BASH_SOURCE[0]}")/wv-scratch.sh"
+# shellcheck source=scripts/lib/wv-clock.sh
+source "$(dirname "${BASH_SOURCE[0]}")/wv-clock.sh"
 _GATE_SUITE_LIB=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 unset WV_GATE_EXECUTION_MODE
 
@@ -290,8 +293,8 @@ gate_run_bounded() {
 
 # _pc_suite_worker <idx> <suite> — background body. The rc file is written via
 # rename so the parent never reads half a line. It holds "<rc> <ms> <start>
-# <end>": the suite's start and exit in epoch ms, read here as it starts and
-# exits (wv-4666cb). The suite log's ts is the drain time, written after the
+# <end> <clock>": the suite's start and exit in epoch ms, read here as it
+# starts and exits (wv-4666cb), and the clock <ms> was measured on (wv-b17a85). The suite log's ts is the drain time, written after the
 # last suite ends, so a failure's own time can only come from these.
 #
 # Under a candidate lane's shared slots (WV_GATE_SLOTS, wv-428a92) the
@@ -300,7 +303,7 @@ gate_run_bounded() {
 # record never count the wait as the suite's cost. A supervisor stopped while
 # waiting (exit 125, no stamp) ran nothing: the result is "skip", not a failure.
 _pc_suite_worker() {
-    local _w_t0 _w_t1 _w_rc _w_slot _w_acq
+    local _w_t0 _w_t1 _w_rc _w_slot _w_acq _w_ms _w_el _w_kind _w_clock=wall
     local WV_GATE_EXECUTION_MODE="${_pc_q_mode[$1]}"
     local plan_args=()
     [ "$WV_GATE_EXECUTION_MODE" != frozen ] || plan_args=(--plan "$_pc_out_dir/plan.json")
@@ -329,8 +332,9 @@ _pc_suite_worker() {
         TMPDIR="$_pc_out_dir/scratch" \
         WV_GATE_SLOT_STAMP="$_pc_out_dir/$1.slot" \
         WV_GATE_SLOT_STOP="$_pc_out_dir/stop" \
+        WV_GATE_ELAPSED="$_pc_out_dir/$1.elapsed" \
         gate_run_bounded "$2" "${WV_GATE_TIMEOUT:-1800}" \
-        env -u WV_CALL_LOG -u WV_GATE_LANE_JOBS -u WV_GATE_SLOTS -u WV_GATE_SLOT_STAMP -u WV_GATE_SLOT_STOP -u WV_SCRATCH_ROOT \
+        env -u WV_CALL_LOG -u WV_GATE_LANE_JOBS -u WV_GATE_SLOTS -u WV_GATE_SLOT_STAMP -u WV_GATE_SLOT_STOP -u WV_GATE_ELAPSED -u WV_SCRATCH_ROOT \
         "${_pc_snapshot_args[@]}" "${plan_args[@]}" \
         --work "$_pc_out_dir/scratch/$1" --provenance "$_pc_out_dir/$1.identity.json" \
         "$2" </dev/null >"$_pc_out_dir/$1.out" 2>&1
@@ -339,18 +343,26 @@ _pc_suite_worker() {
         read -r _w_slot _w_acq < "$_pc_out_dir/$1.slot" || _w_acq=""
         case "$_w_acq" in ''|*[!0-9]*) ;; *) _w_t0=$_w_acq ;; esac
     elif [ "$_w_rc" = 125 ] && [ -n "${WV_GATE_SLOTS:-}" ]; then
-        printf 'skip 0 - -\n' > "$_pc_out_dir/$1.rc.tmp" && mv "$_pc_out_dir/$1.rc.tmp" "$_pc_out_dir/$1.rc"
+        printf 'skip 0 - - unknown\n' > "$_pc_out_dir/$1.rc.tmp" && mv "$_pc_out_dir/$1.rc.tmp" "$_pc_out_dir/$1.rc"
         return 0
     fi
     if [ "$_w_rc" = 0 ] && [ "$WV_GATE_EXECUTION_MODE" = frozen ] \
-        && ! jq -e --arg suite "$2" --slurpfile plan "$_pc_out_dir/plan.json" \
-        '.suite == $suite and .tree == $plan[0].tree and .base == $plan[0].base
-         and .execution_mode == "frozen" and .key == $plan[0].suites[$suite].key' "$_pc_out_dir/$1.identity.json" >/dev/null 2>&1; then
+        && ! jq -se --arg suite "$2" --slurpfile plan "$_pc_out_dir/plan.json" \
+        'length == 1 and (.[0] | .suite == $suite and .tree == $plan[0].tree and .base == $plan[0].base
+         and .execution_mode == "frozen" and .key == $plan[0].suites[$suite].key)' "$_pc_out_dir/$1.identity.json" >/dev/null 2>&1; then
         echo "✗ frozen suite receipt does not match its planned inputs" >> "$_pc_out_dir/$1.out"
         _w_rc=1
     fi
     _w_t1=$(date +%s%N 2>/dev/null || echo 0)
-    printf '%s %s %s %s\n' "$_w_rc" "$(hook_duration_ms "$_w_t0")" "$(_pc_ns_to_ms "$_w_t0")" "$(_pc_ns_to_ms "$_w_t1")" \
+    # The suite's cost is the supervisor's monotonic reading, which leaves out
+    # time the host spent suspended (wv-b17a85); the wall clock is the fallback
+    # only when there is no such reading. Start and end stay epoch timestamps.
+    _w_ms=$(hook_duration_ms "$_w_t0")
+    if read -r _w_el _w_kind < "$_pc_out_dir/$1.elapsed" 2>/dev/null \
+        && [ "$_w_kind" = monotonic ] && [[ "$_w_el" =~ ^[0-9]+$ ]]; then
+        _w_ms=$_w_el _w_clock=monotonic
+    fi
+    printf '%s %s %s %s %s\n' "$_w_rc" "$_w_ms" "$(_pc_ns_to_ms "$_w_t0")" "$(_pc_ns_to_ms "$_w_t1")" "$_w_clock" \
         > "$_pc_out_dir/$1.rc.tmp" && mv "$_pc_out_dir/$1.rc.tmp" "$_pc_out_dir/$1.rc"
 }
 
@@ -359,15 +371,16 @@ _pc_suite_worker() {
 # while a sibling is still running changes the graph under a suite that reads
 # it (test-trailer-refs.sh hashes the live DB around its audit).
 _pc_reap() {
-    local i rc dur start end
+    local i rc dur start end clock
     for i in "${!_pc_run_pid[@]}"; do
         [ -n "${_pc_run_done[$i]:-}" ] && continue
         [ -f "$_pc_out_dir/$i.rc" ] || continue
-        read -r rc dur start end < "$_pc_out_dir/$i.rc"
-        _pc_run_done[$i]="$rc"
-        _pc_run_dur[$i]="$dur"
-        _pc_run_start[$i]="$start"
-        _pc_run_end[$i]="$end"
+        read -r rc dur start end clock < "$_pc_out_dir/$i.rc"
+        _pc_run_done[i]="$rc"
+        _pc_run_clock[i]="${clock:-unknown}"
+        _pc_run_dur[i]="$dur"
+        _pc_run_start[i]="$start"
+        _pc_run_end[i]="$end"
         if [ "$rc" = "0" ]; then
             hook_progress "passed ${_pc_q_suite[$i]} ($(( dur / 1000 ))s)"
         elif [ "$rc" = "skip" ]; then
@@ -388,7 +401,7 @@ _pc_reap() {
 }
 
 # _pc_record_all — once no suite is running, record its immutable planned key
-# and wall-clock cost, in selection order. A live edit cannot change the bytes
+# and its cost with the clock that measured it, in selection order. A live edit cannot change the bytes
 # this suite tested, or turn that result into certification of the new edit.
 _pc_record_all() {
     local i est key mode
@@ -397,7 +410,7 @@ _pc_record_all() {
     for i in $(printf '%s\n' "${!_pc_run_done[@]}" | sort -n); do
         case "${_pc_run_done[$i]}" in lost|skip) continue ;; esac
         est=""
-        [ "${_pc_q_cost[$i]:-0}" -gt 0 ] 2>/dev/null && est=$(( _pc_q_cost[$i] * 1000 ))
+        [ "${_pc_q_cost[$i]:-0}" -gt 0 ] 2>/dev/null && est=$(( _pc_q_cost[i] * 1000 ))
         key=""
         mode=${_pc_q_mode[$i]}
         plan_args=()
@@ -407,7 +420,8 @@ _pc_record_all() {
         fi
         "$WV" test-record "${_pc_q_suite[$i]}" --files="${_pc_files_csv:-}" --exit="${_pc_run_done[$i]}" \
             --execution-mode="$mode" \
-            --duration="${_pc_run_dur[$i]}" --estimate="$est" ${key:+--inputs-key="$key"} \
+            --duration="${_pc_run_dur[$i]}" --clock="${_pc_run_clock[$i]:-unknown}" \
+            --estimate="$est" ${key:+--inputs-key="$key"} \
             "${plan_args[@]}" \
             --started-ms="${_pc_run_start[$i]:-}" --ended-ms="${_pc_run_end[$i]:-}" \
             --start-fingerprints="$_pc_out_dir/start.fps" >/dev/null 2>&1 || true
@@ -474,7 +488,7 @@ gate_pool_mode_reason() {
 # self-host default, or the base's declaration and the recipes it names.
 gate_pool_frozen_reason() {
     local recipes=""
-    if jq -e '.policy == null' <<< "$_GATE_PROVISION" >/dev/null; then
+    if jq -se 'length == 1 and (.[0] | .policy == null)' <<< "$_GATE_PROVISION" >/dev/null; then
         gate_pool_mode_reason
         return
     fi
@@ -558,8 +572,8 @@ run_hook_suites() {
     # Sparse indexed arrays keyed by idx, not associative ones: those need bash 4
     # and this hook also runs under macOS /bin/bash 3.2.
     _pc_q_suite=() _pc_q_cost=() _pc_q_mode=() _pc_run_pid=() _pc_run_done=() _pc_run_dur=()
-    _pc_run_start=() _pc_run_end=()
-    local order=() cand=() cand_csv states reuse_t0 frozen_names=()
+    _pc_run_start=() _pc_run_end=() _pc_run_clock=()
+    local order=() cand=() cand_csv states reuse_t0 reuse_k0 reuse_ms reuse_k frozen_names=()
     while IFS=$'\t' read -r idx suite cost; do
         [ -n "$suite" ] || continue
         [ "$suite" = "tests/run-all.sh" ] && continue
@@ -570,9 +584,9 @@ run_hook_suites() {
             echo "✗ Weave gate: the selected suite $suite does not exist — refusing rather than counting it as passed" >&2
             exit 1
         fi
-        _pc_q_suite[$idx]="$suite"
-        _pc_q_cost[$idx]="$cost"
-        _pc_q_mode[$idx]=$(gate_pool_suite_mode "$suite") || exit 1
+        _pc_q_suite[idx]="$suite"
+        _pc_q_cost[idx]="$cost"
+        _pc_q_mode[idx]=$(gate_pool_suite_mode "$suite") || exit 1
         [ "${_pc_q_mode[$idx]}" != frozen ] || frozen_names+=("$suite")
         cand+=("$idx")
     done
@@ -599,7 +613,7 @@ run_hook_suites() {
         rm -rf "$_pc_out_dir/scratch"
         exit 1
     fi
-    reuse_t0=$(date +%s%N 2>/dev/null || echo 0)
+    wv_clock_ms reuse_t0 reuse_k0
     states=""
     if [ "${#frozen_names[@]}" -eq 0 ]; then
         hook_progress "checkout inputs are mutable: reuse disabled for ${#cand[@]} suite(s)"
@@ -608,7 +622,8 @@ run_hook_suites() {
     else
         states=$("$WV" test-status --inputs --suites="$cand_csv" \
             --snapshot-plan="$_pc_out_dir/plan.json" 2>/dev/null) || states=""
-        hook_progress "reuse check: ${#cand[@]} suite(s) in $(hook_duration_ms "$reuse_t0")ms"
+        wv_clock_since reuse_ms reuse_k "$reuse_t0" "$reuse_k0"
+        hook_progress "reuse check: ${#cand[@]} suite(s) in ${reuse_ms}ms$([ "$reuse_k" = monotonic ] || printf ' (%s clock)' "$reuse_k")"
     fi
     for idx in "${cand[@]}"; do
         if [ "${_pc_q_mode[$idx]}" = frozen ] \
@@ -669,7 +684,7 @@ run_hook_suites() {
         fi
         launched=$(( launched + 1 ))
         _pc_suite_worker "$idx" "${_pc_q_suite[$idx]}" &
-        _pc_run_pid[$idx]=$!
+        _pc_run_pid[idx]=$!
         if [ "$jobs" -eq 1 ]; then
             # A child even when serial: cancellation can reach its supervisor.
             # Explicit wait keeps bash < 4.3 support without wait -n.
@@ -689,8 +704,8 @@ run_hook_suites() {
     # is a failure, never a pass.
     for i in "${!_pc_run_pid[@]}"; do
         if [ -z "${_pc_run_done[$i]:-}" ]; then
-            _pc_run_done[$i]="lost"
-            _pc_run_dur[$i]=0
+            _pc_run_done[i]="lost"
+            _pc_run_dur[i]=0
         fi
     done
     # The call log is read before the ledger is written: the test-record calls

@@ -121,6 +121,14 @@ check "the report warns" "${report%% *}" "warn"
 w show "$p" >/dev/null 2>&1 && ok "reading a graph with violations still works (D4)" || bad "reading a graph with violations still works (D4)"
 sqlite3 "$DB" "DELETE FROM edges WHERE (source='$q' AND target='$p') OR (source='$z' AND target='$x');"
 
+echo "=== wv doctor names a dangling edge (wv-477035) ==="
+check "a graph without dangling edges passes" "$(doctor_check "dangling edges" | cut -d' ' -f1)" "pass"
+sqlite3 "$DB" "INSERT INTO edges(source,target,type,weight,context) VALUES('wv-000ghost','$p','implements',1.0,'{}');"
+report=$(doctor_check "dangling edges")
+[[ "$report" == "warn 1 edge(s)"*"wv-000ghost->$p (implements)"*"wv unlink"* ]] && ok "the report names the dangling edge and its remedy" ||
+    bad "the report names the dangling edge and its remedy" "$report"
+sqlite3 "$DB" "DELETE FROM edges WHERE source='wv-000ghost';"
+
 echo "=== no close over an unaccounted open child ==="
 close() { w done "$1" --skip-verification --no-warn 2>&1; }
 par=$(add "parent with an open child" --metadata='{"type":"epic"}'); open=$(child "open child" "$par")

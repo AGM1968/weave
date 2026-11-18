@@ -117,6 +117,17 @@ rm -f "$WV_HOT_ZONE"/owners/*/.context_checked_*
 hookcell "editing a node with an open blocker is denied" active_node_not_blocked deny - exit2 pre-action.sh \
     "$(edit_of "$P/src/app.py")"
 sqlite3 "$WV_DB" "DELETE FROM edges WHERE type='blocks';"
+# The schema lock held and its stamp gone, as during a load or a migration: the
+# guard's wv list waits past its budget (wv-3a8c06).
+claim "$work"
+rm -rf "$WV_HOT_ZONE/run_cache"
+( exec 9>"$WV_HOT_ZONE/.schema.lock"; flock -x 9; exec sleep 30 ) &
+lock_holder=$!
+sleep 0.3
+rm -f "$WV_DB.ensured"
+WV_PTU_WAIT_BUDGET_MS=1000 hookcell "an edit the guard cannot judge within its wait budget is denied" \
+    edit_guard_judged_in_time deny - exit2 pre-action.sh "$(edit_of "$P/src/app.py")"
+kill "$lock_holder" 2>/dev/null; wait "$lock_holder" 2>/dev/null
 
 echo "=== an edit is judged by the graph of the checkout its file is in (wv-455739) ==="
 # The hook's cwd is $P, whose graph has $work active. An edit to a file in a

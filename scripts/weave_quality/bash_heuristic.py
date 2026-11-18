@@ -94,8 +94,25 @@ def _count_nesting(lines: list[str]) -> int:
     return max_depth
 
 
-# Heredoc start: <<EOF, <<'EOF', <<"EOF", <<-EOF, etc.
-_HEREDOC_START = re.compile(r"<<-?\s*['\"]?(\w+)['\"]?")
+# Heredoc start: <<EOF, <<'EOF', <<"EOF", <<-EOF, etc. A here-string (<<<)
+# opens nothing: read as a heredoc, `cmd <<< "0 ..."` took 0 as a delimiter
+# and skipped the rest of the file (wv-70c888).
+_HEREDOC_START = re.compile(r"(?<!<)<<(?!<)-?\s*['\"]?(\w+)['\"]?")
+
+
+def _without_comment(stripped: str) -> str:
+    """Return a line without its trailing comment: an unquoted '#' at a word start."""
+    quote = ""
+    for k, ch in enumerate(stripped):
+        if quote:
+            if ch == quote:
+                quote = ""
+            continue
+        if ch in "'\"":
+            quote = ch
+        elif ch == "#" and (k == 0 or stripped[k - 1].isspace()):
+            return stripped[:k].rstrip()
+    return stripped
 
 # A line that ends a brace group with '; }', and a brace-group opener: '{'
 # followed by space, at line start or after a shell separator -- not '${' and
@@ -182,8 +199,9 @@ def _find_function_end(lines: list[str], start: int) -> int:
             if "{" in stripped:
                 depth += 1
                 found_open = True
-                # One-liner: func() { ...; } — both { and } on same line
-                if stripped.endswith("}") or stripped.endswith("; }"):
+                # One-liner: func() { ...; } — both { and } on same line,
+                # before any trailing comment (wv-70c888)
+                if _without_comment(stripped).endswith("}"):
                     return j
             continue
 
@@ -196,7 +214,7 @@ def _find_function_end(lines: list[str], start: int) -> int:
         # Nested function definition — count opening brace, unless it closes
         # on the same line: a nested one-liner opens nothing (wv-b0b2d4).
         if _FUNC_PATTERN.match(lines[j]):
-            if "{" in stripped and not stripped.endswith("}"):
+            if "{" in stripped and not _without_comment(stripped).endswith("}"):
                 depth += 1
             continue
 

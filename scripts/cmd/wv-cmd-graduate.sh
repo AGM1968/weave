@@ -50,9 +50,9 @@ _memory_graduate_target() {
         .weave/guides/*.md)
             pypath=$(_wv_python_module_path weave_quality 2>/dev/null)
             out=$(_wv_agent_python_exec_module weave_quality.guides "$pypath" doctor --project-root "$root" 2>/dev/null) \
-                && jq -e '.invalid | type == "array"' >/dev/null 2>&1 <<< "$out" \
+                && jq -se 'length == 1 and (.[0] | .invalid | type == "array")' >/dev/null 2>&1 <<< "$out" \
                 || { echo "Error: cannot check guide $rel: the guide doctor did not report" >&2; return 1; }
-            if jq -e --arg f "${rel##*/}" 'any(.invalid[]; .file == $f)' >/dev/null <<< "$out"; then
+            if jq -se --arg f "${rel##*/}" 'length == 1 and (.[0] | any(.invalid[]; .file == $f))' >/dev/null <<< "$out"; then
                 echo "Error: guide $rel does not parse: $(jq -r --arg f "${rel##*/}" '.invalid[] | select(.file == $f) | .error' <<< "$out")" >&2
                 return 1
             fi
@@ -63,7 +63,7 @@ _memory_graduate_target() {
         .weave/patterns/*.yaml)
             pypath=$(_wv_python_module_path weave_quality 2>/dev/null)
             out=$(_wv_agent_python_exec_module weave_quality "$pypath" patterns validate "$root" --json 2>/dev/null)
-            if ! jq -e --arg p "$real" 'any(.rules[]; .path == $p and .status == "valid")' >/dev/null 2>&1 <<< "$out"; then
+            if ! jq -se --arg p "$real" 'length == 1 and (.[0] | any(.rules[]; .path == $p and .status == "valid"))' >/dev/null 2>&1 <<< "$out"; then
                 echo "Error: detector $rel does not validate: $(jq -r --arg p "$real" '[.rules[]? | select(.path == $p) | .error // .status] | first // "not reported"' <<< "$out" 2>/dev/null)" >&2
                 return 1
             fi
@@ -88,7 +88,8 @@ _memory_graduate_target() {
 # pass or warn, never fail, so doctor still exits 0. Doctor calls it only when
 # the graph holds an active memory, so a graph without one never loads this
 # module (test-cli-autoload pins that).
-#   memory budget  the rendered WEAVE:MEMORY block against .weave/policy.conf
+#   memory budget  the rendered WEAVE:MEMORY block (graph-only memories are
+#                  not in it, wv-287b39) against .weave/policy.conf
 #                  [memory] block_budget_bytes. The default, 8192, is what
 #                  wv-91f0ca's 16 KiB AGENTS.md target leaves once the rest of
 #                  that file is counted. Over budget, it names graduation
@@ -128,7 +129,8 @@ _doctor_memory_budget() {
     if [ "$bytes" -gt "$budget" ] || [ -n "$note" ]; then
         candidates=$(jq -rn --slurpfile m <(printf '%s' "$memories") --slurpfile e <(printf '%s' "$entries") --slurpfile s <(printf '%s' "$surfaces") '
             $m[0] as $m | $e[0] as $e | $s[0] as $s
-            | [ $m[] | . as $x
+            | ($e | map(.id)) as $shown
+            | [ $m[] | . as $x | select(any($shown[]; . == $x.id))
                 | [ $s[] | . as $id | select($x.text | test("(^|[^A-Za-z0-9_-])" + ($id | gsub("[.]"; "\\.")) + "([^A-Za-z0-9_-]|$)")) ] as $hit
                 | select($hit | length > 0) | "\($x.id) (\($hit | join(", ")))" ] as $carried
             | [ $e | sort_by(-(.text | utf8bytelength)) | .[0:3][] | "\(.id) (\(.text | utf8bytelength) B)" ] as $longest
@@ -138,7 +140,7 @@ _doctor_memory_budget() {
                 "oldest verified: " + ($oldest | join(", ")) ] | join("; ")')
     fi
     if [ "$bytes" -gt "$budget" ]; then
-        _doctor_record "memory budget" "warn" "memory block is $bytes bytes, over the $budget-byte budget (.weave/policy.conf [memory] block_budget_bytes); graduation candidates: $candidates; graduate with: wv memory review <id> --verdict=graduate --target=<repo path>$note"
+        _doctor_record "memory budget" "warn" "memory block is $bytes bytes, over the $budget-byte budget (.weave/policy.conf [memory] block_budget_bytes); graduation candidates: $candidates; graduate with: wv memory review <id> --verdict=graduate --target=<repo path>, or keep one in recall only with: wv memory review <id> --verdict=exposure --exposure=graph-only --reason=TEXT$note"
     elif [ -n "$note" ]; then
         _doctor_record "memory budget" "warn" "memory block is $bytes of $budget bytes$note"
     else

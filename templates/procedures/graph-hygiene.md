@@ -1,19 +1,54 @@
 ---
 id: graph-hygiene
 description:
-  "Keep the graph healthy — health checks, pruning stale done nodes, classifying orphans, and
-  clearing test/smoke pollution. Use periodically or after a sync that bulk-closed nodes."
+  "Audit and keep the graph healthy: an audit report, health checks, stale and stuck work, pruning
+  done nodes, classifying orphans, and clearing test/smoke pollution. Use when auditing graph health
+  or dependencies, periodically, or after a sync that bulk-closed nodes."
 fallback: "wv guide --procedure=graph-hygiene"
-adapters: [codex, copilot]
+adapters: [claude, codex, copilot]
 visibility: shared
+claude_skill: weave-audit
+resources:
+  - path: audit-report.sh
+    executable: true
 ---
 
 # Graph Hygiene
+
+## Audit
+
+Start an audit with the report. It reads the graph once and is read-only:
+
+```bash
+bash "${WV_CONFIG_DIR:-$HOME/.config/weave}/procedures/audit-report.sh"
+```
+
+It prints node counts by status, the `wv health` score, and four lists, each with its count and the
+first ten ids:
+
+- **Todo unclaimed for more than 7 days** (`created_at`): claim and finish it, block it behind the
+  work it waits for, or delete it if it is no longer wanted.
+- **Active and untouched for more than 2 days** (`updated_at`): finish it, or return it to todo with
+  a note on what is left.
+- **Done without a learning** (no `learning`, `decision`, `pattern` or `pitfall`; memories are not
+  counted): add one with `wv update <id> --metadata=...` when the work was non-trivial.
+- **`wv health` issues**: orphans, ghost edges, contradictions and the rest, by count.
+
+`WV_AUDIT_TODO_DAYS`, `WV_AUDIT_ACTIVE_DAYS` and `WV_AUDIT_SHOW` change the thresholds and the list
+length. A graph has no cycle check to run: `wv block` refuses a block that would close a cycle of
+any length, and `wv done` unblocks every node whose blockers are now all done.
+
+Before creating a node, `wv search "<topic>"` finds the existing one; `wv add` refuses a duplicate
+and prints the id it matched. After any fix, `wv health`, `wv ready` and `wv status` confirm the
+result, then sync as usual.
+
+## Maintenance commands
 
 Run `wv health` periodically to catch drift. Key maintenance commands:
 
 ```bash
 wv health                        # score + orphan/ghost-edge counts
+wv digest                        # one-line health summary
 wv prune --dry-run               # preview: done nodes older than 30 days, and what each rule kept
 wv prune                         # archive them, writing a deletion tombstone per node and edge
 wv prune --orphans-only          # archive done nodes with no edges (ignores age)

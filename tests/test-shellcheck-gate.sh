@@ -170,18 +170,24 @@ if command -v flock >/dev/null 2>&1; then
     L="$T/sc.lock"
     real_sc=$(command -v shellcheck)
     # A shellcheck that records whether the lock variable reached it.
-    printf '#!/bin/sh\necho "${WV_GATE_SC_LOCK-unset}" >> %q\nexec %q "$@"\n' "$T/sc-env" "$real_sc" > "$T/bin/shellcheck"
+    # ...and when each run of it started, so waiting is judged by order, not by
+    # comparing two wall times a loaded host stretches (wv-9ba563).
+    printf '#!/bin/sh\necho "${WV_GATE_SC_LOCK-unset}" >> %q\ndate +%%s%%N >> %q\nexec %q "$@"\n' \
+        "$T/sc-env" "$T/sc-start" "$real_sc" > "$T/bin/shellcheck"
     chmod +x "$T/bin/shellcheck"
-    elapsed_ms() { echo $(( ($(date +%s%N) - $1) / 1000000 )); }
     printf '#!/bin/bash\necho ok2\n' > scripts/x.sh; git add scripts/x.sh
-    t0=$(date +%s%N); precommit WV_GATE_SC_LOCK="$L"; free_ms=$(elapsed_ms "$t0")
+    precommit WV_GATE_SC_LOCK="$L"
     check "(control) with the lock free the lane's shellcheck passes" "0" "$RC"
-    flock "$L" sleep 4 & holder=$!
+    : > "$T/sc-start"
+    # The holder stamps its release as the last thing it does under the lock.
+    flock "$L" sh -c 'sleep 3; date +%s%N > "$1"' _ "$T/released" & holder=$!
     sleep 0.3
-    t0=$(date +%s%N); precommit WV_GATE_SC_LOCK="$L"; held_ms=$(elapsed_ms "$t0")
+    precommit WV_GATE_SC_LOCK="$L"
     wait "$holder"
+    first_sc=$(awk 'NR == 1 || $1 < m { m = $1 } END { print m }' "$T/sc-start"); released=$(cat "$T/released" 2>/dev/null)
     check "with the lock held by another lane, the shellcheck waits for it, then passes" "0 yes" \
-        "$RC $([ $((held_ms - free_ms)) -ge 2500 ] && echo yes || echo "no (free ${free_ms}ms, held ${held_ms}ms)")"
+        "$RC $([ -n "$first_sc" ] && [ -n "$released" ] && [ "$first_sc" -ge "$released" ] && echo yes \
+            || echo "no (shellcheck started ${first_sc:-never}, lock released ${released:-never})")"
     : > "$T/sc-env"
     precommit WV_GATE_SC_LOCK="$L"
     check "...and the lock variable reaches no process the hook starts" "unset" "$(sort -u "$T/sc-env")"

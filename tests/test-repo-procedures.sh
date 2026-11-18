@@ -32,6 +32,7 @@ lacks() { ! grep -qF -- "$2" <<< "$1"; }
 mkdir -p "$CONFIG/procedures" "$CONFIG/lib" "$A/.weave/procedures" "$B/.weave"
 cp "$ROOT/scripts/project-procedures.sh" "$ROOT/scripts/gen-procedures.sh" "$CONFIG/"
 cp "$ROOT/scripts/lib/wv-repository-class.sh" "$CONFIG/lib/"
+cp "$ROOT/scripts/lib/wv-skill-retirement.sh" "$CONFIG/lib/"
 chmod +x "$CONFIG/project-procedures.sh" "$CONFIG/gen-procedures.sh"
 
 procedure() { # dir id skill body [visibility]

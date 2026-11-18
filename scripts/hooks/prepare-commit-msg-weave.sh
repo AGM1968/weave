@@ -5,8 +5,9 @@
 _wv_root="$(git rev-parse --show-toplevel 2>/dev/null)"
 _wv_hook_src="$_wv_root/scripts/hooks/prepare-commit-msg-weave.sh"
 if [ -z "${WV_HOOK_REEXEC:-}" ] && [ -f "$_wv_hook_src" ] && ! cmp -s "$_wv_hook_src" "$0"; then
-    # ./install.sh exists only in Weave's own tree; a consumer whose vendored
-    # source wv init-repo wrote refreshes with wv (wv-376de3).
+    # ./install.sh is named only where the source installer is available
+    # (install.sh and scripts/wv at HEAD); otherwise, or when HEAD cannot be
+    # read, a consumer refreshes with wv (wv-376de3, wv-225efc).
     _wv_refresh='wv self-update, then wv init-repo --update'
     [ "$(git ls-tree HEAD -- install.sh scripts/wv 2>/dev/null | wc -l)" -eq 2 ] && _wv_refresh='./install.sh'
     echo "Weave prepare-commit-msg: installed hook differs from scripts/hooks/prepare-commit-msg-weave.sh — running the source (refresh with $_wv_refresh)" >&2

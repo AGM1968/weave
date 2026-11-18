@@ -47,12 +47,14 @@ check "an archived skill is removed" "absent" "$(present unstuck)"
 check "every archived skill is removed" "absent" "$(present epic-breakdown)"
 check "a hand-written skill is kept" "present" "$(present my-own-skill)"
 check "a procedure-projected skill is kept" "present" "$(present projected)"
-check "a shipped skill is installed" "present" "$(present trails)"
-if grep -qx trails "$SK/.weave-installed" 2>/dev/null; then
-    ok "the manifest records what was installed"
-else
-    bad "the manifest records what was installed" "manifest: $(tr '\n' ' ' < "$SK/.weave-installed" 2>/dev/null)"
-fi
+# The names install.sh ships, read with the array on one line or several. The
+# list is empty since every Weave skill became a procedure projection
+# (wv-c7f784); it stays as the path for an owner-admitted host-only skill.
+SHIPPED=$(sed -n '/^WV_CONFIG_SKILLS=(/{:a;/)/!{N;ba;};p;}' "$ROOT/install.sh" | tr '\n' ' ' \
+    | sed 's/^WV_CONFIG_SKILLS=(//; s/).*//' | tr ' ' '\n' | grep . | sort | xargs)
+for s in $SHIPPED; do check "shipped skill $s is installed" "present" "$(present "$s")"; done
+check "the manifest records exactly what install.sh ships" "$SHIPPED" \
+    "$(grep . "$SK/.weave-installed" 2>/dev/null | sort | xargs)"
 
 echo "=== a skill leaves the shipped set later ==="
 skill old-skill
@@ -61,7 +63,7 @@ skill still-mine "hand-written, never recorded"
 install_here
 check "a recorded skill that is no longer shipped is removed" "absent" "$(present old-skill)"
 check "an unrecorded skill is still kept" "present" "$(present still-mine)"
-check "shipped skills survive the prune" "present" "$(present zero-in)"
+for s in $SHIPPED; do check "shipped skill $s survives the prune" "present" "$(present "$s")"; done
 if grep -qx old-skill "$SK/.weave-installed"; then
     bad "the manifest drops the removed skill"
 else

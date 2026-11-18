@@ -10,7 +10,7 @@
 
 WV_POLICY_SCHEMA="weave.policy-rules.v1"
 WV_POLICY_CONTRACT_VERSION="1.14.0"
-WV_POLICY_IDENTITY="643f18bbc688ae2f5544472cb742063bc403fec1f4ed7f39c5ac0efc4d93e771"
+WV_POLICY_IDENTITY="710e38ac8ddf73e191d71a29155f50b7804a8a9415666fa201164be16cadc54f"
 
 _wv_policy_applicable() {
     case "${1}:${2-}" in

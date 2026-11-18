@@ -258,7 +258,7 @@ wv_potu_touched_guard() (
 
     # Skip on tool failure. jq's `// true` collapses explicit false → true (boolean
     # alternative semantics), so check explicit equality instead.
-    if echo "$INPUT" | jq -e '.tool_response.success == false' >/dev/null 2>&1; then
+    if echo "$INPUT" | jq -se 'length == 1 and (.[0] | .tool_response.success == false)' >/dev/null 2>&1; then
         exit 0
     fi
 
@@ -481,8 +481,8 @@ _potu_route_advisory() {
         ev="$root/.weave/route-evidence/$node.json"
         [ -f "$ev" ] || continue
         # Every recorded sha256 for the suite, in either evidence shape.
-        if jq -e --arg s "$rel" --arg h "$sha" \
-            '[.. | objects | select(has("suites")) | .suites[$s].sha256 // empty] | any(. != $h)' \
+        if jq -se --arg s "$rel" --arg h "$sha" \
+            'length == 1 and (.[0] | [.. | objects | select(has("suites")) | .suites[$s].sha256 // empty] | any(. != $h))' \
             "$ev" >/dev/null 2>&1; then
             stale="${stale:+$stale }$node"
         fi
@@ -587,7 +587,7 @@ wv_potu_lint_guard() (
     # PostToolUseFailure fires for hard failures; this guards soft/partial failures.
     # Use jq -e equality: 'jq -r ".x // true"' collapses explicit boolean false to
     # true (alternative-operator semantics on falsey values).
-    if echo "$INPUT" | jq -e '.tool_response.success == false' >/dev/null 2>&1; then
+    if echo "$INPUT" | jq -se 'length == 1 and (.[0] | .tool_response.success == false)' >/dev/null 2>&1; then
         exit 0
     fi
 
@@ -635,7 +635,7 @@ wv_potu_memory_guard() (
 
     # Skip on tool failure (jq `// true` collapses explicit false → true, so test
     # explicit equality).
-    if echo "$INPUT" | jq -e '.tool_response.success == false' >/dev/null 2>&1; then
+    if echo "$INPUT" | jq -se 'length == 1 and (.[0] | .tool_response.success == false)' >/dev/null 2>&1; then
         exit 0
     fi
 

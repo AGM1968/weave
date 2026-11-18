@@ -28,6 +28,17 @@ Usage:
                                               checkpoint) or failed (exit 3)
   wv-load-ack.py show DB                      print the checkpoint, exit 1 if none
   wv-load-ack.py checkpoint WEAVE_DIR         print the checkpoint of the tree now
+  wv-load-ack.py emitted DB PATH...           record delta files this database
+                                              published since its load
+  wv-load-ack.py unloaded DB WEAVE_DIR        print published delta files the
+                                              database neither loaded nor
+                                              published; exit 1 if any
+
+A delta file on disk that the last complete load did not absorb and this
+database did not publish came from elsewhere: a pull, or another session's
+sync. The database lacks those changes, so state.sql must not be written from
+it until a load (wv-287e89). With no complete acknowledgement there is no
+evidence either way, and unloaded reports nothing.
 """
 from __future__ import annotations
 
@@ -54,6 +65,9 @@ CREATE TABLE IF NOT EXISTS _weave_load_ack (
 CREATE TABLE IF NOT EXISTS _weave_load_ack_files (
     path TEXT PRIMARY KEY,
     blob TEXT NOT NULL
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS _weave_emitted_deltas (
+    path TEXT PRIMARY KEY
 ) WITHOUT ROWID;
 """
 
@@ -223,6 +237,7 @@ def cmd_begin(db: str) -> int:
     conn.execute("BEGIN IMMEDIATE")
     conn.execute("DELETE FROM _weave_load_ack")
     conn.execute("DELETE FROM _weave_load_ack_files")
+    conn.execute("DELETE FROM _weave_emitted_deltas")
     _set_attempt(conn, "begun", "")
     conn.execute("COMMIT")
     return 0
@@ -278,6 +293,40 @@ def cmd_show(db: str) -> int:
     return 0
 
 
+def cmd_emitted(db: str, paths: list[str]) -> int:
+    """Record delta files (relative to .weave) this database just published."""
+    conn = _connect(db)
+    conn.execute("BEGIN IMMEDIATE")
+    conn.executemany("INSERT OR IGNORE INTO _weave_emitted_deltas (path) VALUES (?)",
+                     [(p,) for p in paths if p])
+    conn.execute("COMMIT")
+    return 0
+
+
+def cmd_unloaded(db: str, weave_dir: str) -> int:
+    """Print delta files neither loaded nor published here; 1 if any."""
+    try:
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5.0)
+        acked = conn.execute(
+            "SELECT 1 FROM _weave_load_ack k JOIN _weave_load_attempt a "
+            "ON a.id = 1 AND a.state = 'complete'").fetchone()
+    except sqlite3.Error:
+        return 0
+    if not acked:
+        return 0
+    known = {r[0] for r in conn.execute("SELECT path FROM _weave_load_ack_files")}
+    try:
+        known |= {r[0] for r in conn.execute("SELECT path FROM _weave_emitted_deltas")}
+    except sqlite3.Error:
+        pass  # loaded before this table existed: only the ack is known
+    on_disk = [p for p in _walk(os.path.realpath(weave_dir))
+               if p.startswith("deltas/") and "/.staging-" not in p]
+    missing = sorted(set(on_disk) - known)
+    for path in missing:
+        print(path)
+    return 1 if missing else 0
+
+
 def main(argv: list[str]) -> int:
     """Dispatch one subcommand; see the module docstring."""
     if not argv:
@@ -298,6 +347,10 @@ def main(argv: list[str]) -> int:
             return cmd_finish(args[0], args[1], args[2], args[3:])
         if cmd == "show" and len(args) == 1:
             return cmd_show(args[0])
+        if cmd == "emitted" and len(args) >= 1:
+            return cmd_emitted(args[0], args[1:])
+        if cmd == "unloaded" and len(args) == 2:
+            return cmd_unloaded(args[0], args[1])
     except (CatalogError, OSError, sqlite3.Error) as exc:
         print(f"wv-load-ack: {exc}", file=sys.stderr)
         return 1

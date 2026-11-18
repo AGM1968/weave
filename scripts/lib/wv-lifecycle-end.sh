@@ -189,9 +189,10 @@ wv_stop_guard() (
     _SC_BLOCKED=false
     # shellcheck disable=SC2317  # invoked by the EXIT trap
     _sc_record_stop() {
-        local rc=$?
+        local rc=$? stopfile="${_HC_HOT_ZONE:-}/.session_laststop"
+        declare -F wv_session_file >/dev/null && stopfile=$(wv_session_file "${_HC_HOT_ZONE:-}" laststop)
         [ -d "${_HC_HOT_ZONE:-}" ] && printf '%s %s\n' "$(date +%s)" \
-            "$([ "$_SC_BLOCKED" = true ] && echo blocked || echo stopped)" > "${_HC_HOT_ZONE}/.session_laststop" 2>/dev/null
+            "$([ "$_SC_BLOCKED" = true ] && echo blocked || echo stopped)" > "$stopfile" 2>/dev/null
         # This trap replaces the completion stamp's (wv-ca3ffe): stamp here.
         declare -F wv_hook_run_end >/dev/null && wv_hook_run_end "$rc"
         return "$rc"
@@ -323,7 +324,7 @@ wv_stop_guard() (
     # Retro: surface call-stats when session analysis is enabled and a log exists.
     if [ -n "$_WV" ]; then
         _CALL_STATS=$("$_WV" analyze sessions --call-stats --top=3 --since-days=1 --json 2>/dev/null || true)
-        if echo "$_CALL_STATS" | jq -e '.call_stats | length > 0' >/dev/null 2>&1; then
+        if echo "$_CALL_STATS" | jq -se 'length == 1 and (.[0] | .call_stats | length > 0)' >/dev/null 2>&1; then
             _TOP_CMD=$(echo "$_CALL_STATS" | jq -r '.call_stats[0] | "\(.cmd) (\(.calls) calls, ~\(.approx_tokens|tostring) tok)"' 2>/dev/null || true)
             if [ -n "$_TOP_CMD" ]; then
                 echo "Retro: top command today: $_TOP_CMD. Full report: wv analyze sessions --call-stats --since-days=1" >&2
@@ -391,7 +392,11 @@ wv_session_end_sync() (
 
     # Clear the crash sentinel on clean shutdown. LAST: if a step above failed
     # and the stop guard blocked exit, the sentinel persists for next session.
-    rm -f "${_HC_HOT_ZONE}/.session_sentinel"
+    if declare -F wv_session_file >/dev/null; then
+        rm -f "$(wv_session_file "$_HC_HOT_ZONE" sentinel)"
+    else
+        rm -f "${_HC_HOT_ZONE}/.session_sentinel"
+    fi
     exit 0
 )
 

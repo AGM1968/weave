@@ -191,8 +191,10 @@ check "node_kind wins over a disagreeing type" "$(kind_of wv-0000a7)" "epic/epic
 check "the backfill leaves updated_at alone" "$(sqlite3 "$DB" "SELECT updated_at FROM nodes WHERE id='wv-0000a1';")" "2026-01-01 00:00:00"
 check "wv ready lists the same nodes after the backfill" "$(ready_ids)" "$ready_before"
 check "every node now carries a kind" "$(sqlite3 "$DB" "SELECT COUNT(*) FROM nodes WHERE json_extract(metadata,'\$.node_kind') IS NULL OR json_extract(metadata,'\$.node_kind') IS NOT type;")" "0"
-grep -q 'wv-0000a1.*node_kind' "$R/.weave/state.sql" 2>/dev/null && ok "the backfill is persisted to state.sql" ||
-    bad "the backfill is persisted to state.sql"
+# A write publishes its delta; state.sql is rewritten only by sync, a
+# checkpoint or a load (wv-8595fb), so the delta is what persists it.
+grep -rqE 'wv-0000a1.*node_kind|node_kind.*wv-0000a1' "$R/.weave/deltas" 2>/dev/null && ok "the backfill is persisted to a published delta" ||
+    bad "the backfill is persisted to a published delta"
 check "a second backfill has nothing to write" "$(w kind backfill --json 2>/dev/null | jq -r '.to_write')" "0"
 # A mapping that would change wv ready is refused before anything is written:
 # a node_kind outside the kinds, over a memory type, is listed by ready today

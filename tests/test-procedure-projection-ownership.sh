@@ -109,12 +109,18 @@ printf '%s\n' '#!/usr/bin/env bash' > "$E/run.sh"
         'claude_skill: wv-withres' 'resources:' \
         '  - path: data.txt' \
         '  - path: run.sh' '    executable: true' \
-        '---' '# body'
+        '---' '# body' '' \
+        '- a body bullet is not a resource item' \
+        '- path: body-text.txt, in the body, is not a resource either'
 } > "$E/withres.md"
+# resources as the LAST frontmatter key: every parser stops at the closing ---
+# (wv-8cd9d9); before, the body's list items failed as malformed resources.
+"$GEN" --source="$E" --check >/dev/null || { echo "FAIL: body list read as resource items"; exit 1; }
 bash "$PROJECT" --source="$E" --repo="$EREPO"
 [ -f "$EREPO/.claude/skills/wv-withres/data.txt" ] || { echo "FAIL: non-executable resource not copied"; exit 1; }
 [ ! -x "$EREPO/.claude/skills/wv-withres/data.txt" ] || { echo "FAIL: non-executable resource gained exec bit"; exit 1; }
 [ -x "$EREPO/.claude/skills/wv-withres/run.sh" ] || { echo "FAIL: executable resource missing exec bit"; exit 1; }
+[ ! -e "$EREPO/.claude/skills/wv-withres/body-text.txt" ] || { echo "FAIL: a body line was projected as a resource"; exit 1; }
 
 # --- F. Codex ownership: deleted managed entry pruned, manual entry preserved -
 F="$TMP/f"; FREPO="$TMP/frepo"; mkdir -p "$F" "$FREPO"
@@ -236,4 +242,65 @@ fi
 after=$(find "$OREPO" -path "$OREPO/.git" -prune -o -type f -print | sort)
 [ "$before" = "$after" ] || { echo "FAIL: repository-class refusal mutated projection target"; exit 1; }
 
-echo 'Results: 35/35 passed'
+# --- Q. Neutral skills surface (.agents/skills, wv-77586c) -------------------
+# Written for a run that owns it (section R), byte-identical to the Claude adapter's copy;
+# a hand-written neutral skill refuses before any write; a demoted procedure's
+# neutral copy is pruned, a hand-written one is kept.
+N="$TMP/neutral"; NREPO="$TMP/neutralrepo"; mkdir -p "$N" "$NREPO"
+mkproc "$N" neutral '[claude, codex, copilot]' 'visibility: shared' 'claude_skill: wv-neutral'
+mkproc "$N" noskill '[codex, copilot]' 'visibility: shared'
+bash "$PROJECT" --source="$N" --repo="$NREPO" --agent=codex
+grep -qF -- "$MARKER" "$NREPO/.agents/skills/wv-neutral/SKILL.md" \
+    || { echo "FAIL: --agent=codex did not write the neutral skill"; exit 1; }
+[ ! -e "$NREPO/.claude/skills" ] || { echo "FAIL: --agent=codex wrote the Claude adapter"; exit 1; }
+[ "$(ls "$NREPO/.agents/skills")" = wv-neutral ] || { echo "FAIL: a procedure with no skill name reached .agents/skills"; exit 1; }
+bash "$PROJECT" --source="$N" --repo="$NREPO" --agent=all
+diff -r "$NREPO/.agents/skills/wv-neutral" "$NREPO/.claude/skills/wv-neutral" >/dev/null \
+    || { echo "FAIL: neutral and Claude skill copies differ"; exit 1; }
+mkdir -p "$NREPO/.agents/skills/mine"; echo '# mine' > "$NREPO/.agents/skills/mine/SKILL.md"
+sed -i 's/^visibility: shared/visibility: local/' "$N/neutral.md"
+bash "$PROJECT" --source="$N" --repo="$NREPO" --agent=claude
+[ ! -e "$NREPO/.agents/skills/wv-neutral" ] || { echo "FAIL: demoted neutral skill not pruned"; exit 1; }
+[ -f "$NREPO/.agents/skills/mine/SKILL.md" ] || { echo "FAIL: hand-written neutral skill pruned"; exit 1; }
+sed -i 's/^visibility: local/visibility: shared/' "$N/neutral.md"
+mkdir -p "$NREPO/.agents/skills/wv-neutral"; echo '# hand-written' > "$NREPO/.agents/skills/wv-neutral/SKILL.md"
+rm -rf "$NREPO/.claude/skills"
+if bash "$PROJECT" --source="$N" --repo="$NREPO" --agent=all 2>/dev/null; then
+    echo "FAIL: projector overwrote a hand-written neutral skill"; exit 1
+fi
+[ ! -e "$NREPO/.claude/skills/wv-neutral" ] || { echo "FAIL: neutral collision left a partial Claude write"; exit 1; }
+grep -qxF '# hand-written' "$NREPO/.agents/skills/wv-neutral/SKILL.md" || { echo "FAIL: hand-written neutral skill changed"; exit 1; }
+
+# --- R. Neutral skills are opt-in (owner decision on wv-cb5c96) --------------
+# Codex and Amp load .agents/skills with no prompt and pi asks for folder trust
+# because of it, so it is written only when --agent selects a harness that reads
+# it (codex, all, or a comma list naming codex) or when the repository already
+# holds a managed copy, the recorded opt-in. --agent takes init-repo's comma list.
+R="$TMP/optin"; mkdir -p "$R"
+mkproc "$R" optin '[claude, codex, copilot]' 'visibility: shared' 'claude_skill: wv-optin'
+RC="$TMP/optin-claude"; mkdir -p "$RC"
+bash "$PROJECT" --source="$R" --repo="$RC" --agent=claude
+[ -f "$RC/.claude/skills/wv-optin/SKILL.md" ] && [ ! -e "$RC/.agents/skills" ] \
+    || { echo "FAIL: a claude-only projection wrote .agents/skills"; exit 1; }
+RP="$TMP/optin-copilot"; mkdir -p "$RP"
+bash "$PROJECT" --source="$R" --repo="$RP" --agent=copilot
+[ ! -e "$RP/.agents/skills" ] || { echo "FAIL: a copilot-only projection wrote .agents/skills"; exit 1; }
+RL="$TMP/optin-list"; mkdir -p "$RL"
+bash "$PROJECT" --source="$R" --repo="$RL" --agent=claude,codex
+grep -qF -- "$MARKER" "$RL/.agents/skills/wv-optin/SKILL.md" && [ -f "$RL/.claude/skills/wv-optin/SKILL.md" ] \
+    || { echo "FAIL: --agent=claude,codex did not write both skill surfaces"; exit 1; }
+sed -i 's/^description: optin proc/description: optin proc revised/' "$R/optin.md"
+bash "$PROJECT" --source="$R" --repo="$RL" --agent=claude
+grep -qF 'optin proc revised' "$RL/.agents/skills/wv-optin/SKILL.md" \
+    || { echo "FAIL: a managed .agents/skills copy was not refreshed under --agent=claude"; exit 1; }
+for bad in bogus claude,bogus; do
+    if bash "$PROJECT" --source="$R" --repo="$RC" --agent="$bad" 2>/dev/null; then
+        echo "FAIL: --agent=$bad accepted"; exit 1
+    fi
+done
+RH="$TMP/optin-hand"; mkdir -p "$RH/.agents/skills/wv-optin"; echo '# mine' > "$RH/.agents/skills/wv-optin/SKILL.md"
+bash "$PROJECT" --source="$R" --repo="$RH" --agent=claude \
+    || { echo "FAIL: a claude-only projection refused over a hand-written neutral skill it does not own"; exit 1; }
+grep -qxF '# mine' "$RH/.agents/skills/wv-optin/SKILL.md" || { echo "FAIL: hand-written neutral skill changed"; exit 1; }
+
+echo 'Results: 49/49 passed'

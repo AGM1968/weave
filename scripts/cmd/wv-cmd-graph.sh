@@ -1636,6 +1636,9 @@ cmd_tree() {
 # naming heuristic or a changed suite's own run did (wv-fb861c).
 # An [inputs] section ("suite = glob ...") is skipped here: it declares a
 # suite's complete input scope for result reuse, not a route (wv-f0bcc4).
+# With --unmatched first (wv impact --suites --unmatched, wv-da768b), prints
+# {"suites":[...],"unmatched":[...]} instead: the same suites beside the given
+# files no map row, pattern, heuristic, [default] or [scanners] entry routes.
 # With --routes first, prints the route table instead: one "<file>\t<suite>"
 # line per route, so a caller can invert it into each suite's inputs
 # (wv test-status --inputs, wv-cb4913). One router, two views.
@@ -1670,9 +1673,14 @@ _impact_map_at_rev() {
 _IMPACT_MAP_REVS=()
 
 _impact_suites_for_files() {
-    local _routes_only=false
+    local _routes_only=false _with_unmatched=false
     if [ "${1:-}" = "--routes" ]; then _routes_only=true; shift; fi
-    if [ $# -eq 0 ]; then [ "$_routes_only" = true ] || echo '[]'; return 0; fi
+    if [ "${1:-}" = "--unmatched" ]; then _with_unmatched=true; shift; fi
+    if [ $# -eq 0 ]; then
+        if [ "$_with_unmatched" = true ]; then echo '{"suites":[],"unmatched":[]}'
+        elif [ "$_routes_only" != true ]; then echo '[]'; fi
+        return 0
+    fi
 
     local map_conf="${WEAVE_DIR}/test-map.conf"
     local times_json="${WEAVE_DIR}/test-times.json"
@@ -1716,7 +1724,8 @@ _impact_suites_for_files() {
         _map_texts+=("$_conf_text"); _map_labels+=("$map_conf")
     fi
 
-    declare -A _seen=() _heavy_maps=() _declared=()
+    # _covered: a file some map routes to at least one suite (wv-da768b).
+    declare -A _seen=() _heavy_maps=() _declared=() _covered=()
     local _mi _nmaps=${#_map_texts[@]}
     for _mi in "${!_map_texts[@]}"; do
         _conf_text=${_map_texts[$_mi]}
@@ -1863,6 +1872,7 @@ _impact_suites_for_files() {
             for s in $suites; do
                 [ "$_routes_only" = true ] && printf '%s\t%s\n' "$f" "$s"
                 _seen["$s"]=1
+                _covered["$f"]=1
             done
             for s in $decl; do _declared["$s"]=1; done
         done
@@ -1888,7 +1898,19 @@ _impact_suites_for_files() {
         first=false
     done
     out+=']'
-    echo "$out"
+    if [ "$_with_unmatched" != true ]; then
+        echo "$out"
+        return 0
+    fi
+    # --unmatched: the suites beside the files no route covers, in the order
+    # given, so a caller can name them (wv-da768b). jq builds the list: a path
+    # can hold a quote or backslash.
+    local -a _unmatched=()
+    for f in "$@"; do
+        [ -n "${_covered[$f]+x}" ] || _unmatched+=("$f")
+    done
+    printf '%s' "$out" | jq -c '{suites: ., unmatched: $ARGS.positional}' \
+        --args ${_unmatched[@]+"${_unmatched[@]}"} || return 1
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1981,6 +2003,7 @@ cmd_impact() {
     local include_quality=false
     local node_cap=50
     local file_seeds=()
+    local with_unmatched=false
 
     local seeds=()
 
@@ -1990,6 +2013,7 @@ cmd_impact() {
             --direction=*)  direction="${1#*=}" ;;
             --json)         output_format="json" ;;
             --suites)       output_format="suites" ;;
+            --unmatched)    with_unmatched=true ;;
             --full)         full=true ;;
             --include-done) include_done=true ;;
             --all)          node_cap=10000 ;;
@@ -2013,8 +2037,16 @@ cmd_impact() {
             echo -e "${RED}Error: --suites requires --files=<paths>${NC}" >&2
             return 1
         fi
-        _impact_suites_for_files "${file_seeds[@]}"
+        if [ "$with_unmatched" = true ]; then
+            _impact_suites_for_files --unmatched "${file_seeds[@]}"
+        else
+            _impact_suites_for_files "${file_seeds[@]}"
+        fi
         return $?
+    fi
+    if [ "$with_unmatched" = true ]; then
+        echo -e "${RED}Error: --unmatched needs --suites${NC}" >&2
+        return 1
     fi
 
     # Resolve file seeds → node IDs (merged with any explicit ID seeds)
@@ -2527,7 +2559,7 @@ cmd_discover() {
             --node-ids="$_disc_finding_ids" --limit=2 2>/dev/null || true)
         # jq refuses an empty --argjson, and "nothing to coach" is the ordinary case.
         [ -n "$_disc_coaching" ] || _disc_coaching="null"
-        printf '%s' "$_disc_coaching" | jq -e . >/dev/null 2>&1 || _disc_coaching="null"
+        printf '%s' "$_disc_coaching" | jq -se 'length == 1 and (.[0] | .)' >/dev/null 2>&1 || _disc_coaching="null"
     fi
 
     jq -n -c \
@@ -2611,6 +2643,17 @@ cmd_discover() {
 
         metadata_values(node_metadata($seed).done_criteria) as $criteria |
         metadata_values(node_metadata($seed).risks) as $risks |
+        # Plan assumptions (blindspot-pass step 5) and the spec must-not-break
+        # list (clarify-spec) are read here, so the next agent inherits them
+        # through discover (wv-a1c40b). An assumption tagged verified or
+        # falsified is a known fact; any other tag, or none, is open.
+        # No apostrophes in this program: it is a single-quoted shell string.
+        (metadata_values(node_metadata($seed).assumptions)
+         | map(if type == "object" then . else {claim: (. | tostring)} end)) as $assumptions |
+        ($assumptions | map(select(.status == "verified" or .status == "falsified"))) as $settled |
+        ($assumptions | map(select(.status != "verified" and .status != "falsified"))) as $open |
+        (node_metadata($seed).spec // {} | if type == "object" then . else {} end
+         | metadata_values(.must_not_break)) as $must_not_break |
         {
           schema: $schema,
           generated_by: $generated_by,
@@ -2632,6 +2675,24 @@ cmd_discover() {
                 "Verify closure evidence against this criterion.";
                 null
               )))
+            + ($must_not_break | map(. as $keep | item(
+                "known_known";
+                "observed";
+                "spec_metadata";
+                ("Must not break: " + ($keep | tostring));
+                "Verify this behaviour still holds after the change.";
+                null
+              )))
+            + ($settled | map(. as $a | item(
+                "known_known";
+                "observed";
+                "assumption_metadata";
+                ((if $a.status == "falsified" then "Falsified assumption: " else "Verified assumption: " end)
+                 + ($a.claim // "" | tostring)
+                 + (if $a.evidence then " (" + ($a.evidence | tostring) + ")" else "" end));
+                (if $a.status == "falsified" then "The plan must not rely on this." else "Re-check only if the code it rests on changes." end);
+                null
+              )))
           )[0:$limit],
           known_unknowns: (
             interleave([
@@ -2647,8 +2708,24 @@ cmd_discover() {
                   "known_unknown";
                   "candidate";
                   "risk_metadata";
-                  ("Recorded risk: " + ($risk | tostring));
+                  ("Recorded risk: "
+                   + (if ($risk | type) == "object" and $risk.scenario
+                      then ($risk.scenario | tostring)
+                           + (if $risk.impact or $risk.likelihood
+                              then " (" + ($risk.impact // "?" | tostring) + "/" + ($risk.likelihood // "?" | tostring) + ")"
+                              else "" end)
+                           + (if $risk.tripwire then "; tripwire: " + ($risk.tripwire | tostring) else "" end)
+                      else ($risk | tostring) end));
                   "Bound or mitigate this risk during implementation.";
+                  null
+                ))),
+              ($open | map(. as $a | item(
+                  "known_unknown";
+                  "candidate";
+                  "assumption_metadata";
+                  ("Unverified assumption: " + ($a.claim // "" | tostring)
+                   + (if $a.status then " [" + ($a.status | tostring) + "]" else "" end));
+                  ("Check before building on it" + (if $a.check then ": " + ($a.check | tostring) else "." end));
                   null
                 ))),
               ($findings | map(. as $finding | item(

@@ -91,12 +91,15 @@ check "a gate that ran lanes records each lane, their wall and the protected pas
     --lanes-started-ms=1792000108000 >/dev/null 2>&1
 "$WV" test-record gate --gate --phase=lanes --gate-id=l3 --exit=0 --duration=9000 \
     --lanes= --lanes-ms= --lanes-started-ms=- >/dev/null 2>&1
-check "a gate with no lane carries no lane fields" "false false false false" \
-    "$(tail -1 "$GATES" | jq -r '"\(has("lanes")) \(has("lanes_ms")) \(has("lanes_started_ms")) \(has("protected_ms"))"')"
+# The record must be this gate's own: on jq 1.6 an empty lanes value once
+# passed the array test, aborted the append, and left l2 as the last line
+# (wv-b12fb4).
+check "a gate with no lane is recorded and carries no lane fields" "l3 false false false false" \
+    "$(tail -1 "$GATES" | jq -r '"\(.gate_id) \(has("lanes")) \(has("lanes_ms")) \(has("lanes_started_ms")) \(has("protected_ms"))"')"
 "$WV" test-record gate --gate --phase=lanes --gate-id=l4 --exit=0 --duration=9000 \
     --lanes='not json' --lanes-ms=5 >/dev/null 2>&1
-check "malformed lanes are dropped, not written as a string" "false false" \
-    "$(tail -1 "$GATES" | jq -r '"\(has("lanes")) \(has("lanes_ms"))"')"
+check "malformed lanes are dropped, not written as a string" "l4 false false" \
+    "$(tail -1 "$GATES" | jq -r '"\(.gate_id) \(has("lanes")) \(has("lanes_ms"))"')"
 _gm_out=$("$WV" analyze gates --json 2>/dev/null)
 check "analyze reports lane time only over gates that recorded it" "2 8 21 0.58 8 12" \
     "$(jq -r '.phases[] | select(.phase == "lanes") | "\(.lane_gates) \(.lanes_p50_s|floor) \(.lanes_p90_s|floor) \(.lanes_share_of_wall) \(.protected_p50_s|floor) \(.protected_p90_s|floor)"' <<< "$_gm_out")"
@@ -177,6 +180,29 @@ for d in 100 100 100 100 100 100 100 100 100 100 100 900 900 900 900 900 900; do
 done
 check "recent p50 is the median of the last 10 measured runs, all-history p50 lags" "900 100" \
     "$("$WV" analyze suites --json 2>/dev/null | jq -r '.suites[] | select(.suite == "tests/test-grow.sh") | "\(.recent_p50_ms) \(.p50_ms)"')"
+
+# ── every row names the clock its duration was measured on (wv-b17a85) ──
+"$WV" test-record tests/test-clk.sh --exit=0 --duration=100 --clock=monotonic >/dev/null 2>&1
+check "a suite row carries the clock it was measured on" "monotonic" "$(tail -1 "$SUITES" | jq -r '.clock')"
+"$WV" test-record tests/test-clk.sh --exit=0 --duration=100 --clock=sundial >/dev/null 2>&1
+check "...an undeclared clock is dropped, never guessed" "false" "$(tail -1 "$SUITES" | jq -r 'has("clock")')"
+"$WV" test-record gate --gate --phase=pre-commit --gate-id=gclk --exit=0 --duration=5 --clock=boottime >/dev/null 2>&1
+check "a gate row carries the clock it was measured on" "gclk boottime" "$(tail -1 "$GATES" | jq -r '"\(.gate_id) \(.clock)"')"
+
+# Estimates read monotonic runs only; a wall or boottime run (one that may hold
+# a suspend) never moves them; a suite with no monotonic run yet keeps its
+# unlabelled history until it has one.
+est() { "$WV" analyze suites --json 2>/dev/null | jq -r --arg s "$1" '.suites[] | select(.suite == $s) | "\(.p50_ms) \(.recent_p50_ms) \(.estimate_basis)"'; }
+for d in 200 200 200; do "$WV" test-record tests/test-sus.sh --exit=0 --duration=$d >/dev/null 2>&1; done
+check "a suite with only unlabelled history is estimated from it" "200 200 legacy" "$(est tests/test-sus.sh)"
+for d in 9000000 9000000 9000000 9000000; do "$WV" test-record tests/test-sus.sh --exit=0 --duration=$d --clock=wall >/dev/null 2>&1; done
+"$WV" test-record tests/test-sus.sh --exit=0 --duration=9000000 --clock=boottime >/dev/null 2>&1
+"$WV" test-record tests/test-sus.sh --exit=0 --duration=9000000 --clock=unknown >/dev/null 2>&1
+check "...and wall, boottime or unknown runs, which may hold a suspend, never move it" "200 200 legacy" "$(est tests/test-sus.sh)"
+"$WV" test-record tests/test-sus.sh --exit=0 --duration=300 --clock=monotonic >/dev/null 2>&1
+check "one monotonic run replaces the unlabelled history as the estimate" "300 300 monotonic" "$(est tests/test-sus.sh)"
+"$WV" test-record tests/test-wallonly.sh --exit=0 --duration=9000000 --clock=wall >/dev/null 2>&1
+check "a suite timed only on the wall clock is unmeasured" "0 0 none" "$(est tests/test-wallonly.sh)"
 
 # ── a test run without its own log never writes the user's durable history ──
 fakehome="$TMP/home"; mkdir -p "$fakehome"

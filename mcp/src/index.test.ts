@@ -41,7 +41,7 @@ function fixtureEnv(dir: string, hotZone = join(dir, "hot-zone")): NodeJS.Proces
       ([key]) =>
         !/^(WV_|GIT_|CLAUDE_CODE_|CODEX_)/.test(key) &&
         // AI_AGENT names the harness too (wv-08d7f9).
-        !["WEAVE_DIR", "REPO_ROOT", "POLICY_CACHE", "CLAUDECODE", "COPILOT_AGENT", "AI_AGENT"].includes(key)
+        !["WEAVE_DIR", "REPO_ROOT", "POLICY_CACHE", "CLAUDECODE", "COPILOT_AGENT", "COPILOT_CLI", "COPILOT_AGENT_SESSION_ID", "AI_AGENT"].includes(key)
     )
   );
   return {
@@ -375,6 +375,8 @@ describe("resolveAgentHarness / resolveAgentId cross-harness parity (wv-4d4c96 /
     "CODEX_THREAD_ID",
     "CODEX_CI",
     "COPILOT_AGENT",
+    "COPILOT_CLI",
+    "COPILOT_AGENT_SESSION_ID",
     "CLAUDE_CODE_SESSION_ID",
     "WV_SESSION_IDENTITY",
     "WV_SESSION_ID",
@@ -505,6 +507,19 @@ describe("resolveAgentHarness / resolveAgentId cross-harness parity (wv-4d4c96 /
     setMarkers({ WV_SESSION_ID: "" });
     expect(sessionIdentityApplies()).toBe(true);
     expect(refuseOwnershipInSessionMode("weave_work", { id: "wv-000000" })?.isError).toBe(true);
+  });
+
+  it("Copilot CLI: COPILOT_CLI=1 ranks after AI_AGENT, its session variable qualifies it (wv-6781d7)", () => {
+    setMarkers({ COPILOT_CLI: "1", COPILOT_AGENT_SESSION_ID: "e6ffa6a9-f6e4-48e1-88b1-26cb209c229a" });
+    expect(resolveAgentHarness()).toBe("copilot");
+    expect(resolveAgentId()).toMatch(new RegExp(`^copilot-.+-.+-h${h16("e6ffa6a9-f6e4-48e1-88b1-26cb209c229a")}$`));
+    setMarkers({ COPILOT_CLI: "1", COPILOT_AGENT_SESSION_ID: "s1", CLAUDECODE: "1" });
+    expect(resolveAgentHarness()).toBe("copilot");
+    setMarkers({ COPILOT_CLI: "1", COPILOT_AGENT_SESSION_ID: "s1", CLAUDECODE: "1", AI_AGENT: "claude-code_2-1-318_agent" });
+    expect(resolveAgentHarness()).toBe("claude");
+    // A COPILOT_AGENT process does not name the Copilot CLI variable.
+    setMarkers({ COPILOT_AGENT: "1", COPILOT_AGENT_SESSION_ID: "s1" });
+    expect(sessionIdentityApplies()).toBe(false);
   });
 
   it("WV_SESSION_IDENTITY=0, WV_AGENT_ID, copilot and human stay actor-owned", () => {
@@ -938,6 +953,8 @@ describe("Weave MCP Server", () => {
       // wv-f757a4: the policy section was silently absent (hook script under a
       // 5s timeout, no "policy:" line in its agent output); it must carry a level.
       expect(result.content[0].text).toMatch(/=== Context Policy ===\npolicy: (HIGH|MEDIUM|LOW)/);
+      // wv-eb061d: the level's directives come from context-policy, not a copy here.
+      expect(result.content[0].text).toMatch(/=== Context Policy ===\npolicy: [A-Z]+[^\n]*\n- \S/);
       // wv-e3f867: policy follows the server's project, not merely WV_DB or
       // WEAVE_DIR. It must be freshly written inside the disposable project.
       expect(existsSync(policyPath)).toBe(true);

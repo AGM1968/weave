@@ -185,13 +185,35 @@ else
     pass "pipe scanner skips files that do not set pipefail"
 fi
 
-pipe_repo_out=$(python3 "$PIPE_SCANNER" "$REPO_ROOT/tests" "$REPO_ROOT/scripts" 2>/dev/null || true)
-pipe_repo_hits=$(grep -cE '^[^-].*:[0-9]+:' <<<"$pipe_repo_out" || true)
-if [ "${pipe_repo_hits:-0}" -eq 0 ]; then
-    pass "no early-exit pipeline under pipefail in tests or production shell"
-else
-    fail "no early-exit pipeline under pipefail in tests or production shell"         "$(grep -E '^[^-].*:[0-9]+:' <<<"$pipe_repo_out" | sed 's/^/    /')
+# Every root that holds maintained shell: shipped (scripts, templates incl.
+# procedure resources, .claude hooks and projected skills, the installers,
+# build-release.sh) and repo tooling (tests, patches). Left out: docs/findings
+# probe scripts and archive/, which are evidence and never ship. Before
+# wv-db7ec6 only tests/ and scripts/ were scanned, so a broken shipped skill
+# helper (weave-audit's audit-report.sh, exit 141 on any real graph) passed.
+PIPE_ROOTS=(tests scripts templates .claude install.sh install-mcp.sh)
+pipe_repo_rc=0
+pipe_repo_out=$(cd "$REPO_ROOT" && python3 "$PIPE_SCANNER" "${PIPE_ROOTS[@]}" 2>&1) || pipe_repo_rc=$?
+if [ "$pipe_repo_rc" -eq 0 ]; then
+    pass "no early-exit pipeline under pipefail in any maintained shell root"
+elif [ "$pipe_repo_rc" -eq 1 ]; then
+    fail "no early-exit pipeline under pipefail in any maintained shell root" \
+        "$(grep -E '^[^-].*:[0-9]+:' <<<"$pipe_repo_out" | sed 's/^/    /')
     capture first, then match on a herestring: grep -q PAT <<< \"\$value\""
+else
+    # A missing root or a scanner crash is not a clean result.
+    fail "no early-exit pipeline under pipefail in any maintained shell root" \
+        "    the scanner did not run (rc $pipe_repo_rc): $pipe_repo_out"
+fi
+
+# A root that does not exist is an error, never zero hits: a renamed root
+# would otherwise shrink the scope above while it still passed.
+pipe_missing_rc=0
+python3 "$PIPE_SCANNER" "$REPO_ROOT/no-such-root-$$" >/dev/null 2>&1 || pipe_missing_rc=$?
+if [ "$pipe_missing_rc" -eq 2 ]; then
+    pass "pipe scanner exits 2 on a root that does not exist"
+else
+    fail "pipe scanner exits 2 on a root that does not exist" "    got rc $pipe_missing_rc"
 fi
 
 # The clean-repo claim above is only as wide as the files the walk selects: 1b's

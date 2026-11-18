@@ -200,6 +200,59 @@ EOF
     assert_contains "$out" '"status":"warn"' "doctor --json marks it warn"
 }
 
+# pattern-rules (wv-0e4a57): doctor names each rule file the loader skips.
+
+write_valid_rule() {
+    cat > ".weave/patterns/$1.yaml" <<EOF
+id: $1
+language: prose
+kind: regex
+patterns:
+  - absent
+EOF
+}
+
+test_invalid_rule_file_is_named() {
+    echo "-- a rule file that breaks the contract → doctor WARN naming it, and only it"
+    mkdir -p .weave/patterns
+    write_valid_rule sound-rule
+    printf 'id: [unclosed\n' > .weave/patterns/broken-rule.yaml
+    local out line
+    out=$("$WV" doctor 2>&1 || true)
+    line=$(grep -F "pattern-rules" <<< "$out" || true)
+    assert_contains "$line" "1 pattern rule file(s) not applied" "doctor counts the invalid rule file"
+    assert_contains "$line" ".weave/patterns/broken-rule.yaml" "doctor names the invalid rule file"
+    assert_not_contains "$line" "sound-rule.yaml" "a valid rule file is not named"
+    assert_not_contains "$line" "every pattern rule file is valid" "never reports pass beside an invalid rule"
+}
+
+test_valid_rule_files_pass() {
+    echo "-- only valid rule files → doctor PASS"
+    mkdir -p .weave/patterns
+    write_valid_rule sound-rule
+    local out
+    out=$("$WV" doctor 2>&1 || true)
+    assert_contains "$out" "pattern-rules: every pattern rule file is valid" "doctor passes when every rule file is valid"
+    assert_not_contains "$out" "not applied" "no invalid-rule warning without one"
+}
+
+test_no_pattern_dir_skips_rule_check() {
+    echo "-- no .weave/patterns/ at all → pattern-rules does not fire"
+    local out
+    out=$("$WV" doctor 2>&1 || true)
+    assert_not_contains "$out" "pattern-rules" "no pattern-rules line without a pattern directory"
+}
+
+test_json_mode_names_the_invalid_rule() {
+    echo "-- wv doctor --json carries the pattern-rules check and stays parsable"
+    mkdir -p .weave/patterns
+    printf 'id: [unclosed\n' > .weave/patterns/broken-rule.yaml
+    local out row
+    out=$("$WV" doctor --json 2>/dev/null || true)
+    row=$(jq -c '.. | objects | select(.check? == "pattern-rules") | {status, named: (.detail | contains("broken-rule.yaml"))}' <<< "$out" 2>/dev/null || true)
+    assert_contains "$row" '{"status":"warn","named":true}' "doctor --json marks pattern-rules warn and names the file"
+}
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 main() {
@@ -212,6 +265,10 @@ main() {
     setup_test_env; test_delegate_failure_never_reports_pass
     setup_test_env; test_malformed_rule_does_not_stop_shadow_detection
     setup_test_env; test_json_mode_carries_the_same_advisory
+    setup_test_env; test_invalid_rule_file_is_named
+    setup_test_env; test_valid_rule_files_pass
+    setup_test_env; test_no_pattern_dir_skips_rule_check
+    setup_test_env; test_json_mode_names_the_invalid_rule
 
     echo ""
     echo "========================================"

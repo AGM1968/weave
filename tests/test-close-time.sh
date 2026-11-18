@@ -94,6 +94,33 @@ check "--json-v2 (the MCP weave_show shape) carries it too" \
 [[ "$(w show "$edited" --close-time 2>&1)" == *"Closed:   $closed_edited UTC"* ]] && ok "the text view prints the derived close" ||
     bad "the text view prints the derived close" "$(w show "$edited" --close-time 2>&1 | grep Closed)"
 
+echo "=== who acted: --actors reads the Delta v2 log (wv-8c24e6) ==="
+# Graph state keeps only the last writer, and a closed node keeps no claimed_by;
+# the append-only operation log keeps one actor per operation.
+as() { local a="$1"; shift; (export WV_AGENT_ID="$a"; w "$@"); }
+multi=$(as actor-a add "touched by three actors" --standalone 2>/dev/null | grep -oE 'wv-[a-f0-9]{6}' | sed -n 1p)
+as actor-a sync >/dev/null 2>&1
+as actor-b work "$multi" >/dev/null 2>&1; as actor-b sync >/dev/null 2>&1
+as actor-c work "$multi" --force >/dev/null 2>&1
+as actor-c done "$multi" --skip-verification --no-warn >/dev/null 2>&1; as actor-c sync >/dev/null 2>&1
+act() { w show "$1" --actors --json 2>/dev/null | jq -c '.actors'; }
+check "the creator is the first operation's actor" "$(act "$multi" | jq -r '.created_by.actor')" "actor-a"
+check "the claim is the transition into active" "$(act "$multi" | jq -r '[.claimed_by[].actor] | join(",")')" "actor-b"
+check "the closer is the actor of the transition into done" "$(act "$multi" | jq -r '.closed_by.actor')" "actor-c"
+check "every actor stays on record" "$(act "$multi" | jq -r '[.events[].actor] | unique | join(",")')" "actor-a,actor-b,actor-c"
+as actor-a work "$multi" --reopen --force >/dev/null 2>&1; as actor-a sync >/dev/null 2>&1
+as actor-a done "$multi" --skip-verification --no-warn >/dev/null 2>&1; as actor-a sync >/dev/null 2>&1
+check "after a reopen, the latest close counts" "$(act "$multi" | jq -r '.closed_by.actor')" "actor-a"
+check "and the earlier claim is still listed" "$(act "$multi" | jq -r '[.claimed_by[].actor] | join(",")')" "actor-b,actor-a"
+# Every write auto-syncs, so the no-operation case is history written with the
+# v2 writer off, which is what all history before the cutover looks like.
+prev2=$( (export WV_DELTA_V2_WRITE=0; w add "written with the v2 writer off" --standalone 2>/dev/null) | grep -oE 'wv-[a-f0-9]{6}' | sed -n 1p)
+check "a node with no v2 operation says so" "$(act "$prev2" | jq -r '.reason')" "no Delta v2 operation names this node"
+check "plain --json keeps its shape without --actors" "$(w show "$multi" --json 2>/dev/null | jq 'has("actors")')" "false"
+check "--json-v2 carries it too" "$(w show "$multi" --json-v2 --actors 2>/dev/null | jq -r '.[0].actors.closed_by.actor')" "actor-a"
+[[ "$(w show "$multi" --actors 2>&1)" == *"closed by actor-a"* ]] && ok "the text view names the closer" ||
+    bad "the text view names the closer" "$(w show "$multi" --actors 2>&1 | grep Actors)"
+
 echo ""
 echo "Results: $pass/$run passed"
 [ "$pass" -eq "$run" ]

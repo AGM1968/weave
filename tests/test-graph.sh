@@ -906,6 +906,17 @@ test_discover() {
     scalar_risk_meta=$("$WV" discover "$seed" --json --depth=2 --limit=5 2>&1)
     assert_jq_true "$scalar_risk_meta" '.known_unknowns | any(.source == "risk_metadata" and .meaning == "Recorded risk: scalar metadata risk")' "discover JSON: scalar risks metadata emits risk evidence"
 
+    # wv-a1c40b: the keys the pre-mortem, blindspot-pass and clarify-spec
+    # procedures write are read back, so the next agent inherits them.
+    sqlite3 "$WV_DB" "UPDATE nodes SET metadata='{\"risks\":[{\"scenario\":\"migration drops rows\",\"impact\":\"critical\",\"likelihood\":\"medium\",\"tripwire\":\"row count differs\"}],\"assumptions\":[{\"claim\":\"helper exists\",\"status\":\"verified\",\"evidence\":\"lib/h.sh\"},{\"claim\":\"api returns json\",\"status\":\"unverified\",\"check\":\"call it\"},{\"claim\":\"cache is warm\",\"status\":\"falsified\"},\"bare assumption\"],\"spec\":{\"what\":\"w\",\"must_not_break\":[\"ordering\"]}}' WHERE id='$seed';"
+    proc_meta=$("$WV" discover "$seed" --json --depth=2 2>&1)
+    assert_jq_true "$proc_meta" '.known_unknowns | any(.source == "risk_metadata" and .meaning == "Recorded risk: migration drops rows (critical/medium); tripwire: row count differs")' "discover JSON: a pre-mortem risk object renders its scenario, not raw JSON"
+    assert_jq_true "$proc_meta" '.known_knowns | any(.source == "assumption_metadata" and .meaning == "Verified assumption: helper exists (lib/h.sh)")' "discover JSON: a verified assumption is a known_known"
+    assert_jq_true "$proc_meta" '.known_knowns | any(.source == "assumption_metadata" and .meaning == "Falsified assumption: cache is warm")' "discover JSON: a falsified assumption is a known_known the plan must not rely on"
+    assert_jq_true "$proc_meta" '.known_unknowns | any(.source == "assumption_metadata" and .meaning == "Unverified assumption: api returns json [unverified]" and .probe == "Check before building on it: call it")' "discover JSON: an unverified assumption is a known_unknown with its check"
+    assert_jq_true "$proc_meta" '.known_unknowns | any(.source == "assumption_metadata" and .meaning == "Unverified assumption: bare assumption")' "discover JSON: an untagged assumption is open"
+    assert_jq_true "$proc_meta" '.known_knowns | any(.source == "spec_metadata" and .meaning == "Must not break: ordering")' "discover JSON: spec must_not_break is a known_known"
+
     ctx=$("$WV" context "$seed" --json --mode=discover 2>&1)
     assert_jq_true "$ctx" '.discovery.schema == "weave.discovery.v1" and (.discovery.unknown_unknown_candidates | length >= 1)' "context discover-mode: embeds bounded discovery report"
 

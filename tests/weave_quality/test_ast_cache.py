@@ -2,6 +2,8 @@
 
 # pylint: disable=missing-function-docstring,redefined-outer-name
 
+import importlib.util
+import shutil
 import subprocess
 import time
 from collections.abc import Iterator
@@ -195,3 +197,25 @@ def test_open_anchors_cache_at_git_toplevel(tmp_path: Path) -> None:
     # Cache anchored at repo root, not the subdir scan path.
     assert (tmp_path / ".weave" / "ast_cache.db").exists()
     assert not (subdir / ".weave").exists()
+
+
+def _identity_of(package: Path) -> str:
+    """Load a copy of the scanner entry module and return the identity it derives."""
+    spec = importlib.util.spec_from_file_location("wq_main_copy", package / "__main__.py")
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return str(vars(module)["_SCANNER_VERSION"])
+
+
+def test_analyzer_change_changes_scanner_identity(tmp_path: Path) -> None:
+    # Regression for wv-70c888: the cache key was the release VERSION alone, so a
+    # bash-parser fix between releases kept serving the old parser's results.
+    source = Path(__file__).resolve().parents[2] / "scripts" / "weave_quality"
+    package = tmp_path / "weave_quality"
+    shutil.copytree(source, package, ignore=shutil.ignore_patterns("__pycache__"))
+    before = _identity_of(package)
+    assert before == _identity_of(package)  # (control) stable while nothing changes
+    with (package / "bash_heuristic.py").open("a", encoding="utf-8") as fh:
+        fh.write("\n# an analyzer change\n")
+    assert _identity_of(package) != before

@@ -16,6 +16,8 @@ export WV_CALL_SOURCE=test
 export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WV="$ROOT/scripts/wv"
+# shellcheck source=tests/lib/fake-agent-bin.sh
+source "$ROOT/tests/lib/fake-agent-bin.sh"
 run=0; pass=0
 ok()  { run=$((run+1)); pass=$((pass+1)); echo "  ✓ $1"; }
 bad() { run=$((run+1)); echo "  ✗ $1"; [ -n "${2:-}" ] && echo "      $2"; }
@@ -31,7 +33,7 @@ PEER_PID=""
 stop_peer() { [ -z "$PEER_PID" ] || { kill "$PEER_PID" 2>/dev/null; wait "$PEER_PID" 2>/dev/null; }; PEER_PID=""; }
 trap 'stop_peer; rm -rf "$T"' EXIT
 mkdir -p "$T/bin" "$T/cfg"
-cp /bin/sleep "$T/bin/codex"
+fake_agent_bin "$T/bin/codex"
 unset WV_HOT_ZONE WV_DB WV_SESSION_ID GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
 export WV_CONFIG_DIR="$T/cfg" WV_AUTO_SYNC=0 WV_AUTO_CHECKPOINT=0 WV_REQUIRE_LEARNING=0 WV_RUN_CACHE=0
 HU="$(hostname)-$(whoami)"

@@ -1163,6 +1163,63 @@ AC_DIR=$(mktemp -d)
     _check "control: and, the branch having diverged, leaves history alone and says so" \
         "$(_yes bash -c '! git merge-base --is-ancestor "$1" HEAD && grep -q diverged <<< "$2"' _ "$_upstream" "$_err")"
 
+    # 4. Other worktrees of the repository (wv-8abb6a). The linked worktree
+    # lives outside the checkout so it adds nothing to its status.
+    _wt="$AC_DIR-wt"
+    git worktree add -q --detach "$_wt" HEAD >/dev/null 2>&1
+    _enabled_in() {  # <dir>: wv_auto_commit_enabled as every writer asks it
+        (cd "$1" && env -u WV_AUTO_CHECKPOINT bash -c \
+            '. "$1/scripts/lib/wv-checkpoint-ci.sh"; wv_auto_commit_enabled "$PWD"' _ "$REPO_ROOT")
+    }
+    _common=$(git rev-parse --path-format=absolute --git-common-dir)
+    _check "control: the linked worktree may checkpoint with no hold anywhere" "$(_yes _enabled_in "$_wt")"
+    touch "$_common/weave-autocommit-hold"
+    _held_in() { ! _enabled_in "$1"; }
+    _check "the repository-wide hold stops the linked worktree's checkpoints" "$(_yes _held_in "$_wt")"
+    rm -f "$_common/weave-autocommit-hold"
+    touch "$(git -C "$_wt" rev-parse --git-path weave-autocommit-hold)"
+    _check "a linked worktree's own hold does not reach the main worktree" "$(_yes _enabled_in "$AC_DIR")"
+    rm -f "$(git -C "$_wt" rev-parse --git-path weave-autocommit-hold)"
+
+    # A live gate in the linked worktree: this checkout's checkpoint still
+    # commits locally but leaves the shared remote refs alone.
+    (cd "$AC_DIR/peer" && echo more >> upstream.txt && git commit -qam "upstream two" \
+        && git push -q origin main) >/dev/null 2>&1
+    _upstream2=$(git -C "$AC_DIR/peer" rev-parse HEAD)
+    rm -f "$AC_DIR/.ready"
+    (cd "$_wt" && exec env -i PATH="$PATH" HOME="$HOME" bash -c \
+        '. "$1/scripts/lib/wv-gate-hold.sh"; wv_gate_hold_acquire pre-push x && echo $$ > "$2.tmp" && mv "$2.tmp" "$2" && sleep 60' \
+        _ "$REPO_ROOT" "$AC_DIR/.ready") >/dev/null 2>&1 &
+    _gate_bg=$!
+    _i=0; while [ ! -f "$AC_DIR/.ready" ] && [ "$_i" -lt 100 ]; do sleep 0.05; _i=$((_i + 1)); done
+    _gate=$(cat "$AC_DIR/.ready" 2>/dev/null)
+    rm -f "$AC_DIR/.ready"
+    _head=$(git rev-parse HEAD)
+    "$WV" add "during a peer gate" >/dev/null 2>&1
+    _err=$(WV_CHECKPOINT_PULL=1 "$WV" sync 2>&1 >/dev/null || true)
+    _check "a gate in another worktree: the checkpoint still commits locally" \
+        "$(_yes test "$(git rev-parse HEAD)" != "$_head")"
+    _check "...but does not fetch (origin/main stays at the earlier upstream)" \
+        "$(_yes test "$(git rev-parse origin/main)" = "$_upstream")"
+    _check "...and says why" "$(_yes grep -q 'gate is running in another worktree' <<< "$_err")"
+    # Under set -e nothing here may fail silently (wv-f0dbde: the pre-push run
+    # of this suite exited 1 between the assertion above and the control
+    # below, printing nothing). Children first, so the holder's sleep is not
+    # orphaned still holding the gate lock's descriptor; each kill may find
+    # its target already gone; wait reaps the holder, which as this shell's
+    # own background child would otherwise stay a zombie that ps still lists.
+    [ -z "$_gate" ] || pkill -9 -P "$_gate" 2>/dev/null || true
+    kill -9 "$_gate_bg" 2>/dev/null || true
+    wait "$_gate_bg" 2>/dev/null || true
+    _add_ok=no
+    _add_err=$("$WV" add "after the peer gate" 2>&1 >/dev/null) && _add_ok=yes
+    _check "control setup: a graph write after the peer gate succeeds" "$_add_ok"
+    [ "$_add_ok" = yes ] || printf '      wv add said: %s\n' "$_add_err"
+    _err=$(WV_CHECKPOINT_PULL=1 "$WV" sync 2>&1 >/dev/null || true)
+    _check "control: once that gate is dead (its record left behind), the checkpoint fetches again" \
+        "$(_yes test "$(git rev-parse origin/main)" = "$_upstream2")"
+    git worktree remove --force "$_wt" >/dev/null 2>&1 || rm -rf "$_wt"
+
     echo "$_p $_r" > "$AC_DIR/.delta"
 )
 if [ -f "$AC_DIR/.delta" ]; then
@@ -3304,9 +3361,11 @@ SQLBREAK
     _lin_node=$(sqlite3 "$_lin_out/hz/brain.db" "SELECT id FROM nodes LIMIT 1;" 2>/dev/null)
     "${_LO[@]}" "$WV" update "$_lin_node" \
         --metadata '{"commit":"feedfacefeedfacefeedfacefeedfacefeedface"}' >/dev/null 2>&1
-    sha256sum "$_lin_out/.weave/state.sql" | cut -d' ' -f1 > "$_lin_out/.state_before_prune"
+    # A write publishes its delta, not state.sql (wv-8595fb).
+    find "$_lin_out/.weave/deltas" -name '*.sql' | sort > "$_lin_out/.deltas_before_prune"
     "${_LO[@]}" "$WV" commit-refs --prune > "$_lin_out/.prune_after" 2>&1 || true
-    sha256sum "$_lin_out/.weave/state.sql" | cut -d' ' -f1 > "$_lin_out/.state_after_prune"
+    find "$_lin_out/.weave/deltas" -name '*.sql' | sort | comm -13 "$_lin_out/.deltas_before_prune" - \
+        | while IFS= read -r _f; do grep -lF -- "$_lin_node" "$_f"; done > "$_lin_out/.prune_deltas"
 ) >/dev/null 2>&1 || true
 assert_equals "lineage_actor,lineage_seq/absent" \
     "$(cat "$_lin_out/.shape_before_status" 2>/dev/null || echo missing)" \
@@ -3322,8 +3381,8 @@ assert_equals "0" "$(cat "$_lin_out/.rc_after" 2>/dev/null || echo missing)" \
     "sync persists again once the migration has repaired the partial schema"
 assert_equals "1" "$(grep -c 'and persisted' "$_lin_out/.prune_after" 2>/dev/null || true)" \
     "commit-refs --prune persists again after the repair"
-assert_equals "1" "$([ "$(cat "$_lin_out/.state_before_prune" 2>/dev/null)" != "$(cat "$_lin_out/.state_after_prune" 2>/dev/null)" ] && echo 1 || echo 0)" \
-    "the repaired prune changes state.sql rather than only the hot database"
+assert_equals "1" "$([ -s "$_lin_out/.prune_deltas" ] && echo 1 || echo 0)" \
+    "the repaired prune publishes a delta rather than changing only the hot database"
 _lin_persisted=$(grep -c "lineage_actor" "$_lin_out/.weave/state.sql" 2>/dev/null || true)
 assert_equals "1" "$([ "${_lin_persisted:-0}" -ge 1 ] && echo 1 || echo 0)" \
     "the repaired schema reaches the git layer in state.sql"

@@ -129,6 +129,9 @@ weave_health --fast
 weave_index --chunk-size
 weave_index --model
 weave_index --overlap
+# --- gate plumbing: the test-map router the hooks call (wv-da768b) ---
+weave_impact --suites
+weave_impact --unmatched
 # --- EXPOSE tier 1: exposed 2026-06-12 (wv-4a1de6) — lines deleted ---
 # --- EXPOSE tier 2: exposed/reclassified 2026-06-12 (wv-8e217e) ---
 # weave_search.type, weave_code_search.filter, weave_impact.files exposed;

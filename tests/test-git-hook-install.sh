@@ -139,6 +139,50 @@ has "a non-executable Weave hook is a warning, not a pass" "installed but not ex
 git -C "$TMP/noexec" config core.hooksPath "$TMP/elsewhere"
 has "core.hooksPath is reported" "core.hooksPath=$TMP/elsewhere" "$(doctor_hooks "$TMP/noexec")"
 
+echo "=== merge drivers .gitattributes names are registered (wv-f0b143) ==="
+# Git builds in text, binary and union only. merge=ours, merge=theirs and
+# merge=wv-trails need merge.<name>.driver in each clone's config, which no
+# clone inherits; without it git merges the file as text without a word.
+doctor_merge() {  # doctor_merge <repo> -> the doctor's merge-driver row
+    (cd "$1" && WV_HOT_ZONE="$TMP/zone-$(basename "$1")" WV_DB="$TMP/zone-$(basename "$1")/brain.db" \
+        "$PROJECT_ROOT/scripts/wv" doctor 2>&1 | grep -E 'merge drivers' || true)
+}
+merge_repo() {  # merge_repo <dir> <attribute lines...>
+    local dir="$1"; shift
+    new_repo "$dir"
+    printf '%s\n' "$@" > "$dir/.gitattributes"
+    (cd "$dir" && WV_HOT_ZONE="$TMP/zone-$(basename "$dir")" WV_DB="$TMP/zone-$(basename "$dir")/brain.db" \
+        "$PROJECT_ROOT/scripts/wv" init >/dev/null 2>&1) || true
+}
+touch "$TMP/merge-trails.py"
+merge_repo "$TMP/drv-missing" '.weave/state.sql merge=ours -diff' '.weave/deltas/**/*.sql merge=theirs' \
+    '.weave/trails.md merge=wv-trails' '*.jsonl merge=union' '# x merge=commented'
+row=$(doctor_merge "$TMP/drv-missing")
+has "an unregistered driver is a warning naming each one" "names merge driver(s) with no git config driver: ours, theirs, wv-trails;" "$row"
+case "$row" in *union*|*commented*) bad "built-in and commented rules are not reported" "$row" ;; *) ok "built-in and commented rules are not reported" ;; esac
+has "the fix outside Weave's source checkout is init-repo" "Fix: wv init-repo --update" "$row"
+wv_register_merge_drivers "$TMP/drv-missing" "$TMP/merge-trails.py"
+has "registered drivers pass" "✓ merge drivers: every merge driver .gitattributes names is registered" "$(doctor_merge "$TMP/drv-missing")"
+check "registration sets the trails driver to the given script" "python3 '$TMP/merge-trails.py' %O %A %B" \
+    "$(git -C "$TMP/drv-missing" config --get merge.wv-trails.driver)"
+merge_repo "$TMP/drv-builtin" '*.jsonl merge=union' '*.bin merge=binary'
+has "built-in drivers alone pass" "every merge driver .gitattributes names is registered" "$(doctor_merge "$TMP/drv-builtin")"
+merge_repo "$TMP/drv-notrails" '.weave/trails.md merge=wv-trails'
+if wv_register_merge_drivers "$TMP/drv-notrails" "$TMP/absent.py"; then
+    bad "registration with no trails script reports failure"
+else
+    ok "registration with no trails script reports failure"
+fi
+check "and still registers ours and theirs" "true|cp %B %A" \
+    "$(git -C "$TMP/drv-notrails" config --get merge.ours.driver)|$(git -C "$TMP/drv-notrails" config --get merge.theirs.driver)"
+# Both setup paths register through the one definition: wv-init-repo for every
+# Weave repository and install.sh for its own source checkout, whose graph
+# only wv-init-repo used to cover.
+check "install.sh and the generated wv-init-repo each register through the library" 2 \
+    "$(grep -cE '^\s*(if )?wv_register_merge_drivers ' "$INSTALL")"
+check "no inline merge-driver git config is left in install.sh" 0 \
+    "$(grep -cE '^[[:space:]]*git (-C [^ ]+ )?config merge\.' "$INSTALL" || true)"
+
 echo ""
 echo "Results: $pass/$run passed"
 [ "$pass" -eq "$run" ]

@@ -45,7 +45,6 @@ HOOKS_NEEDING_COMMON=(
     ".claude/hooks/stop-check.sh"
     ".claude/hooks/pre-compact-context.sh"
     ".claude/hooks/wv-touched-files.sh"
-    ".claude/hooks/context-guard.sh"
 )
 
 HOOKS_NEEDING_RESOLVE_FALLBACK=(

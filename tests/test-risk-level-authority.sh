@@ -32,6 +32,24 @@ if grep -rqE 'risk_level"?: *"[^"]*critical' "$ROOT/.claude/skills" "$ROOT/templ
 else
     ok "no skill or template tells an agent to write risk_level critical"
 fi
+# wv-a1c40b: guidance cites the contract instead of restating its values, so
+# a contract change cannot leave a fifth, unpinned copy behind.
+_rl='(none|low|medium|high)'
+_list_pat="${_rl}(\|${_rl}){3}|${_rl}(, ${_rl}){3}"
+_list_hits=$(grep -rnE -- "$_list_pat" "$ROOT/.claude/skills" "$ROOT/templates/procedures" 2>/dev/null || true)
+if [ -n "$_list_hits" ]; then
+    bad "no procedure or skill restates the risk_level value list" "$(sed -n 1,3p <<< "$_list_hits")"
+else
+    ok "no procedure or skill restates the risk_level value list"
+fi
+_usage_out=$(cd "$TMP" && "$WV" add 2>&1 || true)
+usage_set=$(grep -oE -- '--risks=[a-z|]+' <<< "$_usage_out" | sed -n 1p | sed 's/--risks=//' | tr '|' '\n' | sort | paste -sd' ')
+[ "$usage_set" = "$contract" ] && ok "wv add usage names the contract's set" ||
+    bad "wv add usage names the contract's set" "usage=[$usage_set]"
+_help_out=$("$WV" add --help 2>&1 || true)
+help_set=$(grep -oE 'risk_level, one of: [a-z, ]+' <<< "$_help_out" | sed 's/risk_level, one of: //' | tr ',' '\n' | tr -d ' ' | grep . | sort | paste -sd' ')
+[ "$help_set" = "$contract" ] && ok "wv add --help names the contract's set" ||
+    bad "wv add --help names the contract's set" "help=[$help_set]"
 
 echo "=== every write path refuses a value outside it ==="
 R="$TMP/repo"; mkdir -p "$R" "$TMP/cfg"

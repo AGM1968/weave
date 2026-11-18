@@ -1,8 +1,9 @@
 ---
 id: session
 description:
-  "Session-context management — the 5-option framework, rewind habit, compact steering, session
-  phases, scope and token awareness. Use when a session grows long or context is tight."
+  "Session-context management — the 5-option framework, rewind habit, the retry limit of two,
+  compact steering, session phases, scope and token awareness. Use when a session grows long or
+  context is tight, or when the same approach has failed twice."
 fallback: "wv guide --procedure=session"
 adapters: [claude, codex, copilot]
 visibility: shared
@@ -17,13 +18,13 @@ under long context. Make a deliberate choice.
 
 ## The 5-Option Framework
 
-| Option | When to use | Action |
-| --- | --- | --- |
-| **Continue** | Current approach is working and context is fresh | Keep going. |
-| **Rewind** | Failed approach, tool error, wrong path, or dead end | Return to before the attempt. |
-| **Compact** | Context is growing but direction is clear | Compact with an explicit focus and drop list. |
-| **Clear** | Task is complete and the next task is unrelated | Save a trail, start fresh, reload the relevant context. |
-| **Subagent** | Work produces intermediate output the parent will not need | Delegate and retain only the conclusion. |
+| Option       | When to use                                                | Action                                                  |
+| ------------ | ---------------------------------------------------------- | ------------------------------------------------------- |
+| **Continue** | Current approach is working and context is fresh           | Keep going.                                             |
+| **Rewind**   | Failed approach, tool error, wrong path, or dead end       | Return to before the attempt.                           |
+| **Compact**  | Context is growing but direction is clear                  | Compact with an explicit focus and drop list.           |
+| **Clear**    | Task is complete and the next task is unrelated            | Save a trail, start fresh, reload the relevant context. |
+| **Subagent** | Work produces intermediate output the parent will not need | Delegate and retain only the conclusion.                |
 
 ## Rewind After a Failed Approach
 
@@ -35,11 +36,46 @@ architecture is discovered to be wrong after meaningful exploration.
 
 1. Before a risky attempt, save a trail: `wv trails save --message="About to try X; state is Y"`.
 2. After failure, use the host’s rewind/undo feature to return before the attempt.
-3. Capture the lesson when closing the node: `wv done <id> --learning="pitfall: X failed because Y"`.
+3. Capture the lesson when closing the node:
+   `wv done <id> --learning="pitfall: X failed because Y"`.
 4. Start the replacement approach with the restored context.
 
 If the host has no rewind feature, save a trail, clear the session, and reload the active node’s
 context pack instead.
+
+## Break a Retry Loop
+
+Two rules govern a failed attempt, on two separate axes. Rewinding (above) keeps the context clean
+after any failed attempt. The retry limit decides when the approach itself must change: after the
+second failure of the same approach, make no third attempt. Change strategy, or record a blocker
+node.
+
+Each of these counts as a failure of the same approach:
+
+- the same error, or the same command failing the same way, again;
+- another edit to the same file without knowing why the previous edit failed;
+- time spent past twice the estimate with no progress.
+
+At the limit:
+
+1. Record the attempts in a trail capsule (`wv guide --procedure=agent-memory`): each failed
+   approach in `discoveries` with what was tried, what happened and why it failed, and the chosen
+   path in `next`. The capsule is the one record of attempts; no other metadata field holds them.
+2. Question the problem: is it the right one, is context missing, is there a simpler approach?
+3. Name two or three fundamentally different strategies and pick the smallest experiment that tests
+   a key assumption with a clear works-or-fails signal.
+4. Take one path:
+
+| Path          | When                                  | Graph action                                                                  |
+| ------------- | ------------------------------------- | ----------------------------------------------------------------------------- |
+| Pivot         | A different strategy is ready         | Rewind, then start it                                                         |
+| Investigate   | Understanding is missing              | `wv add "investigate: ..." --parent=<id>`, then `wv block <id> --by=<new-id>` |
+| Split         | The problem is too big for one change | Child nodes with `--parent=<id>`                                              |
+| Need input    | Only the owner or another party knows | A blocker node, then `wv block <id> --by=<blocker-id>`                        |
+| Fresh context | The context is past recovering        | Append a capsule, `wv update <id> --status=todo`, then close the session      |
+
+When the node closes, the lesson goes in its learning:
+`wv done <id> --learning="pitfall: X failed twice because Y"`.
 
 ## Compact Steering
 
@@ -61,11 +97,11 @@ wv context <id> --json
 
 The enforcement layer has three phases:
 
-| Phase | Meaning |
-| --- | --- |
-| `discover` | Read and search are allowed; edit-class tools still require a claimed node. |
-| `execute` | An active node is required for substantive edits. `wv work <id>` enters this phase. |
-| `closing` | `wv done <id>` has closed the node and follow-up commit/sync work is permitted. |
+| Phase      | Meaning                                                                             |
+| ---------- | ----------------------------------------------------------------------------------- |
+| `discover` | Read and search are allowed; edit-class tools still require a claimed node.         |
+| `execute`  | An active node is required for substantive edits. `wv work <id>` enters this phase. |
+| `closing`  | `wv done <id>` has closed the node and follow-up commit/sync work is permitted.     |
 
 The phase is stored in the hot zone. A node inherited from a prior session must be explicitly
 re-claimed; stale-node checks prevent accidental continuation of abandoned work.
@@ -75,9 +111,8 @@ re-claimed; stale-node checks prevent accidental continuation of abandoned work.
 Sessions in one checkout share its hot zone, its git index and its working tree. Weave guards the
 graph: each session's claims, Primary node and commit trailers are its own, and `wv load` and
 another session's writes wait for each other. Nothing guards the working tree. Two sessions that
-each hold a claim there can overwrite each other's uncommitted edits, and Weave refuses that
-second claim. `wv work` names the other session's claim and prints the command for a linked
-worktree:
+each hold a claim there can overwrite each other's uncommitted edits, and Weave refuses that second
+claim. `wv work` names the other session's claim and prints the command for a linked worktree:
 
 ```bash
 git worktree add -b <branch> ../<repo>-<name> HEAD
@@ -92,8 +127,8 @@ hooks: upgrade Weave only when no session's commit or push gate is running.
 Keep a session to roughly 4–5 related tasks. Start fresh when work is independent, the context has
 been compacted repeatedly, or prior exploration is obscuring the current task.
 
-Use `wv bootstrap --json` once at session start and `wv status` for routine checks. To inspect actual
-tool-output cost, enable call logging and use:
+Use `wv bootstrap --json` once at session start and `wv status` for routine checks. To inspect
+actual tool-output cost, enable call logging and use:
 
 ```bash
 export WV_CALL_LOG=~/.local/share/weave/wv_calls.jsonl

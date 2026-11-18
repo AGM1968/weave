@@ -443,14 +443,18 @@ P_DB="$TEST_DIR/persist/hz/brain.db"
 sqlite3 "$P_DB" "UPDATE nodes SET metadata = json_set('{}', '\$.commit', '0123456789012345678901234567890123456789', '\$.commits', json_array('0123456789012345678901234567890123456789')) WHERE id='$P_NODE';"
 ( cd "$TEST_DIR/persist" && "${P_ENV[@]}" $WV sync ) >/dev/null 2>&1 || true
 
-P_BEFORE=$(md5sum "$TEST_DIR/persist/.weave/state.sql" 2>/dev/null | awk '{print $1}')
+# A write publishes its delta, not state.sql (wv-8595fb): the prune must leave
+# a new delta naming the node.
+p_deltas() { find "$TEST_DIR/persist/.weave/deltas" -name '*.sql' 2>/dev/null | sort; }
+p_names() { local f; while IFS= read -r f; do [ -n "$f" ] && grep -qF -- "$1" "$f" && return 0; done; return 1; }
+P_BEFORE=$(p_deltas)
 ( cd "$TEST_DIR/persist" && "${P_ENV[@]}" $WV commit-refs --prune ) >/dev/null 2>&1
-P_AFTER=$(md5sum "$TEST_DIR/persist/.weave/state.sql" 2>/dev/null | awk '{print $1}')
-if [ "$P_BEFORE" != "$P_AFTER" ]; then
-    echo -e "  ${GREEN}✓${NC} prune writes through to state.sql"
+P_NEW=$(comm -13 <(printf '%s\n' "$P_BEFORE") <(p_deltas))
+if [ -n "$P_NEW" ] && p_names "$P_NODE" <<< "$P_NEW"; then
+    echo -e "  ${GREEN}✓${NC} prune publishes a delta naming the node"
     TESTS_PASSED=$((TESTS_PASSED + 1))
 else
-    echo -e "  ${RED}✗${NC} prune left state.sql byte-identical — nothing was persisted"
+    echo -e "  ${RED}✗${NC} prune published no delta naming the node — nothing was persisted"
 fi
 TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -473,15 +477,15 @@ assert_equals "nothing_to_prune" "$(echo "$P_JSON" | jq -r '.prune.persisted')" 
 sqlite3 "$P_DB" "UPDATE nodes SET metadata = json_set('{}', '\$.commit', '0123456789012345678901234567890123456789', '\$.commits', json_array('0123456789012345678901234567890123456789')) WHERE id='$P_NODE';"
 ( cd "$TEST_DIR/persist" && "${P_ENV[@]}" $WV sync ) >/dev/null 2>&1 || true
 sqlite3 "$P_DB" "DROP TRIGGER IF EXISTS _warp_nodes_update; DROP TABLE IF EXISTS _warp_changes;"
-P_BEFORE=$(md5sum "$TEST_DIR/persist/.weave/state.sql" 2>/dev/null | awk '{print $1}')
+P_BEFORE=$(p_deltas)
 P_JSON=$( ( cd "$TEST_DIR/persist" && "${P_ENV[@]}" $WV commit-refs --prune --json ) 2>/dev/null)
-P_AFTER=$(md5sum "$TEST_DIR/persist/.weave/state.sql" 2>/dev/null | awk '{print $1}')
+P_NEW=$(comm -13 <(printf '%s\n' "$P_BEFORE") <(p_deltas))
 assert_equals "true" "$(echo "$P_JSON" | jq -r '.prune.persisted')" "prune with tracking dropped still persists"
-if [ "$P_BEFORE" != "$P_AFTER" ]; then
-    echo -e "  ${GREEN}✓${NC} state.sql really moved with tracking dropped"
+if [ -n "$P_NEW" ] && p_names "$P_NODE" <<< "$P_NEW"; then
+    echo -e "  ${GREEN}✓${NC} a delta really carries the prune with tracking dropped"
     TESTS_PASSED=$((TESTS_PASSED + 1))
 else
-    echo -e "  ${RED}✗${NC} claimed persistence with tracking dropped but state.sql is byte-identical"
+    echo -e "  ${RED}✗${NC} claimed persistence with tracking dropped but no delta names the node"
 fi
 TESTS_RUN=$((TESTS_RUN + 1))
 

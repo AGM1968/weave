@@ -19,6 +19,14 @@ when this process exits for any reason, a SIGKILL included. While waiting,
 WV_GATE_SLOT_STOP appearing means the pool has its verdict: exit 125 without
 launching. None of the three reaches the command, so a gate the command runs
 starts a budget of its own rather than waiting on this one.
+
+Elapsed time (wv-b17a85): when WV_GATE_ELAPSED names a file, the supervisor
+writes "<ms> monotonic" there once the command ends: the command's run time on
+the monotonic clock, which stops while the host is suspended, so a hibernation
+inside a suite or lane is not counted as its cost. The deadline uses the same
+clock. Like the slot settings, the variable never reaches the command. A report
+it cannot write is a warning, never a change to the command's status; the
+caller then has no monotonic reading and says so.
 """
 
 import argparse
@@ -268,11 +276,21 @@ def acquire_slot(
         time.sleep(SLOT_POLL_S)
 
 
-def run(label: str, bound: int, command: list[str]) -> int:
-    """Launch only after ownership is available; return after fully draining."""
-    slots = os.environ.pop("WV_GATE_SLOTS", "")
-    stamp = os.environ.pop("WV_GATE_SLOT_STAMP", "")
-    stop = os.environ.pop("WV_GATE_SLOT_STOP", "")
+def report_elapsed(path: str, start: float) -> None:
+    """Write the command's monotonic run time in ms for the caller's record."""
+    if not path:
+        return
+    target = Path(path)
+    tmp = target.with_name(target.name + ".tmp")
+    try:
+        tmp.write_text(f"{int((time.monotonic() - start) * 1000)} monotonic\n", encoding="utf-8")
+        tmp.replace(target)
+    except OSError as exc:
+        print(f"gate supervisor: report elapsed to {path}: {exc} (no monotonic reading)", file=sys.stderr)
+
+
+def ownership_ready() -> bool:
+    """Establish this platform's process ownership before launch, or say why not."""
     if sys.platform == "linux":
         libc = ctypes.CDLL(None, use_errno=True)
         if libc.prctl(36, 1, 0, 0, 0) != 0:  # PR_SET_CHILD_SUBREAPER
@@ -280,15 +298,26 @@ def run(label: str, bound: int, command: list[str]) -> int:
                 f"gate supervisor: enable subreaper (errno {ctypes.get_errno()}, status 2)",
                 file=sys.stderr,
             )
-            return 2
+            return False
         children()  # Refuse before launch if procfs ownership is unavailable.
-    elif sys.platform == "darwin":
+        return True
+    if sys.platform == "darwin":
         process_table()  # Validate the portable snapshot before launching.
-    else:
-        print(
-            f"gate supervisor: unsupported platform {sys.platform} (status 2); refusing before launch",
-            file=sys.stderr,
-        )
+        return True
+    print(
+        f"gate supervisor: unsupported platform {sys.platform} (status 2); refusing before launch",
+        file=sys.stderr,
+    )
+    return False
+
+
+def run(label: str, bound: int, command: list[str]) -> int:
+    """Launch only after ownership is available; return after fully draining."""
+    slots = os.environ.pop("WV_GATE_SLOTS", "")
+    stamp = os.environ.pop("WV_GATE_SLOT_STAMP", "")
+    stop = os.environ.pop("WV_GATE_SLOT_STOP", "")
+    elapsed_path = os.environ.pop("WV_GATE_ELAPSED", "")
+    if not ownership_ready():
         return 2
     cancelled = 0
 
@@ -321,7 +350,10 @@ def run(label: str, bound: int, command: list[str]) -> int:
             )
         os._exit(127)
     if sys.platform == "darwin":
-        return watch_group(root, label, bound, lambda: cancelled)
+        try:
+            return watch_group(root, label, bound, lambda: cancelled)
+        finally:
+            report_elapsed(elapsed_path, start)
     try:
         while True:
             _, status = reap(root)
@@ -335,6 +367,8 @@ def run(label: str, bound: int, command: list[str]) -> int:
                 return 124
             time.sleep(0.05)
     finally:
+        # Measured when the command ends, before draining what it left behind.
+        report_elapsed(elapsed_path, start)
         drain(root)
 
 

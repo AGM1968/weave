@@ -12,6 +12,7 @@ mkdir -p "$CONFIG/procedures" "$CONFIG/lib" "$REPO"
 cp "$ROOT/scripts/project-procedures.sh" "$CONFIG/project-procedures.sh"
 cp "$ROOT/scripts/gen-procedures.sh" "$CONFIG/gen-procedures.sh"
 cp "$ROOT/scripts/lib/wv-repository-class.sh" "$CONFIG/lib/wv-repository-class.sh"
+cp "$ROOT/scripts/lib/wv-skill-retirement.sh" "$CONFIG/lib/wv-skill-retirement.sh"
 chmod +x "$CONFIG/project-procedures.sh" "$CONFIG/gen-procedures.sh"
 
 write_procedure() {

@@ -43,19 +43,25 @@ print((last_prompt or last_user)[:120])
 PYEOF
 }
 
-# _ss_summary_line <status_line> -- the compact one-liner context-guard.sh used
-# to print: counts, the context load policy (wv context-policy, wv-f757a4) and
-# the primary node.
+# _ss_summary_line -- the compact one-liner context-guard.sh used to print:
+# counts, the context load policy (wv context-policy, wv-f757a4) and the primary
+# node. Counts and the primary node come from wv status --json, never from its
+# text (wv-a84f42): a scrape that misses prints an empty graph, not an error. A
+# status that cannot be read says so. A second line carries the policy's
+# directives as context-policy states them (wv-eb061d).
 _ss_summary_line() {
-    local status_line="$1" policy="unknown" active ready blocked current
-    policy=$("$WV" context-policy --json 2>/dev/null | jq -r '.policy // "unknown"' 2>/dev/null) || policy="unknown"
+    local policy="unknown" policy_json directives status_json work
+    policy_json=$("$WV" context-policy --json 2>/dev/null) || policy_json=""
+    policy=$(jq -r '.policy // "unknown"' <<< "$policy_json" 2>/dev/null) || policy="unknown"
     [ -n "$policy" ] || policy="unknown"
-    active=$(printf '%s' "$status_line" | grep -oP '\d+(?= active)' || echo "0")
-    ready=$(printf '%s' "$status_line" | grep -oP '\d+(?= ready)' || echo "0")
-    blocked=$(printf '%s' "$status_line" | grep -oP '\d+(?= blocked)' || echo "0")
-    current=$(printf '%s' "$status_line" | grep -oP '(?<=Primary: )wv-[a-f0-9]+' || echo "none")
-    printf 'Weave: %s active, %s ready, %s blocked | policy=%s | current=%s\n' \
-        "${active:-0}" "${ready:-0}" "${blocked:-0}" "$policy" "${current:-none}"
+    directives=$(jq -r '(.directives.text // []) | join(" ")' <<< "$policy_json" 2>/dev/null) || directives=""
+    status_json=$("$WV" status --json 2>/dev/null) || status_json=""
+    work=$(jq -er --arg policy "$policy" \
+        '"\(.active) active, \(.ready) ready, \(.blocked) blocked | policy=\($policy) | current=\(.current.id // "none")"' \
+        <<< "$status_json" 2>/dev/null) \
+        || work="status unavailable (wv status --json failed) | policy=${policy} | current=unknown"
+    printf 'Weave: %s\n' "$work"
+    [ -z "$directives" ] || printf 'Context policy %s: %s\n' "$policy" "$directives"
 }
 
 # _ss_stamp_begin -- the SessionStart completion stamp (wv-ca3ffe), when
@@ -64,6 +70,57 @@ _ss_summary_line() {
 _ss_stamp_begin() {
     declare -F wv_hook_run_begin >/dev/null || return 0
     wv_hook_run_begin SessionStart
+}
+
+# _ss_own_file <hot_zone> <name> -- this session's session-scoped file
+# (wv_session_file), or the flat name when the runtime helper is absent.
+_ss_own_file() {
+    if declare -F wv_session_file >/dev/null; then
+        wv_session_file "$1" "$2"
+    else
+        printf '%s/.session_%s\n' "$1" "$2"
+    fi
+}
+
+# _ss_previous_session <hot_zone> <project_dir> <own_sentinel> -- collect how
+# the previous session ended (wv-4efe06), per session (wv-9a867a). Sets
+# _SS_HAD_SENTINEL, _SS_SENTINEL_TS, _SS_HB, _SS_STOP_TS, _SS_STOP_OUTCOME and
+# _SS_LIVE_PEER. A sentinel is a session that has not run SessionEnd. This
+# session's own is its previous run (a resume after a crash). Another
+# session's, while a harness process is working in this checkout, may belong to
+# that live peer: it is reported as a peer and none of its files are touched.
+# With no live peer, other sessions' sentinels are ended sessions: the newest
+# is labelled, and all of their files are removed.
+_ss_previous_session() {
+    local hz="$1" project="$2" own="$3" s m newest="" newest_m=-1 suffix
+    local -a ended=()
+    _SS_HAD_SENTINEL=false _SS_SENTINEL_TS="unknown" _SS_HB=0 _SS_STOP_TS=0 _SS_STOP_OUTCOME="" _SS_LIVE_PEER=""
+    if declare -F _wv_concurrent_session >/dev/null; then
+        _SS_LIVE_PEER=$(_wv_concurrent_session "$project" 2>/dev/null) || _SS_LIVE_PEER=""
+    fi
+    for s in "$hz"/.session_sentinel "$hz"/.session_sentinel.*; do
+        [ -f "$s" ] || continue
+        if [ "$s" != "$own" ]; then
+            [ -z "$_SS_LIVE_PEER" ] || continue
+            ended+=("$s")
+        fi
+        m=$(stat -c %Y "$s" 2>/dev/null || stat -f %m "$s" 2>/dev/null || echo 0)
+        if [ "$m" -ge "$newest_m" ]; then newest="$s"; newest_m="$m"; fi
+    done
+    if [ -n "$newest" ]; then
+        suffix="${newest#"$hz"/.session_sentinel}"
+        _SS_HAD_SENTINEL=true
+        _SS_SENTINEL_TS=$(jq -r '.ts // "unknown"' "$newest" 2>/dev/null || echo "unknown")
+        _SS_HB=$(cat "$hz/.session_heartbeat$suffix" 2>/dev/null || echo 0)
+        read -r _SS_STOP_TS _SS_STOP_OUTCOME < "$hz/.session_laststop$suffix" 2>/dev/null || true
+        [[ "$_SS_HB" =~ ^[0-9]+$ ]] || _SS_HB=0
+        [[ "${_SS_STOP_TS:-}" =~ ^[0-9]+$ ]] || _SS_STOP_TS=0
+    fi
+    for s in ${ended[@]+"${ended[@]}"}; do
+        suffix="${s#"$hz"/.session_sentinel}"
+        rm -f "$s" "$hz/.session_heartbeat$suffix" "$hz/.session_laststop$suffix" 2>/dev/null || true
+    done
+    rm -f "$(_ss_own_file "$hz" heartbeat)" "$(_ss_own_file "$hz" laststop)" 2>/dev/null || true
 }
 
 # _ss_unfinished_hooks_note <hot_zone> -- one line, newline-terminated, when
@@ -183,7 +240,8 @@ wv_session_start_context() {
     local payload="${1:-}"
     local project_dir="${WV_PROJECT_DIR:-$_HC_PROJECT_DIR}"
     local repo_hash="${_HC_REPO_HASH}" hot_zone="${_HC_HOT_ZONE}"
-    local sentinel="${hot_zone}/.session_sentinel"
+    local sentinel
+    sentinel=$(_ss_own_file "$hot_zone" sentinel)
 
     # ── Clear stale bash-dedup locks from the previous session ──
     # bash-dedup.sh uses the same repo hash to locate lock files. Any lock still
@@ -221,15 +279,9 @@ wv_session_start_context() {
     local crash_warning="" had_sentinel=false
     local hb=0 stop_ts=0 stop_outcome="" sentinel_ts="unknown"
     _ss_stamp_begin
-    if [ -f "$sentinel" ]; then
-        had_sentinel=true
-        sentinel_ts=$(jq -r '.ts // "unknown"' "$sentinel" 2>/dev/null || echo "unknown")
-        hb=$(cat "${hot_zone}/.session_heartbeat" 2>/dev/null || echo 0)
-        read -r stop_ts stop_outcome < "${hot_zone}/.session_laststop" 2>/dev/null || true
-        [[ "$hb" =~ ^[0-9]+$ ]] || hb=0
-        [[ "${stop_ts:-}" =~ ^[0-9]+$ ]] || stop_ts=0
-    fi
-    rm -f "${hot_zone}/.session_heartbeat" "${hot_zone}/.session_laststop" 2>/dev/null || true
+    _ss_previous_session "$hot_zone" "$project_dir" "$sentinel"
+    had_sentinel="$_SS_HAD_SENTINEL" sentinel_ts="$_SS_SENTINEL_TS"
+    hb="$_SS_HB" stop_ts="$_SS_STOP_TS" stop_outcome="$_SS_STOP_OUTCOME"
 
     # ── Write minimal sentinel BEFORE wv load (crash-during-load detectable) ──
     # A hot zone in a base another user could control is refused (wv-80be32):
@@ -239,7 +291,7 @@ wv_session_start_context() {
         return 0
     fi
     # Session epoch for stale-node detection in pre-action.sh
-    date +%s > "${hot_zone}/.session_epoch" 2>/dev/null || true
+    date +%s > "$(_ss_own_file "$hot_zone" epoch)" 2>/dev/null || true
     wv_set_phase "discover" "$hot_zone" 2>/dev/null || true
     jq -n \
         --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
@@ -252,7 +304,10 @@ wv_session_start_context() {
     # after a short wait rather than holding session start behind, say, a
     # minutes-long wv sync --gh. Exit 75 is that skip.
     local load_note="" load_rc=0
-    WV_ZONE_LOCK_TIMEOUT="${WV_SESSION_START_LOAD_WAIT:-5}" "$WV" load >/dev/null 2>&1 || load_rc=$?
+    # --if-changed: a hot zone whose load receipt matches .weave/ already holds
+    # this graph, and the full rebuild (25 s of a 34 s start here) is skipped
+    # (wv-4dc121). A pull, another zone's sync or an unsynced write loads in full.
+    WV_ZONE_LOCK_TIMEOUT="${WV_SESSION_START_LOAD_WAIT:-5}" "$WV" load --if-changed >/dev/null 2>&1 || load_rc=$?
     [ "$load_rc" -ne 75 ] \
         || load_note="wv load skipped at session start: another wv process is writing this hot zone, so the live graph is current. Two sessions share this checkout; a second session belongs in a linked worktree (git worktree add)."
 
@@ -325,6 +380,11 @@ wv_session_start_context() {
         else
             crash_warning="Note: previous session stopped cleanly at ${alive} and ended without SessionEnd. No active work to recover."
         fi
+    fi
+    # A live peer is not a crashed session (wv-9a867a): say so in place of a
+    # crash label, and leave its active nodes to it.
+    if [ -n "$_SS_LIVE_PEER" ]; then
+        crash_warning="${crash_warning:+$crash_warning }Note: another session is live in this checkout: ${_SS_LIVE_PEER}. Its session state was left alone; active nodes it holds are its own work, not a crash. A second session needs its own worktree."
     fi
     jq -n \
         --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
@@ -427,7 +487,7 @@ Trail from ${age_hours}h ago — run 'wv trails show' to review"
 
     # The compact line context-guard.sh printed as its own SessionStart hook:
     # first, so a host that truncates long context still shows it.
-    context="$(_ss_summary_line "$status")
+    context="$(_ss_summary_line)
 ${context}"
 
     printf '%s\n' "$context"

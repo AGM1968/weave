@@ -4,36 +4,125 @@ description:
   "Decompose an epic into features and tasks with proper parent edges and blocking order. Use when
   starting a new epic that needs a task breakdown before work can begin."
 fallback: "wv guide --procedure=epic-decompose"
-adapters: [codex, copilot]
+adapters: [claude, codex, copilot]
 visibility: shared
+claude_skill: wv-decompose-work
 ---
 
 # Epic Decomposition
 
-Epics with no child edges produce a **flat graph** — `wv context`, `wv path`, and commit aggregation
-all break silently. Always link sub-tasks at creation time:
+An epic is broken into features, and each feature into tasks, as linked graph nodes with a blocking
+order, before any of its work is claimed. Epics with no child edges produce a **flat graph**:
+`wv context`, `wv path` and commit aggregation all break silently.
+
+## 1. Understand the epic
+
+Settle these with the owner before creating nodes, and ask when any is unclear:
+
+- the end goal, and the success criteria that say it is done;
+- who uses the result;
+- constraints (technical, time, resources) and dependencies on other systems or work.
+
+## 2. Check what already exists
+
+Do not create nodes for work that is already done or already tracked:
+
+```bash
+wv search "<epic topic>"                      # existing nodes, decisions, findings
+wv search --code "<concept>"                  # implementation already in the source
+git log --oneline -20 -- <expected paths>     # recent commits in the area
+```
+
+Report what was found before going further. When significant existing work turns up, name the files,
+commits or nodes and ask whether to break down the full epic or only what is missing; leave
+pre-solved items out of the breakdown.
+
+## 3. Identify features, then tasks
+
+- **Features**: three to seven per epic. Each is one cohesive capability, as independent of the
+  others as it can be, worth days to weeks of work (`--kind=feature`).
+- **Tasks**: three to ten per feature. Each is atomic, completable in hours, and has checkable
+  acceptance criteria (`--kind=task`).
+- Too broad for a feature ("build all user features") is an epic; too narrow ("add one button") is a
+  task. Too broad for a task ("build the entire auth system") is a feature; trivial or temporary
+  work ("add a debug print") gets no node.
+
+## 4. Create the nodes
 
 ```bash
 # 1. Create the epic
-EPIC=$(wv add "Epic: big feature" --kind=epic --metadata='{"priority":1}')
+EPIC=$(wv add "Epic: big feature" --kind=epic --metadata='{"priority":1}') || exit 1
 
-# 2. Create features linked to the epic — --parent creates the implements edge
-FEAT=$(wv add "Feature: sub-capability" --kind=feature --parent=$EPIC)
+# 2. Create features linked to the epic: --parent creates the implements edge
+FEAT=$(wv add "Feature: sub-capability" --kind=feature --metadata='{"priority":1}' \
+  --parent="$EPIC") || exit 1
 
-# 3. Create tasks linked to their feature — set criteria at creation time
-TASK=$(wv add "task(S1): specific work" --parent=$FEAT \
-  --criteria="criterion 1|criterion 2|make check passes" --risks=low)
-
-# 4. Set blocking order (epic unblocked only when features done)
-wv block $EPIC --by=$FEAT
-wv block $FEAT --by=$TASK
+# 3. Create tasks linked to their feature: set criteria and risks at creation time
+TASK=$(wv add "task(S1): specific work" --parent="$FEAT" --metadata='{"priority":1}' \
+  --criteria="criterion 1|criterion 2|make check passes" --risks=low) || exit 1
 ```
 
 **Rules:**
 
-- `--parent=` is **mandatory** for every feature and task — never optional
-- `--criteria=` and `--risks=` at creation time makes nodes claim-ready immediately (hook silent
-  pass)
-- Use the proposal's sprint labels verbatim in node text — drift causes audit mismatches
-- Use `/wv-decompose-work` skill for structured breakdowns
-- Run `/weave-audit` — reports epics with no children and deducts score
+- `--parent=` is **mandatory** for every feature and task, never optional.
+- `--criteria=` and `--risks=` at creation time make nodes claim-ready immediately (the pre-claim
+  hook passes silently). Set them on every node before claiming any.
+- A task that removes, renames or retires a named entity (a skill, a command, a procedure) declares
+  it at creation: `--metadata='{"retires":"skill:<name>"}'` (an array for several). Claiming it
+  lists every word-bounded reference to the bare name in `tests/`, `install.sh`, `templates/` and
+  `scripts/`; review each hit before the first edit.
+- Use the proposal's sprint labels verbatim in node text; drift causes audit mismatches.
+- `wv add` prints the new id on success. A node without `--parent` (the epic) goes through the
+  duplicate check, which refuses with exit 1 and prints the similar node on stderr; stop on a
+  nonzero exit rather than carrying an empty id forward.
+
+## 5. Set the blocking order
+
+```bash
+wv block "$EPIC" --by="$FEAT"     # the epic closes only after its features
+wv block "$FEAT" --by="$TASK"     # a feature closes only after its tasks
+wv block "$TASK2" --by="$TASK1"   # a task that needs another's result
+```
+
+| Pattern           | Edges                                                         |
+| ----------------- | ------------------------------------------------------------- |
+| Sequential tasks  | `wv block T3 --by=T2`, `wv block T2 --by=T1`                  |
+| Parallel tasks    | only `wv block FEAT --by=Tn` for each; no edges between tasks |
+| Shared foundation | one task blocks every feature that needs it                   |
+| Feature ordering  | `wv block F3 --by=F2`, `wv block F2 --by=F1`                  |
+
+Ordering the owner agrees to becomes a `wv block` edge, never prose in a node or a report.
+
+## 6. Priorities
+
+`metadata.priority` runs 1 to 5:
+
+| Priority | Meaning                                                          |
+| -------- | ---------------------------------------------------------------- |
+| 1        | critical: blocks many tasks, core function, required for release |
+| 2        | high: important, blocks some tasks                               |
+| 3        | medium: useful, few dependencies                                 |
+| 4        | low: enhancement, nothing waits on it                            |
+| 5        | nice to have: polish, can be deferred                            |
+
+## 7. Check and report
+
+```bash
+wv tree "$EPIC"                   # the epic, its features and their tasks
+wv path "$TASK" --format=chain    # one task's chain back up to the epic
+wv ready                          # at least one task is unblocked
+```
+
+Verify that the epic has success criteria, features are cohesive, tasks are atomic with criteria,
+priorities are rational, and the dependencies make sense with no cycles. Then report the breakdown:
+the epic id and success criteria, each feature with its id, priority and tasks, the dependency tree,
+and the ready work queue in priority order.
+
+## Next steps
+
+1. Review the breakdown with the owner when it needs agreement.
+2. Find the first task: `wv ready`.
+3. Claim and start work: `wv work wv-XXXXXX`.
+4. Work each task through the Work Loop in `wv guide`: intake, context, execute, close.
+5. An epic that `wv tree` shows with no children is a flat graph: link its work with `--parent`
+   before claiming any of it.

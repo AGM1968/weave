@@ -1576,6 +1576,39 @@
       ]
     },
     {
+      "rule_id": "edit_guard_judged_in_time",
+      "summary": "An edit the guard could not judge, its wv calls past the wait budget or its Context Pack unmade, is refused rather than admitted by the host's timeout.",
+      "basis": "invariant",
+      "decisions": [
+        "deny"
+      ],
+      "applies_to": [
+        {
+          "kind": "host_event",
+          "event": "PreToolUse",
+          "tool_class": "edit"
+        }
+      ],
+      "bypass": [
+        {
+          "kind": "state",
+          "how": "retry once the load, sync, migration or gate holding the graph finishes"
+        }
+      ],
+      "sites": [
+        {
+          "owner": "host_hook",
+          "path": "scripts/lib/wv-hook-common.sh",
+          "function": "_hc_wv_refuse_late"
+        },
+        {
+          "owner": "host_hook",
+          "path": "scripts/lib/wv-hook-common.sh",
+          "function": "_hc_check_context_pack"
+        }
+      ]
+    },
+    {
       "rule_id": "claim_requires_done_criteria",
       "summary": "A node may not be claimed until it carries done criteria.",
       "basis": "invariant",
@@ -2088,7 +2121,7 @@
         {
           "owner": "git_hook",
           "path": "scripts/hooks/pre-commit-weave.sh",
-          "anchor": "python3 -E \"$_PC_SCRIPTS/prose-gate.py\""
+          "anchor": "python3 -E \"$_pc_prose_py\""
         },
         {
           "owner": "git_hook",
@@ -2216,12 +2249,52 @@
         {
           "owner": "git_hook",
           "path": "scripts/hooks/pre-commit-weave.sh",
+          "anchor": "prose-gate.conf in the frozen $_pc_side is not a regular file"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-commit-weave.sh",
+          "anchor": "could not read .weave/prose-gate.conf from the frozen"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-commit-weave.sh",
+          "anchor": "this repository opts in with .weave/prose-gate.conf"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-commit-weave.sh",
           "anchor": "prose gate: could not create a temp directory"
         },
         {
           "owner": "git_hook",
           "path": "scripts/hooks/pre-commit-weave.sh",
           "anchor": "prose gate: could not materialise the staged index"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-commit-weave.sh",
+          "anchor": "rule contract: wv is not on PATH"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-commit-weave.sh",
+          "anchor": "rule contract: could not create a temp directory"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-commit-weave.sh",
+          "anchor": "rule contract: could not materialise the staged rule file(s)"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-commit-weave.sh",
+          "anchor": "rule contract: 'wv quality patterns validate' gave no readable verdict"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-commit-weave.sh",
+          "anchor": "rule contract: STAGED pattern rule file(s) break the rule contract"
         },
         {
           "owner": "git_hook",
@@ -2585,7 +2658,7 @@
     },
     {
       "category": "expected_conflict",
-      "summary": "Another Weave gate holds this checkout (wv-c5500d): the pre-commit or pre-push gate refuses to start beside it, naming the holder. One gate at a time per checkout is a conflict over shared git state and scratch, not a judgement of the content.",
+      "summary": "Another Weave gate holds this checkout (wv-c5500d): the pre-commit or pre-push gate refuses to start beside it, naming the holder. One gate at a time per checkout is a conflict over shared git state and scratch, not a judgement of the content. A push also refuses while a live gate runs in another worktree of the same repository (wv-33cf11), whose push it could publish beneath.",
       "sites": [
         {
           "owner": "git_hook",
@@ -2594,8 +2667,24 @@
         },
         {
           "owner": "git_hook",
+          "path": "scripts/hooks/pre-push-weave.sh",
+          "anchor": "is running in another worktree of this repository (pid"
+        },
+        {
+          "owner": "git_hook",
           "path": "scripts/hooks/pre-commit-weave.sh",
           "anchor": "wv_gate_hold_acquire pre-commit \"commit on"
+        }
+      ]
+    },
+    {
+      "category": "content_verification",
+      "summary": "The pre-push gate refuses a push whose committed .weave/state.sql lacks Delta v2 operations committed with it, or cannot be checked against them (wv-65cd02). The graph's Git verdict decides (wv status, projection_lags_operations or projection_unverifiable); the hook asks and refuses with its hint.",
+      "sites": [
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-push-weave.sh",
+          "anchor": "is not pushed ($_pp_proj_reason):"
         }
       ]
     }

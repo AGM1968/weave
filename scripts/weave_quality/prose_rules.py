@@ -2173,6 +2173,27 @@ def _verbatim_container_transition(
     return container, prior_quote_depth, resets_span, False
 
 
+# A trail completion record header, the shape scripts/merge-trails.py's
+# COMPLETION regex defines: `## <date> <time> — Completed <id> (<alias>)`.
+# The trail is append-only, so a header names the alias a node had when it
+# closed; that alias is an identifier, and a later rename cannot reach the
+# history (owner ruling on wv-56ef11). Only the full header shape is exempt,
+# never the record body under it.
+_TRAIL_COMPLETION_HEADER = re.compile(
+    r"^## \d{4}-\d{2}-\d{2} \d{2}:\d{2} (?:—|--) Completed wv-[0-9a-f]{6}"
+    r"(?: \([a-z0-9][a-z0-9-]*\))?\s*$"
+)
+
+
+def _trail_completion_header_lines(source_lines: Sequence[str]) -> set[int]:
+    """Return 1-indexed lines that are trail completion record headers."""
+    return {
+        lineno
+        for lineno, line in enumerate(source_lines, start=1)
+        if _TRAIL_COMPLETION_HEADER.match(line)
+    }
+
+
 def _verbatim_exempt_lines(source_lines: Sequence[str]) -> set[int]:
     """Return 1-indexed lines an author has explicitly opted out of every rule.
 
@@ -2485,7 +2506,9 @@ def _scan_lines_raw(source_lines: list[str], rule: dict[str, object]) -> list[_S
     _list_ctx_owns_line) instead of leaving it active indefinitely.
     """
     rule_id = str(rule.get("id", ""))
-    verbatim_exempt = _verbatim_exempt_lines(source_lines)
+    verbatim_exempt = _verbatim_exempt_lines(source_lines) | _trail_completion_header_lines(
+        source_lines
+    )
     out: list[_ScanLine] = []
     fence_state = _FenceState()
     html_state = _HtmlBlockState()
@@ -3181,7 +3204,9 @@ def _scan_lines(text: str, rule: dict[str, object]) -> list[_ScanLine]:
         paragraph_rule = {**rule, "match_scope": "paragraph"}
         return _scan_heading_lines(source_lines, _scan_lines(text, paragraph_rule))
 
-    verbatim_exempt = _verbatim_exempt_lines(source_lines)
+    verbatim_exempt = _verbatim_exempt_lines(source_lines) | _trail_completion_header_lines(
+        source_lines
+    )
     out: list[_ScanLine] = []
     paragraph: list[tuple[int, str, int]] = []
     container = ""

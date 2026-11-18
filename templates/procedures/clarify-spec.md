@@ -1,0 +1,90 @@
+---
+id: clarify-spec
+description:
+  "Clarifies vague requirements before implementation and turns unclear tasks into actionable
+  specifications. Use when acceptance criteria, scope, or constraints are ambiguous."
+fallback: "wv guide --procedure=clarify-spec"
+adapters: [claude, codex, copilot]
+visibility: shared
+status: ready
+claude_skill: wv-clarify-spec
+---
+
+# Clarify Spec
+
+Turn a vague request into a specification before any code is written. Work built on a guess about
+what the owner meant is work done twice. This is the Work Loop's intake step for a description too
+vague to act on.
+
+Clarify when any of these is uncertain:
+
+- Can the task be stated in one concrete sentence?
+- Is it known exactly what "done" looks like?
+- Would two implementers build it differently?
+- Is the plan about to assume the owner's intent?
+
+## Steps
+
+1. **Name the vague words.** "Better", "faster", "modern", "clean up" and "improve" each need a
+   metric or a concrete change.
+2. **Ask 5W+C** of the request:
+   - **What** happens: the specific behaviour as input, process, output, with edge cases.
+   - **Why** it is needed: the problem it solves, alternatives considered, the cost of not doing it.
+   - **Who** it serves: the role, their context and constraints.
+   - **When** it applies: always or under conditions; dependencies; timing.
+   - **Where** in the system: components touched, integration points, existing patterns to match.
+   - **Constraints**: performance, compatibility, technical limits, what is out of scope.
+3. **Answer from evidence first.** The node text, `wv context <id> --json`, related decisions and
+   the code answer many questions without asking anyone.
+4. **Write the specification** in the three parts every spec needs before a decision:
+   - **What it does**: the concrete change.
+   - **How we will know it works**: testable done criteria.
+   - **What it must not break**: the behaviour and contracts that stay unchanged.
+
+   A specification missing any of the three is not ready.
+
+5. **Record it on the node** (`--metadata` merges):
+
+   ```bash
+   wv update <id> --metadata='{
+     "done_criteria": ["search p95 under 1 s on the staging corpus", "no schema change"],
+     "spec": {
+       "what": "Cache /api/search results for 5 minutes",
+       "must_not_break": ["result ordering", "permission filtering"],
+       "clarified_from": "The API is too slow"
+     }
+   }'
+   ```
+
+6. **Escalate what evidence cannot settle.** When the intent is the owner's to decide, ask the owner
+   through the host's question mechanism with concrete options, and record the answer on the node
+   before implementing. Do not proceed on a guess.
+
+## Report shape
+
+```text
+Original: "The API is too slow"
+Clarified:
+  what: /api/search only; 5 s average today; target under 1 s p95
+  why: users abandon search
+  constraints: no database schema change this sprint
+Spec:
+  does: add a result cache in front of /api/search
+  known to work: p95 under 1 s on the staging corpus
+  must not break: ordering, permission filtering
+Ready: yes | no (question for the owner: ...)
+```
+
+When the owner must choose, offer options rather than an open question: "Which aspect needs
+modernising: color scheme, component style, layout and spacing, or typography?"
+
+## Rules
+
+- Never start coding from a vague requirement.
+- Never decide on the owner's behalf what "better" or "improve" means.
+- "You know what I mean" is not a specification.
+- Always record the clarification on the node; the next agent inherits it from there.
+- Always confirm the specification before writing code.
+
+Pairs with `wv guide --procedure=quality-gate` (done criteria before claim) and
+`wv guide --procedure=pre-mortem` (risks of the clarified change).

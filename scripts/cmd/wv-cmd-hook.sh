@@ -32,6 +32,21 @@ _hook_active_id() {
 
 _hook_input_paths() { _ptu_input_paths "$@"; }
 
+# _hook_patch_payload <input> -- the adapter side of one host shape (wv-c95723).
+# Copilot CLI reports its patch tool as tool_name Edit with tool_input the bare
+# patch document, where the guards read an object. A string tool_input that is a
+# patch document becomes the apply_patch observation they already judge
+# (tool_input.command, as Codex sends it), so its file headers meet the claim
+# and installed-copy guards. Keyed on the payload's shape, not the host. Any
+# other string is left for the guards to refuse as malformed.
+_hook_patch_payload() {
+    case "$1" in *'*** Begin Patch'*) ;; *) printf '%s' "$1"; return 0 ;; esac
+    printf '%s' "$1" | jq -c 'if type == "object" and (.tool_input | type) == "string"
+            and (.tool_input | test("^\\s*\\*\\*\\* Begin Patch"))
+        then .tool_name = "apply_patch" | .tool_input = {command: .tool_input}
+        else . end' 2>/dev/null || printf '%s' "$1"
+}
+
 # _hook_pre_tool_use <input> <format> — run the PreToolUse guards in
 # scripts/lib/wv-pre-tool-use.sh, the implementation Claude Code's hooks call
 # in-process, and report the first one that decides. Bash dedup runs last, so
@@ -55,7 +70,7 @@ _hook_pre_tool_use() {
         rc=$?
         set -e
         if [ "$rc" -eq 2 ] || printf '%s' "$out" \
-            | jq -e '.hookSpecificOutput.permissionDecision == "deny"' >/dev/null 2>&1; then
+            | jq -se 'length == 1 and (.[0] | .hookSpecificOutput.permissionDecision == "deny")' >/dev/null 2>&1; then
             decided="$guard"
             break
         fi
@@ -112,6 +127,26 @@ _hook_pre_tool_use() {
     _hook_decision_json allow PreToolUse "" "$active_id"
 }
 
+# _hook_event_phase <name> -- the one table from an event name to the
+# dispatcher handler that runs it (wv-b25ebb). The kinds of
+# contracts/hook-events-v1.schema.json are the neutral entry. The host names
+# Claude Code and Codex send are an adapter-side alias, accepted while host
+# hook files migrate. Every before_* kind shares the pre-tool handler and
+# every after_* kind the post-tool handler. The guards classify the payload
+# themselves, and a kind therefore names the phase, not the tool. recovery is the snapshot taken
+# before context compaction, which the next context recovers from.
+_hook_event_phase() {
+    case "$1" in
+        session_start|SessionStart) echo SessionStart ;;
+        before_read|before_edit|before_commit|before_close|PreToolUse) echo PreToolUse ;;
+        after_edit|after_commit|PostToolUse) echo PostToolUse ;;
+        session_stop|Stop) echo Stop ;;
+        session_end|SessionEnd) echo SessionEnd ;;
+        recovery|PreCompact) echo PreCompact ;;
+        *) return 1 ;;
+    esac
+}
+
 cmd_hook_dispatch() {
     local event="" input active_id format="json" vscode=false
     while [ $# -gt 0 ]; do
@@ -126,15 +161,19 @@ cmd_hook_dispatch() {
             # Stop decision and JSON (not plain text) for PreCompact.
             --format=json|--format=host|--format=vscode) format="${1#*=}" ;;
             --help|-h)
-                echo "Usage: wv hook dispatch --event=SessionStart|PreToolUse|PostToolUse|Stop|SessionEnd|PreCompact [--json] [--format=json|host|vscode]"
+                echo "Usage: wv hook dispatch --event=<kind> [--json] [--format=json|host|vscode]"
+                echo "Kinds (contracts/hook-events-v1.schema.json): session_start, before_read, before_edit,"
+                echo "  before_commit, before_close, after_edit, after_commit, session_stop, session_end, recovery"
+                echo "Host aliases: SessionStart, PreToolUse, PostToolUse, Stop, SessionEnd, PreCompact"
                 return 0 ;;
             *) echo "Error: unknown hook dispatch option '$1'" >&2; return 1 ;;
         esac
         shift
     done
-    case "$event" in SessionStart|PreToolUse|PostToolUse|Stop|SessionEnd|PreCompact) ;; *)
-        echo "Error: --event must be SessionStart, PreToolUse, PostToolUse, Stop, SessionEnd, or PreCompact" >&2; return 1 ;;
-    esac
+    if ! event=$(_hook_event_phase "$event"); then
+        echo "Error: --event must be a hook-events-v1 kind (session_start, before_read, before_edit, before_commit, before_close, after_edit, after_commit, session_stop, session_end, recovery) or a host alias (SessionStart, PreToolUse, PostToolUse, Stop, SessionEnd, PreCompact)" >&2
+        return 1
+    fi
     if [ "$format" = vscode ]; then
         vscode=true
         format=host
@@ -155,6 +194,7 @@ cmd_hook_dispatch() {
         raw_input_empty=true
         input='{}'
     fi
+    input=$(_hook_patch_payload "$input")
     wv_adopt_hook_session_id "$input"
     if [ "$event" = "PreToolUse" ]; then
         if [ "$raw_input_empty" = true ]; then
@@ -167,7 +207,7 @@ cmd_hook_dispatch() {
         _hook_pre_tool_use "$input" "$format" || ptu_rc=$?
         return "$ptu_rc"
     fi
-    if ! printf '%s' "$input" | jq -e 'type == "object"' >/dev/null 2>&1; then
+    if ! printf '%s' "$input" | jq -se 'length == 1 and (.[0] | type == "object")' >/dev/null 2>&1; then
         # Advisory and lifecycle events fail open on a malformed payload; the
         # mutation-gating event (PreToolUse) failed it closed above.
         _hook_decision_json hook_error "$event" "Invalid hook JSON; failing open"
@@ -185,7 +225,7 @@ cmd_hook_dispatch() {
                 # Manual invocation: stamp the epoch PreToolUse's stale-node check
                 # compares against and reset phase, nothing more -- no sentinel,
                 # no load, no commit.
-                date +%s > "${_HC_HOT_ZONE}/.session_epoch" 2>/dev/null || true
+                date +%s > "$(wv_session_file "$_HC_HOT_ZONE" epoch)" 2>/dev/null || true
                 wv_set_phase "discover" "${_HC_HOT_ZONE}" 2>/dev/null || true
             else
                 # A host session start: the one implementation every host runs
@@ -371,8 +411,8 @@ cmd_hook_normalize() {
         }
     fi
 
-    input=$(cat)
-    if ! printf '%s' "$input" | jq -e 'type == "object"' >/dev/null 2>&1; then
+    input=$(_hook_patch_payload "$(cat)")
+    if ! printf '%s' "$input" | jq -se 'length == 1 and (.[0] | type == "object")' >/dev/null 2>&1; then
         _hook_normalize_fail "$host" "$event" invalid_required_field "payload must be a JSON object"
         return 2
     fi
