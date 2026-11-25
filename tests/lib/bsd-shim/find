@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+: "${WV_BSD_SHIM_REAL:=${0%/*}/../real}"  # env -i drops the export; this stand-in sits in bin/ beside real/ (wv-43082a)
+# BSD find stand-in (wv-8ea297): no -printf/-fprintf, and -perm takes [-|+]mode,
+# never GNU's /mode. BSD find refuses them as macOS does, so a listing built on
+# them fails here instead of passing on Linux; with stderr discarded it read as
+# empty, and a load on macOS replayed no deltas.
+prev=""
+for a in "$@"; do
+    case "$a" in
+        -printf|-fprintf|-fprint|-fprint0)
+            echo "find: $a: unknown primary or operator" >&2; exit 1 ;;
+    esac
+    if [ "$prev" = -perm ] && [[ "$a" == /* ]]; then
+        echo "find: -perm: $a: illegal mode string" >&2; exit 1
+    fi
+    prev=$a
+done
+exec "$WV_BSD_SHIM_REAL/find" "$@"

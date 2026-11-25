@@ -204,6 +204,54 @@ check "one monotonic run replaces the unlabelled history as the estimate" "300 3
 "$WV" test-record tests/test-wallonly.sh --exit=0 --duration=9000000 --clock=wall >/dev/null 2>&1
 check "a suite timed only on the wall clock is unmeasured" "0 0 none" "$(est tests/test-wallonly.sh)"
 
+# ── every row names the tree it judged (wv-abc855) ──
+# A fix recommitted under the same file names must be told apart from a flaky
+# rerun of the same bytes, so rows carry the tree, not only HEAD and names.
+T1=$(printf '%040d' 1 | tr 0 a); T2=$(printf '%040d' 2 | tr 0 b)
+"$WV" test-record tests/test-tree.sh --exit=0 --duration=5 --tree="$T1" >/dev/null 2>&1
+check "a suite row carries the tree it judged" "$T1" "$(tail -1 "$SUITES" | jq -r '.tree')"
+"$WV" test-record tests/test-tree.sh --exit=0 --duration=5 --tree=HEAD >/dev/null 2>&1
+check "...a value that is not a full tree id is dropped, never guessed" "false" "$(tail -1 "$SUITES" | jq -r 'has("tree")')"
+WV_GATE_TREE="$T1" "$WV" test-record tests/test-tree.sh --exit=0 --duration=5 >/dev/null 2>&1
+check "...an inherited WV_GATE_TREE is not stamped on a suite's own record" "false" "$(tail -1 "$SUITES" | jq -r 'has("tree")')"
+"$WV" test-record gate --gate --phase=trees --gate-id=gt1 --exit=0 --duration=5 --tree="$T1" >/dev/null 2>&1
+check "a gate row carries the tree it judged" "gt1 $T1" "$(tail -1 "$GATES" | jq -r '"\(.gate_id) \(.tree)"')"
+"$WV" test-record gate --gate --phase=trees --gate-id=gt2 --exit=0 --duration=5 >/dev/null 2>&1
+check "...and none where the gate names none" "gt2 false" "$(tail -1 "$GATES" | jq -r '"\(.gate_id) \(has("tree"))"')"
+
+# The flake split: the same tree failing then passing is a flake; a failing
+# tree followed on the same commit base by a different, passing tree is a fix.
+# Rows without a tree stay out of it.
+rec() { "$WV" test-record "$1" --exit="$2" --duration=5 --commit="$3" ${4:+--tree="$4"} >/dev/null 2>&1; }
+rec tests/test-flake.sh 1 base1 "$T1"; rec tests/test-flake.sh 0 base1 "$T1"
+rec tests/test-fixed.sh 1 base2 "$T1"; rec tests/test-fixed.sh 0 base2 "$T2"
+rec tests/test-fixed.sh 1 base3; rec tests/test-fixed.sh 0 base3
+split() { "$WV" analyze suites --json 2>/dev/null | jq -r --arg s "$1" '.suites[] | select(.suite == $s) | "\(.tree_runs) \(.flaky_trees) \(.fixed_recommits)"'; }
+check "the same tree failing and passing counts as a flaky tree" "2 1 0" "$(split tests/test-flake.sh)"
+check "a different tree passing after a failure on the same base counts as a fix" "2 0 1" "$(split tests/test-fixed.sh)"
+
+# ── attempts until the first green gate (wv-c60fbf) ──
+# A series is the gates of one phase on one sha, closed by its first pass; the
+# tree splits extra attempts into same-tree retries and fix iterations, over
+# series whose every gate names a tree.
+CYC="$TMP/cycles.jsonl"
+cg() { WV_GATE_LOG="$CYC" "$WV" test-record gate --gate --phase=pre-commit --gate-id="$1" --commit="$2" \
+        --exit="$3" --duration="$4" ${5:+--tree="$5"} >/dev/null 2>&1; }
+cg a1 c1 1 100000 "$T1"; cg a2 c1 1 100000 "$T1"; cg a3 c1 0 50000 "$T2"  # retry, then a fix
+cg b1 c2 0 10000 "$T1"; cg b2 c2 1 10000 "$T2"                             # a pass closes; a later gate opens a new series
+cg d1 c3 1 10000                                                           # never green
+cg e1 c4 1 10000; cg e2 c4 0 10000 "$T1"                                   # one gate names no tree
+cyc=$("$WV" analyze gates --json --gate-log="$CYC" 2>/dev/null | jq -c '.cycles["pre-commit"]')
+check "series close at their first pass and the rest are unresolved" "5 3 2" \
+    "$(jq -r '"\(.series) \(.green) \(.unresolved)"' <<< "$cyc")"
+check "attempts and gate time to green over the green series" "2 2 3 20.0 250.0" \
+    "$(jq -r '"\(.multi_attempt) \(.attempts_p50) \(.attempts_p90) \(.gate_to_green_p50_s) \(.gate_to_green_p90_s)"' <<< "$cyc")"
+check "refused gates and their wall hours" "5 0.1" "$(jq -r '"\(.refused_gates) \(.refused_wall_h)"' <<< "$cyc")"
+check "the tree splits a series into same-tree retries and fix iterations, tree-bound series only" "2 1 1" \
+    "$(jq -r '"\(.tree_bound_series) \(.same_tree_retries) \(.fix_iterations)"' <<< "$cyc")"
+check "...and the text report shows the split" "1" \
+    "$(WV_MODE=full "$WV" analyze gates --gate-log="$CYC" 2>/dev/null | grep -c 'over 2 tree-bound series: 1 same-tree retries, 1 fix iterations')"
+
 # ── a test run without its own log never writes the user's durable history ──
 fakehome="$TMP/home"; mkdir -p "$fakehome"
 (

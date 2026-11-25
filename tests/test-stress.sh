@@ -23,6 +23,7 @@ export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls
 # ═══════════════════════════════════════════════════════════════════════════
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/lib/bounded.sh"  # timeout(1) is GNU-only; macOS has none (wv-f8e26d)
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 WV="$PROJECT_ROOT/scripts/wv"
 
@@ -250,7 +251,7 @@ get_id() {
     local id
     # The first such line: an add with --criteria prints a second
     # "✓ wv-xxxxxx: N done criteria stored" line (8081bbf46).
-    id=$(sed -nE 's/^✓ (wv-[a-f0-9]{6}): .*/\1/;T;p;q' <<< "$1")
+    id=$(sed -nE '/^✓ (wv-[a-f0-9]{6}): /{s/^✓ (wv-[a-f0-9]{6}): .*/\1/p;q;}' <<< "$1")
     if [ -z "$id" ]; then
         echo "get_id: wv add created no node:" >&2
         sed 's/^/    /' <<< "$1" >&2
@@ -344,7 +345,7 @@ test_jsonl_sql_consistency() {
     local sql_count jsonl_count
     # Count only INSERT INTO "nodes" (exact table name, not nodes_fts etc.)
     sql_count=$(grep -cE "^INSERT INTO \"?nodes\"? " "$TEST_DIR/.weave/state.sql" || echo "0")
-    jsonl_count=$(wc -l < "$TEST_DIR/.weave/nodes.jsonl")
+    jsonl_count=$(( $(wc -l < "$TEST_DIR/.weave/nodes.jsonl") ))  # BSD wc pads (wv-2dbe9e)
 
     assert_equals "$sql_count" "$jsonl_count" "state.sql and nodes.jsonl node counts match" || true
 
@@ -392,7 +393,7 @@ test_parallel_add() {
     fi
 
     # Check for duplicate IDs
-    unique=$("$WV" list --all --json 2>/dev/null | jq -r '.[].id' | sort -u | wc -l)
+    unique=$(( $("$WV" list --all --json 2>/dev/null | jq -r '.[].id' | sort -u | wc -l) ))
     assert_equals "$count" "$unique" "No duplicate IDs from parallel writes" || true
 
     # Check FTS5 integrity
@@ -523,7 +524,7 @@ test_scale_500_nodes() {
 
     # Benchmark search (should complete, not hang)
     local search_ok=true
-    timeout 30 "$WV" search "Feature" --json >/dev/null 2>&1 || search_ok=false
+    bounded 30 "$WV" search "Feature" --json >/dev/null 2>&1 || search_ok=false
     TESTS_RUN=$((TESTS_RUN + 1))
     if [ "$search_ok" = true ]; then
         echo -e "  ${GREEN}✓${NC} Search completes on 505-node graph"
@@ -536,7 +537,7 @@ test_scale_500_nodes() {
 
     # Benchmark health
     local health_ok=true
-    timeout 30 "$WV" health >/dev/null 2>&1 || health_ok=false
+    bounded 30 "$WV" health >/dev/null 2>&1 || health_ok=false
     TESTS_RUN=$((TESTS_RUN + 1))
     if [ "$health_ok" = true ]; then
         echo -e "  ${GREEN}✓${NC} Health check completes on 505-node graph"
@@ -640,7 +641,7 @@ test_large_metadata() {
 
     # Verify storage
     local retrieved_len
-    retrieved_len=$("$WV" show "$id" --json 2>/dev/null | jq -r '.metadata | fromjson | .learning' | wc -c)
+    retrieved_len=$(( $("$WV" show "$id" --json 2>/dev/null | jq -r '.metadata | fromjson | .learning' | wc -c) ))
     # wc -c counts bytes including trailing newline
     TESTS_RUN=$((TESTS_RUN + 1))
     if [ "$retrieved_len" -ge 50000 ]; then
@@ -658,7 +659,7 @@ test_large_metadata() {
     "$WV" load >/dev/null 2>&1
 
     local after_len
-    after_len=$("$WV" show "$id" --json 2>/dev/null | jq -r '.metadata | fromjson | .learning' | wc -c)
+    after_len=$(( $("$WV" show "$id" --json 2>/dev/null | jq -r '.metadata | fromjson | .learning' | wc -c) ))
     TESTS_RUN=$((TESTS_RUN + 1))
     if [ "$after_len" -ge 50000 ]; then
         echo -e "  ${GREEN}✓${NC} 50KB metadata survives round-trip ($after_len bytes)"
@@ -759,7 +760,7 @@ test_missing_tmpfs() {
     if [ "$exit_code" -eq 0 ]; then
         echo -e "  ${GREEN}✓${NC} Status recovers gracefully after missing DB"
         TESTS_PASSED=$((TESTS_PASSED + 1))
-    elif grep -qi "load\|restore\|missing\|not found" <<< "$result"; then
+    elif grep -qiE "load|restore|missing|not found" <<< "$result"; then
         echo -e "  ${GREEN}✓${NC} Status gives helpful error about missing DB"
         TESTS_PASSED=$((TESTS_PASSED + 1))
     else
@@ -912,7 +913,7 @@ test_long_text() {
 
     # Verify storage
     local len
-    len=$("$WV" show "$id" --json 2>/dev/null | jq -r '.text' | wc -c)
+    len=$(( $("$WV" show "$id" --json 2>/dev/null | jq -r '.text' | wc -c) ))
     TESTS_RUN=$((TESTS_RUN + 1))
     if [ "$len" -ge 10000 ]; then
         echo -e "  ${GREEN}✓${NC} 10K character text stored ($len bytes)"
@@ -928,7 +929,7 @@ test_long_text() {
     rm -f "$WV_DB" "$WV_DB-wal" "$WV_DB-shm"
     "$WV" load >/dev/null 2>&1
     local after_len
-    after_len=$("$WV" show "$id" --json 2>/dev/null | jq -r '.text' | wc -c)
+    after_len=$(( $("$WV" show "$id" --json 2>/dev/null | jq -r '.text' | wc -c) ))
     TESTS_RUN=$((TESTS_RUN + 1))
     if [ "$after_len" -ge 10000 ]; then
         echo -e "  ${GREEN}✓${NC} 10K text survives round-trip ($after_len bytes)"
@@ -1174,8 +1175,8 @@ test_path_diamond_dedup() {
     path_result=$("$WV" path "$d" 2>&1)
     # Default format outputs "wv-xxxxxx: text" per line
     local total_ids unique_ids
-    total_ids=$(echo "$path_result" | grep -oE 'wv-[a-f0-9]{4,6}' | wc -l)
-    unique_ids=$(echo "$path_result" | grep -oE 'wv-[a-f0-9]{4,6}' | sort -u | wc -l)
+    total_ids=$(( $(echo "$path_result" | grep -oE 'wv-[a-f0-9]{4,6}' | wc -l) ))
+    unique_ids=$(( $(echo "$path_result" | grep -oE 'wv-[a-f0-9]{4,6}' | sort -u | wc -l) ))
     # Fixed: wv-77cd — UNION dedup in CTE
     assert_equals "$total_ids" "$unique_ids" "Diamond path has no duplicate nodes (total=$total_ids, unique=$unique_ids)"
 

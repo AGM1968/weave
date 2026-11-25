@@ -125,7 +125,7 @@ SQL
 # dump_state_sql then exports nothing for them.
 _wv_graph_diff_inspect() {
     local db="$1" out t have="" lin
-    if ! out=$(sqlite3 -readonly "$db" "SELECT name FROM sqlite_master WHERE type = 'table';" 2>&1); then
+    if ! out=$(sqlite3 -cmd "PRAGMA query_only=1" "file:$db?mode=rw" "SELECT name FROM sqlite_master WHERE type = 'table';" 2>&1); then
         echo "wv hotzone diff: cannot read $db as an SQLite database: ${out//$'\n'/ }" >&2
         return 2
     fi
@@ -137,7 +137,7 @@ _wv_graph_diff_inspect() {
             return 2
         fi
     done
-    if ! lin=$(sqlite3 -readonly "$db" "SELECT (SELECT count(*) FROM pragma_table_info('nodes') WHERE name IN ('lineage_seq','lineage_actor')) + (SELECT count(*) FROM pragma_table_info('edges') WHERE name IN ('lineage_seq','lineage_actor'));" 2>&1); then
+    if ! lin=$(sqlite3 -cmd "PRAGMA query_only=1" "file:$db?mode=rw" "SELECT (SELECT count(*) FROM pragma_table_info('nodes') WHERE name IN ('lineage_seq','lineage_actor')) + (SELECT count(*) FROM pragma_table_info('edges') WHERE name IN ('lineage_seq','lineage_actor'));" 2>&1); then
         echo "wv hotzone diff: cannot inspect $db: ${lin//$'\n'/ }" >&2
         return 2
     fi
@@ -185,14 +185,14 @@ wv_graph_diff() {
             # Absent in one copy (it predates the table): every row the other
             # holds is a difference.
             if [ "$fh" = 1 ]; then holder="$first"; side="first: "; else holder="$second"; side="second:"; fi
-            if ! out=$(sqlite3 -readonly "$holder" "SELECT count(*) FROM $table;" 2>&1); then
+            if ! out=$(sqlite3 -cmd "PRAGMA query_only=1" "file:$holder?mode=rw" "SELECT count(*) FROM $table;" 2>&1); then
                 echo "wv hotzone diff: cannot read $table in $holder: ${out//$'\n'/ }" >&2
                 return 2
             fi
             [ "$out" != "0" ] && all+="only in ${side} ${out} ${table} row(s); the other database has no ${table} table"$'\n'
             continue
         fi
-        if ! out=$(sqlite3 -readonly "$first" "ATTACH DATABASE 'file:${second}?mode=ro' AS other; $sql" 2>&1); then
+        if ! out=$(sqlite3 -cmd "PRAGMA query_only=1" "file:$first?mode=rw" "ATTACH DATABASE 'file:${second}?mode=rw' AS other; $sql" 2>&1); then
             echo "wv hotzone diff: could not compare $table in $first and $second: ${out//$'\n'/ }" >&2
             return 2
         fi
@@ -201,8 +201,8 @@ wv_graph_diff() {
     # The replay clock decides legacy-delta replay (wv-8d4f7d); report it
     # whenever it differs, with both values, whatever the tables say.
     local fc sc
-    if ! fc=$(sqlite3 -readonly "$first" "$(wv_replay_clock_sql main)" 2>&1) \
-        || ! sc=$(sqlite3 -readonly "$second" "$(wv_replay_clock_sql main)" 2>&1); then
+    if ! fc=$(sqlite3 -cmd "PRAGMA query_only=1" "file:$first?mode=rw" "$(wv_replay_clock_sql main)" 2>&1) \
+        || ! sc=$(sqlite3 -cmd "PRAGMA query_only=1" "file:$second?mode=rw" "$(wv_replay_clock_sql main)" 2>&1); then
         echo "wv hotzone diff: could not read the replay clock of $first or $second" >&2
         return 2
     fi

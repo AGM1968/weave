@@ -34,7 +34,8 @@
 #   gate_lanes_run <dir> [hook args...]
 #                           rule 4: each changed enforcement file is judged in
 #                           its own lane, against HEAD's copies of every other
-#                           file; every lane must admit
+#                           file; every lane must admit, so the first refusal
+#                           stops the rest unless WV_GATE_KEEP_GOING=1
 #   gate_repair_record <path> [repair|retirement]
 #                           rule 5: the repair record at HEAD admitting this
 #                           commit's transition of <path>, if one is live
@@ -640,8 +641,18 @@ _gate_lane_build() {
     esac
 }
 
+# _gate_lanes_first_refusal <root> <launched> — the index of the first of the
+# <launched> lanes under <root> that finished and refused, or nothing.
+_gate_lanes_first_refusal() {
+    local k rc
+    for ((k = 0; k < $2; k++)); do
+        rc=$(cat "$1/$k/rc" 2>/dev/null) || continue
+        [ "$rc" = 0 ] || { echo "$k"; return 0; }
+    done
+}
+
 gate_lanes_run() {
-    local work=$1 root t0 c0 k0 jobs i n=0 running=0 failed=0 reuse f ev tree saved _gl_pid=""
+    local work=$1 root t0 c0 k0 jobs i n=0 running=0 failed=0 stopped=0 reuse f ev tree saved _gl_pid=""
     local logs=""
     shift
     local -a files=() pids=() reuses=()
@@ -665,7 +676,7 @@ gate_lanes_run() {
     [ "${#files[@]}" -gt 0 ] || return 0
     # t0 is when the lanes started (an epoch stamp for the gate record); their
     # total is measured on wv-clock.sh's clock, which leaves out a suspend.
-    t0=$(date +%s%N 2>/dev/null || echo 0)
+    t0=$(wv_now ns 2>/dev/null || echo 0)
     wv_clock_ms c0 k0
     root=$(mktemp -d "$work/lanes.XXXXXX") || { echo "gate_lanes_run: allocate lanes under $work (status $?) — refusing" >&2; return 1; }
     tree=$(gate_side_tree auth) || { echo "gate_lanes_run: resolve auth tree (status $?) — refusing" >&2; return 1; }
@@ -713,19 +724,30 @@ gate_lanes_run() {
     done
     saved=$(trap -p INT TERM HUP)
     trap 'for _gl_pid in "${pids[@]}"; do kill -TERM "$_gl_pid" 2>/dev/null || true; done; for _gl_pid in "${pids[@]}"; do wait "$_gl_pid" 2>/dev/null || true; done; exit 130' INT TERM HUP
+    # The first refusal decides (wv-744cb2): every lane must admit, so once one
+    # refuses, the lanes still running are stopped and the rest never start,
+    # as the suite pool stops at its first failed suite. Waiting for them cost
+    # 400-2,690s on four refused gates in the 30 days to 2026-11-19.
+    # WV_GATE_KEEP_GOING=1 (gate-preflight.sh --keep-going) judges every lane.
+    local keep=${WV_GATE_KEEP_GOING:-0} stop=""
     for i in "${!files[@]}"; do
         if [ "$running" -ge "$jobs" ]; then
             wait -n 2>/dev/null || true
             running=$((running - 1))
         fi
+        [ "$keep" = 1 ] || [ -n "$stop" ] || stop=$(_gate_lanes_first_refusal "$root" "${#pids[@]}")
+        if [ -n "$stop" ]; then
+            : > "$root/$i/stopped"
+            continue
+        fi
         (
-            lt0=$(date +%s%N 2>/dev/null || echo 0)
+            lt0=$(wv_now ns 2>/dev/null || echo 0)
+            lrc=0
             WV_GATE_ELAPSED="$root/$i/elapsed" \
             gate_run_bounded "candidate lane ${files[$i]}" "${WV_GATE_LANE_TIMEOUT:-7200}" \
                 env -u WV_LIB_DIR -u WV_CLI -u WV_PRECOMMIT_RUNNING -u WV_SKIP_PRECOMMIT -u WV_GATE_ELAPSED WV_HOOK_REEXEC=1 \
                 WV_GATE_LANE_JOBS="$jobs" WV_GATE_SLOTS="$root/slots" WV_GATE_SC_LOCK="$root/shellcheck.lock" \
-                bash "$root/$i/tree/scripts/hooks/pre-commit-weave.sh" "$@" > "$root/$i/out" 2>&1
-            echo "$?" > "$root/$i/rc"
+                bash "$root/$i/tree/scripts/hooks/pre-commit-weave.sh" "$@" > "$root/$i/out" 2>&1 || lrc=$?
             # The supervisor's monotonic reading leaves out a suspend (wv-b17a85).
             if read -r lel lkind < "$root/$i/elapsed" 2>/dev/null \
                 && [ "$lkind" = monotonic ] && [[ "$lel" =~ ^[0-9]+$ ]]; then
@@ -733,15 +755,41 @@ gate_lanes_run() {
             else
                 hook_duration_ms "$lt0" > "$root/$i/ms"; echo wall > "$root/$i/clock"
             fi
+            # Written last and by rename: an rc file means the lane finished.
+            echo "$lrc" > "$root/$i/rc.tmp" && mv "$root/$i/rc.tmp" "$root/$i/rc"
         ) &
         pids+=("$!")
         running=$((running + 1))
     done
+    # Drain one lane at a time, so a refusal stops the others while they run.
+    # Without wait -n (bash before 4.3) the lanes ran one at a time and a
+    # refusal already stopped the launches above.
+    if [ "$keep" != 1 ] && [ "$jobs" -gt 1 ]; then
+        while [ -z "$stop" ] && [ "$running" -gt 0 ]; do
+            wait -n 2>/dev/null || true
+            running=$((running - 1))
+            stop=$(_gate_lanes_first_refusal "$root" "${#pids[@]}")
+        done
+    fi
+    if [ -n "$stop" ]; then
+        for i in "${!pids[@]}"; do
+            [ -f "$root/$i/rc" ] && continue
+            : > "$root/$i/stopped"
+            kill -TERM "${pids[$i]}" 2>/dev/null || true
+        done
+    fi
     for i in "${pids[@]}"; do wait "$i" 2>/dev/null || true; done
     trap - INT TERM HUP
     [ -z "$saved" ] || eval "$saved"
     for i in "${!files[@]}"; do
         n=$((n + 1))
+        # A lane stopped by another's refusal judged nothing: it neither admits
+        # nor refuses. A lane that finished as it was stopped keeps its result.
+        if [ ! -f "$root/$i/rc" ] && [ -f "$root/$i/stopped" ]; then
+            stopped=$((stopped + 1))
+            hook_progress "candidate lane ${files[$i]}: not judged, stopped after ${files[$stop]} refused (WV_GATE_KEEP_GOING=1 judges every lane)"
+            continue
+        fi
         # Per-lane cost, so a lane that reruns its suites is measured on its
         # own rather than hidden in the total (wv-7ee8fe).
         hook_progress "candidate lane ${files[$i]}: $([ "${reuses[$i]}" = 1 ] && echo "reused HEAD's suite results" || echo "reran its suites") from $jobs shared suite slot(s) in $(cat "$root/$i/ms" 2>/dev/null || echo "?")ms"
@@ -764,11 +812,11 @@ gate_lanes_run() {
                     echo "  could not retain lane output (copy status $?)"
                 fi
             fi
-            sed 's/\x1b\[[0-9;]*m//g' "$root/$i/out" 2>/dev/null | grep -v '^Weave pre-commit: ' | grep . | tail -20 | sed 's/^/    /'
+            LC_ALL=C sed $'s/\e\\[[0-9;]*m//g' "$root/$i/out" 2>/dev/null | grep -v '^Weave pre-commit: ' | grep . | tail -20 | sed 's/^/    /'
         } >&2
     done
     wv_clock_since _GATE_LANES_MS _GATE_LANES_CLOCK "$c0" "$k0"
-    hook_progress "candidate lanes: $((n - failed)) of $n admitted in ${_GATE_LANES_MS}ms"
+    hook_progress "candidate lanes: $((n - failed - stopped)) of $n admitted$([ "$stopped" -eq 0 ] || echo ", $stopped stopped") in ${_GATE_LANES_MS}ms"
     # For the gate record (wv-3dbc11): lanes write no suite rows of their own,
     # so without this their time is the unattributed tail of the gate's wall
     # time (wv-241d5f). One object per lane, the ms and rc the lines above print.
@@ -777,8 +825,10 @@ gate_lanes_run() {
         jq -cn --arg path "${files[$i]}" --arg reused "${reuses[$i]}" --arg ms "$(cat "$root/$i/ms" 2>/dev/null)" \
             --arg jobs "$jobs" --arg rc "$(cat "$root/$i/rc" 2>/dev/null)" --arg sched "$GATE_LANES_SCHEDULER" \
             --arg clock "$(cat "$root/$i/clock" 2>/dev/null || echo unknown)" \
+            --arg stopped "$([ ! -f "$root/$i/rc" ] && [ -f "$root/$i/stopped" ] && echo 1)" \
             '{path:$path, reused:($reused == "1"), ms:($ms | tonumber? // null),
-              jobs:($jobs | tonumber? // null), rc:($rc | tonumber? // null), scheduler:$sched, clock:$clock}'
+              jobs:($jobs | tonumber? // null), rc:($rc | tonumber? // null), scheduler:$sched, clock:$clock}
+             + (if $stopped == "1" then {stopped:true} else {} end)'
     done | jq -cs '.' 2>/dev/null) || _GATE_LANES_RUNS=""
     rm -rf "$root"
     [ "$failed" -eq 0 ]

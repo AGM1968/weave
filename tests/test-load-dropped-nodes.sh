@@ -135,6 +135,32 @@ fi
 leftovers=$(find "$WV_HOT_ZONE" -maxdepth 1 -name '.preload.db.*' 2>/dev/null | grep -c .)
 check "the pre-load snapshot is cleaned up" "0" "$leftovers"
 
+# ── ...with its WAL companions, as macOS keeps them (wv-7551b6) ──────────────
+# Apple's SQLite keeps -wal and -shm after the last connection closes, so a
+# scratch database removed by its name alone leaves both behind (4 files after
+# 2 loads on the macOS census). This sqlite3 leaves them beside every database
+# it opens, attaches or backs up into; a load and a sync must still clean up.
+shim="$TEST_DIR/persist-wal"; mkdir -p "$shim"
+cat > "$shim/sqlite3" <<'SHIM'
+#!/usr/bin/env bash
+"$WV_TEST_REAL_SQLITE" "$@"; rc=$?
+for a in "$@"; do
+    [ -f "$a" ] && touch -- "$a-wal" "$a-shm"
+    while [[ "$a" =~ (ATTACH DATABASE|\.backup)\ \'([^\']+)\' ]]; do
+        [ -f "${BASH_REMATCH[2]}" ] && touch -- "${BASH_REMATCH[2]}-wal" "${BASH_REMATCH[2]}-shm"
+        a=${a/"${BASH_REMATCH[0]}"/}
+    done
+done
+exit $rc
+SHIM
+chmod +x "$shim/sqlite3"
+export WV_TEST_REAL_SQLITE; WV_TEST_REAL_SQLITE=$(command -v sqlite3)
+PATH="$shim:$PATH" "$WV" load >/dev/null 2>&1
+PATH="$shim:$PATH" "$WV" sync >/dev/null 2>&1
+scratch=$(find "$WV_HOT_ZONE" "$WEAVE_DIR" -maxdepth 1 \
+    \( -name '.preload.db.*' -o -name '.brain.db.*' -o -name '.export-snapshot.db.*' \) 2>/dev/null)
+check "no scratch database or WAL companion outlives a load or sync" "" "$scratch"
+
 echo ""
 echo "  $pass/$run passed"
 [ "$pass" -eq "$run" ]

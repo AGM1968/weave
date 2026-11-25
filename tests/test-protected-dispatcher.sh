@@ -16,6 +16,8 @@
 #     at HEAD;
 #   - a repository whose HEAD has no hook (a consumer) runs the installed copy,
 #     and that copy no longer hops to a working-tree hook.
+# shellcheck source=tests/lib/sed-inplace.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/sed-inplace.sh"  # sed -i is GNU-only (wv-076a98)
 set -uo pipefail
 export WV_TEST_SUITE=1
 export WV_CALL_SOURCE=test
@@ -160,7 +162,8 @@ tamper "the snapshot helper lists nothing staged" scripts/lib/wv-gate-snapshot.s
 restore
 # The hook itself: the tamper must come before the gate runs, so it replaces
 # the second line rather than appending.
-sed -i '2i exit 0' scripts/hooks/pre-commit-weave.sh
+sed_inplace '2i\
+exit 0' scripts/hooks/pre-commit-weave.sh
 reset_marks; touch "$MARK/fail"; stage_src; gate
 check "the working tree's hook exits 0 at the top: the commit is still refused" "1" "$RC"
 reset_marks; touch "$MARK/fail"; unguarded
@@ -247,7 +250,8 @@ reset_marks; touch "$MARK/heavy-fail"
 OUT=$(git push -q origin main 2>&1); RC=$?
 check "(control) a failing heavy suite refuses the push" "1" "$RC"
 check "...after it ran" "1" "$(runs heavy)"
-sed -i '2i exit 0' scripts/hooks/pre-push-weave.sh
+sed_inplace '2i\
+exit 0' scripts/hooks/pre-push-weave.sh
 reset_marks; touch "$MARK/heavy-fail"
 OUT=$(git push -q origin main 2>&1); RC=$?
 check "the working tree's pre-push exits 0 at the top: the push is still refused" "1" "$RC"

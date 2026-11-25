@@ -20,7 +20,10 @@
 _test_file_fingerprint() {
     local f="$1" h
     h=$(git hash-object "$f" 2>/dev/null)
-    [ -z "$h" ] && h=$(stat -c '%Y:%s' "$f" 2>/dev/null || echo "missing")
+    if [ -z "$h" ]; then
+        local m z
+        { m=$(wv_stat mtime "$f") && z=$(wv_stat size "$f") && h="$m:$z"; } || h=missing
+    fi
     printf '%s' "$h"
 }
 
@@ -248,6 +251,11 @@ _test_input_is_blob() {
 
 _config_env_file() { echo "${WV_CONFIG_DIR:-$HOME/.config/weave}/config.env"; }
 
+# _config_mktemp — the temporary config file, in $TMPDIR on every host. An
+# explicit template, not bare mktemp: macOS mktemp with no template still
+# creates a file when TMPDIR is unusable, GNU refuses (wv-f8e26d).
+_config_mktemp() { mktemp "${TMPDIR:-/tmp}/wv-config.XXXXXX"; }
+
 # _config_env_set KEY VALUE — upsert KEY="VALUE" in config.env (deduped, quoted).
 _config_env_set() {
     local key="$1" val="$2" file tmp
@@ -260,7 +268,7 @@ _config_env_set() {
         echo "wv config: cannot create config directory $(dirname "$file")" >&2
         return 1
     fi
-    if ! tmp=$(mktemp); then
+    if ! tmp=$(_config_mktemp); then
         echo "wv config: cannot create temporary config file" >&2
         return 1
     fi
@@ -286,7 +294,7 @@ _config_env_unset() {
     local key="$1" file tmp
     file=$(_config_env_file)
     [ -f "$file" ] || return 0
-    if ! tmp=$(mktemp); then
+    if ! tmp=$(_config_mktemp); then
         echo "wv config: cannot create temporary config file" >&2
         return 1
     fi
@@ -612,6 +620,65 @@ _suite_log_path() {
     echo "${WV_SUITE_LOG:-${WV_SUITE_LOG_DEFAULT:-$HOME/.local/share/weave/suite_runs.jsonl}}"
 }
 
+# _repo_identity [dir] — the name the durable logs key a repository by: the
+# basename of the repository that owns git's common directory, the same from
+# every worktree of it. Rows were keyed by the checkout's own basename, so a
+# worktree saw only its own few runs and priced every other suite at 0: a
+# preflight in memory-system-backlog skipped tests/test-hook-common.sh, which
+# had 155 runs under memory-system and none under the worktree (wv-1e4c01).
+# A basename, never a path, so no $HOME/username reaches the log. Outside a
+# git repository: the directory's own basename, as before.
+# INTERIM (wv-1e4c01): this is a log key derived from a path, not the
+# repository_id of docs/DURABLE-GRAPH-AUTHORITY.md, which is never derived
+# from a path or name. Two unrelated repositories with one basename still
+# share a key, as they did before; a suite's throwaway repository has its own
+# .git, so its rows keep its own name (e.g. "project") and never merge here.
+_repo_identity() {
+    local dir="${1:-${REPO_ROOT:-}}" common
+    [ -n "$dir" ] || return 0
+    common=$(git -C "$dir" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || common=""
+    case "$common" in
+        "") basename "$dir" ;;
+        */.git) basename "${common%/.git}" ;;
+        *) common=$(basename "$common"); echo "${common%.git}" ;;
+    esac
+}
+
+# _repo_log_names [dir] — every repo key under which this repository's rows
+# were logged: its identity, then the basename of each of its worktrees, which
+# is how rows were keyed before _repo_identity. A worktree since removed is not
+# listed, so its old rows stay apart. One name per line.
+_repo_log_names() {
+    local dir="${1:-${REPO_ROOT:-}}" id wt
+    [ -n "$dir" ] || return 0
+    id=$(_repo_identity "$dir")
+    printf '%s\n' "$id"
+    while IFS= read -r wt; do
+        case "$wt" in "worktree "*) wt=$(basename "${wt#worktree }"); [ "$wt" = "$id" ] || printf '%s\n' "$wt" ;; esac
+    done < <(git -C "$dir" worktree list --porcelain 2>/dev/null)
+}
+
+# _repo_log_view <log> <out> [dir] — write to <out> the rows of a JSONL log
+# whose repo is one of _repo_log_names, each re-keyed to _repo_identity, so a
+# reader filtering on the identity sees the whole repository's history. jq -c
+# writes "repo":"<name>" with no space, so a literal match on the quoted pair
+# is exact: memory-system does not match memory-system-backlog. A missing log
+# gives an empty <out>. Fails only when <out> cannot be written.
+_repo_log_view() {
+    local log="$1" out="$2" dir="${3:-${REPO_ROOT:-}}" id names
+    id=$(_repo_identity "$dir")
+    names=$(_repo_log_names "$dir")
+    : > "$out" || return 1
+    [ -f "$log" ] || return 0
+    # names through ENVIRON: BSD awk refuses a newline in a -v value (wv-27b2f5)
+    WV_AWK_NAMES="$names" awk -v id="$id" '
+        BEGIN { n = split(ENVIRON["WV_AWK_NAMES"], a, "\n"); want = "\"repo\":\"" id "\"" }
+        { for (i = 1; i <= n; i++) { p = "\"repo\":\"" a[i] "\""
+              if (a[i] != "" && (k = index($0, p))) {
+                  print substr($0, 1, k - 1) want substr($0, k + length(p)); next } } }
+    ' "$log" > "$out"
+}
+
 # _durable_log_writable: false for a test run (WV_CALL_SOURCE=test) that has not
 # pointed the logs somewhere of its own. Suites that drive the commit hooks in
 # throwaway repos were appending their runs to the user's durable history
@@ -622,15 +689,16 @@ _durable_log_writable() {
 }
 
 # _suite_log_append <suite> <files_csv> <exit> <duration_ms> <sha> [estimate_ms]
-#                   [started_ms] [ended_ms] [clock]
+#                   [started_ms] [ended_ms] [clock] [tree]
 # One JSONL line per suite RUN (not per file). Best-effort: a logging failure must
 # never break a commit hook. jq -cn guarantees valid JSON + escaping, so a path
 # containing a quote can neither corrupt the log nor inject a field. Records only
 # repo-relative paths + outcome metadata — never file content, env, or secrets —
-# and `repo` is a basename so no absolute $HOME/username path leaks (no PII).
+# and `repo` is the repository's identity, a basename, so no absolute
+# $HOME/username path leaks (no PII), the same from every worktree (wv-1e4c01).
 _suite_log_append() {
     local suite="$1" files="$2" exit_code="$3" duration_ms="$4" sha="$5" estimate_ms="${6:-}"
-    local started_ms="${7:-}" ended_ms="${8:-}" clock="${9:-}"
+    local started_ms="${7:-}" ended_ms="${8:-}" clock="${9:-}" tree="${10:-}"
     _durable_log_writable || return 0
     local log_path; log_path=$(_suite_log_path)
     [ -n "$log_path" ] || return 0
@@ -648,8 +716,9 @@ _suite_log_append() {
     # clock (wv-b17a85): the clock duration_ms was measured on (wv-clock.sh).
     # Only monotonic leaves out a suspend; absent on rows from before it.
     _clock_kind_valid "$clock" || clock=""
+    _tree_id_valid "$tree" || tree=""
     local repo=""
-    [ -n "${REPO_ROOT:-}" ] && repo=$(basename "$REPO_ROOT")
+    [ -n "${REPO_ROOT:-}" ] && repo=$(_repo_identity "$REPO_ROOT")
     # phase/gate_id (wv-ffda33) come from the gate that ran the suite, so one
     # gate's runs can be grouped exactly instead of guessed from a shared sha.
     jq -cn \
@@ -666,8 +735,9 @@ _suite_log_append() {
         --argjson estimate_ms "$estimate_ms" \
         --argjson started_ms "$started_ms" \
         --argjson ended_ms "$ended_ms" \
-        --arg clock "$clock" \
+        --arg clock "$clock" --arg tree "$tree" \
         '{ts:$ts, repo:$repo, suite:$suite, files:$files, exit:$exit, duration_ms:$duration_ms, sha:$sha}
+         + (if $tree != "" then {tree:$tree} else {} end)
          + (if $clock != "" then {clock:$clock} else {} end)
          + (if $phase != "" then {phase:$phase} else {} end)
          + (if $gate_id != "" then {gate_id:$gate_id} else {} end)
@@ -683,6 +753,14 @@ _clock_kind_valid() {
     case "${1:-}" in monotonic|boottime|wall|unknown) return 0 ;; *) return 1 ;; esac
 }
 
+# _tree_id_valid <id> — a full git tree id (sha1 or sha256). A suite or gate
+# row names the tree it judged (wv-abc855), so a fix recommitted under the same
+# file names is told apart from a flaky rerun of the same bytes. Anything else
+# is dropped, never guessed: an absent tree reads as unknown, not as a match.
+_tree_id_valid() {
+    [[ "${1:-}" =~ ^[0-9a-f]{40}([0-9a-f]{24})?$ ]]
+}
+
 # _gate_log_path: the per-gate log sits beside the suite log, so every isolation
 # that redirects WV_SUITE_LOG (tests set it) redirects this too (wv-ffda33).
 _gate_log_path() {
@@ -692,7 +770,7 @@ _gate_log_path() {
 
 # _gate_log_append <phase> <gate_id> <exit> <duration_ms> <estimate_ms> <suites_csv> <sha> [started_ms]
 #                  [suite_modes] [lanes_json] [lanes_ms] [lanes_started_ms]
-#                  [pressure_start] [pressure_end] [clock]
+#                  [pressure_start] [pressure_end] [clock] [tree]
 # One JSONL line per gate INVOCATION: its wall time, what it ran, what it
 # expected to take, and how it ended. Best-effort like the suite log.
 # started_ms (wv-4666cb) is the gate's start in epoch ms, the origin its suites'
@@ -711,10 +789,12 @@ _gate_log_path() {
 # host load including the gate, not interference alone. Absent where either
 # reading is missing or the counters went backwards.
 # clock (wv-b17a85) is the clock duration_ms and lanes_ms were measured on.
+# tree (wv-abc855) is the git tree the gate judged: the staged tree for a
+# commit gate, the pushed tip's tree for a push gate; absent where unknown.
 _gate_log_append() {
     local phase="$1" gate_id="$2" exit_code="$3" duration_ms="$4" estimate_ms="$5" suites="$6" sha="$7"
     local started_ms="${8:-}" suite_modes="${9:-}" lanes="${10:-}" lanes_ms="${11:-}" lanes_started_ms="${12:-}"
-    local pressure_start="${13:-}" pressure_end="${14:-}" pressure=null clock="${15:-}"
+    local pressure_start="${13:-}" pressure_end="${14:-}" pressure=null clock="${15:-}" tree="${16:-}"
     _durable_log_writable || return 0
     local log_path; log_path=$(_gate_log_path)
     mkdir -p "$(dirname "$log_path")" 2>/dev/null || return 0
@@ -726,6 +806,7 @@ _gate_log_append() {
     case "$lanes_started_ms" in ''|0|*[!0-9]*) lanes_started_ms=null ;; esac
     jq -se 'length == 1 and (.[0] | type == "array" and length > 0)' >/dev/null 2>&1 <<< "$lanes" || lanes=null
     _clock_kind_valid "$clock" || clock=""
+    _tree_id_valid "$tree" || tree=""
     if [[ "$pressure_start" =~ ^[0-9]+,[0-9]+$ ]] && [[ "$pressure_end" =~ ^[0-9]+,[0-9]+$ ]]; then
         pressure=$(jq -cn --arg s "$pressure_start" --arg e "$pressure_end" --argjson d "$duration_ms" '
             ($s | split(",") | map(tonumber)) as $a | ($e | split(",") | map(tonumber)) as $b
@@ -737,7 +818,7 @@ _gate_log_append() {
               end') || pressure=null
     fi
     local repo=""
-    [ -n "${REPO_ROOT:-}" ] && repo=$(basename "$REPO_ROOT")
+    [ -n "${REPO_ROOT:-}" ] && repo=$(_repo_identity "$REPO_ROOT")
     jq -cn \
         --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
         --arg repo "$repo" --arg phase "$phase" --arg gate_id "$gate_id" \
@@ -746,9 +827,10 @@ _gate_log_append() {
         --argjson estimate_ms "$estimate_ms" --arg suites "$suites" --arg sha "$sha" \
         --argjson started_ms "$started_ms" --arg suite_modes "$suite_modes" \
         --argjson lanes "$lanes" --argjson lanes_ms "$lanes_ms" --argjson lanes_started_ms "$lanes_started_ms" \
-        --argjson pressure "$pressure" --arg clock "$clock" \
+        --argjson pressure "$pressure" --arg clock "$clock" --arg tree "$tree" \
         '{ts:$ts, repo:$repo, phase:$phase, gate_id:$gate_id, exit:$exit, duration_ms:$duration_ms,
           estimate_ms:$estimate_ms, suites:($suites | split(",") | map(select(. != ""))), sha:$sha}
+         + (if $tree != "" then {tree:$tree} else {} end)
          + (if $clock != "" then {clock:$clock} else {} end)
          + (if $execution_mode != "" then {execution_mode:$execution_mode} else {} end)
          + (if $started_ms != null then {started_ms:$started_ms} else {} end)
@@ -790,6 +872,10 @@ cmd_test_record() {
     local gate_mode=false gate_phase="${WV_GATE_PHASE:-}" gate_id="${WV_GATE_ID:-}" gate_suites="" gate_suite_modes=""
     local start_fps="" start_given=false inputs_key="" started_ms="" ended_ms="" snapshot_plan=""
     local gate_lanes="" gate_lanes_ms="" gate_lanes_started_ms="" gate_pressure_start="" gate_pressure_end="" clock=""
+    # --tree is supplied by the recorder, never read from an inherited
+    # WV_GATE_TREE: a suite that records its own runs inside a gate would
+    # otherwise stamp the enclosing gate's tree on them (wv-abc855).
+    local tree=""
     local arg
     for arg in "$@"; do
         case "$arg" in
@@ -805,6 +891,7 @@ cmd_test_record() {
             --duration=*) duration_ms="${arg#--duration=}" ;;
             --estimate=*) estimate_ms="${arg#--estimate=}" ;;
             --clock=*)    clock="${arg#--clock=}" ;;
+            --tree=*)     tree="${arg#--tree=}" ;;
             --gate)       gate_mode=true ;;
             --phase=*)    gate_phase="${arg#--phase=}" ;;
             --gate-id=*)  gate_id="${arg#--gate-id=}" ;;
@@ -820,8 +907,8 @@ cmd_test_record() {
     done
 
     if [ -z "$suite" ]; then
-        echo "Usage: wv test-record <suite> [--files=a,b] [--exit=N] [--commit=SHA] [--duration=MS] [--estimate=MS] [--started-ms=EPOCH_MS] [--ended-ms=EPOCH_MS] [--clock=KIND]" >&2
-        echo "       wv test-record gate --gate --phase=P --gate-id=ID --exit=N --duration=MS [--estimate=MS] [--suites=a,b] [--started-ms=EPOCH_MS] [--lanes=JSON --lanes-ms=MS --lanes-started-ms=EPOCH_MS] [--pressure-start=CPU_US,IO_US --pressure-end=CPU_US,IO_US] [--clock=KIND]" >&2
+        echo "Usage: wv test-record <suite> [--files=a,b] [--exit=N] [--commit=SHA] [--duration=MS] [--estimate=MS] [--started-ms=EPOCH_MS] [--ended-ms=EPOCH_MS] [--clock=KIND] [--tree=TREE_ID]" >&2
+        echo "       wv test-record gate --gate --phase=P --gate-id=ID --exit=N --duration=MS [--estimate=MS] [--suites=a,b] [--started-ms=EPOCH_MS] [--lanes=JSON --lanes-ms=MS --lanes-started-ms=EPOCH_MS] [--pressure-start=CPU_US,IO_US --pressure-end=CPU_US,IO_US] [--clock=KIND] [--tree=TREE_ID]" >&2
         return 1
     fi
 
@@ -836,7 +923,8 @@ cmd_test_record() {
         [ -z "$commit_sha" ] && commit_sha=$(git rev-parse --short HEAD 2>/dev/null || echo "")
         _gate_log_append "${gate_phase:-manual}" "$gate_id" "$exit_code" "$duration_ms" \
             "$estimate_ms" "$gate_suites" "$commit_sha" "$started_ms" "$gate_suite_modes" \
-            "$gate_lanes" "$gate_lanes_ms" "$gate_lanes_started_ms" "$gate_pressure_start" "$gate_pressure_end" "$clock"
+            "$gate_lanes" "$gate_lanes_ms" "$gate_lanes_started_ms" "$gate_pressure_start" "$gate_pressure_end" "$clock" \
+            "$tree"
         return 0
     fi
 
@@ -858,7 +946,7 @@ cmd_test_record() {
     # Durable history: one append-only JSONL line per run, survives wv load (LL2).
     # The tmpfs upserts below remain the gate's current-state view.
     _suite_log_append "$suite" "$files" "$exit_code" "$duration_ms" "$commit_sha" "$estimate_ms" \
-        "$started_ms" "$ended_ms" "$clock"
+        "$started_ms" "$ended_ms" "$clock" "$tree"
     # Mutable checkout tools are not captured by any content key. Keep the
     # measured outcome, but never certify per-file, legacy or frozen readiness.
     [ "$WV_GATE_EXECUTION_MODE" != checkout ] || return 0
@@ -1036,15 +1124,20 @@ cmd_test_status() {
         else
             cur_fp=$(_test_file_fingerprint "$f")
         fi
-        row=$(db_query "SELECT fingerprint || char(31) || exit_code
+        # A tab, as every other packed row in wv: the sqlite3 shell escapes
+        # other control characters in output (3.50.6 on the Mac runner printed
+        # char(31) so the split never matched, and every fresh green record
+        # read as stale, wv-bfd445). A fingerprint is a hex blob id or
+        # mtime:size, and an exit code a number, so neither holds a tab.
+        row=$(db_query "SELECT fingerprint || char(9) || exit_code
                         FROM test_results
                         WHERE suite='$suite_esc' AND path='$path_esc'
                         LIMIT 1;" 2>/dev/null || true)
         if [ -z "$row" ]; then
             state="unknown"
         else
-            row_fp="${row%%$'\x1f'*}"
-            row_exit="${row#*$'\x1f'}"
+            row_fp="${row%%$'\t'*}"
+            row_exit="${row#*$'\t'}"
             if [ "$row_fp" != "$cur_fp" ]; then
                 state="stale"
             elif [ "$row_exit" = "0" ]; then

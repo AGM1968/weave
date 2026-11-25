@@ -5,6 +5,10 @@ export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls
 export WV_CALL_SOURCE=test
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# The product's md5sum (wv-resolve-runtime.sh, side-effect free): the repo hash a
+# product path is keyed on, the same on macOS, which has no md5sum(1) (wv-ef5621).
+# shellcheck disable=SC1091  # resolved at run time
+source "$ROOT/scripts/lib/wv-resolve-runtime.sh"
 WV="$ROOT/scripts/wv"
 TEST_DIR=$(mktemp -d)
 REPO="$TEST_DIR/repo"
@@ -508,7 +512,10 @@ rm -f "$budget_file"
 # Bash dedup now runs for Codex too: PreToolUse dispatch takes the lock last,
 # after every other guard has allowed the call, and PostToolUse dispatch
 # releases it once the command has run (wv-594381).
-dedup_locks="/tmp/weave-bash-locks-$(id -u)/$(echo "$REPO" | md5sum | cut -c1-8)"
+# Derived as the hooks derive it, from git's physical toplevel (wv-b3cb72).
+# shellcheck source=tests/lib/dedup-locks.sh
+. "$ROOT/tests/lib/dedup-locks.sh"
+dedup_locks=$(dedup_lock_dir "$REPO") || dedup_locks=""
 rm -rf "$dedup_locks"
 _bash_payload "make check" | "$WV" hook dispatch --event=PreToolUse --format=host >/dev/null 2>&1 || true
 check "PreToolUse dispatch takes the dedup lock" test -e "$dedup_locks/make-build.lock"

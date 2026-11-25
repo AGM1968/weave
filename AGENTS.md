@@ -4,7 +4,7 @@ This repository uses **Weave** for task tracking. Every code change must be trac
 
 ## Before any edit
 
-Use `wv` when it is on PATH; otherwise use the repo-local `./scripts/wv` wrapper. Run
+Use `wv` when it is on PATH; otherwise call the installed `$HOME/.local/bin/wv`. Run
 `wv work <id>` to claim a task, or create a claim-ready node with
 `wv add "<text>" --status=active --criteria="c1|c2" --risks=low`. If `wv status` shows 0 active
 nodes, do not edit files. Discovery before claiming may read, search, and report only.

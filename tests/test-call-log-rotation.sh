@@ -16,6 +16,9 @@ export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# wv_stat / wv_date_fmt: GNU and BSD behind one call (wv-resolve-runtime.sh, side-effect free).
+# shellcheck disable=SC1091  # resolved at run time
+source "$ROOT/scripts/lib/wv-resolve-runtime.sh"
 WV="$ROOT/scripts/wv"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; NC='\033[0m'
@@ -42,7 +45,7 @@ echo "call log rotation"
 # over the bound
 reset; fill 2000; call 1000
 check "rotates when the log exceeds the bound" "yes" "$(rotated)"
-check "previous generation keeps the old bytes" "2000" "$(stat -c %s "$LOG.1" 2>/dev/null || echo missing)"
+check "previous generation keeps the old bytes" "2000" "$(wv_stat size "$LOG.1" 2>/dev/null || echo missing)"
 if [ -s "$LOG" ] && grep -q '"cmd"' <<< "$(head -1 "$LOG")"; then
     ok "new log starts fresh and takes the current row"
 else
@@ -67,10 +70,10 @@ check "non-numeric bound does not fail the command" "0" "$?"
 
 # exactly one generation is kept
 reset; fill 2000; call 1000
-first_gen=$(stat -c %s "$LOG.1" 2>/dev/null)
+first_gen=$(wv_stat size "$LOG.1" 2>/dev/null)
 fill 2000; call 1000
-check "second rotation replaces the single previous generation" "2000" "$(stat -c %s "$LOG.1" 2>/dev/null || echo missing)"
-check "only one previous generation exists" "1" "$(find "$TEST_DIR" -name 'calls.jsonl.*' | wc -l)"
+check "second rotation replaces the single previous generation" "2000" "$(wv_stat size "$LOG.1" 2>/dev/null || echo missing)"
+check "only one previous generation exists" "1" "$(( $(find "$TEST_DIR" -name 'calls.jsonl.*' | wc -l) ))"
 [ -n "$first_gen" ] || bad "first generation was recorded" "stat failed"
 
 # rotation is best-effort: an unwritable directory must not fail the command

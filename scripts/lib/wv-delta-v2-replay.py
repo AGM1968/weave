@@ -1387,13 +1387,51 @@ def _lost_writes(conn: sqlite3.Connection, op_paths: list[Path],
     return lost
 
 
+def _snapshot_lineage(conn: sqlite3.Connection) -> int:
+    """The highest lineage seq the loaded snapshot already holds, before replay."""
+    best = 0
+    for table in ("nodes", "edges", "tombstones"):
+        try:
+            row = conn.execute(f"SELECT MAX(lineage_seq) FROM {table}").fetchone()  # noqa: S608 - fixed names
+        except sqlite3.Error:
+            continue
+        if row and isinstance(row[0], int):
+            best = max(best, row[0])
+    return best
+
+
+def _op_lineage_seq(path: Path) -> int | None:
+    """An op's lineage seq, or None when it cannot be read (it is then in scope)."""
+    try:
+        seq = read_op(path)["payload"]["lineage"]["seq"]
+    except (OSError, ValueError, KeyError, TypeError, IntegrityError, UnsupportedVersion):
+        return None
+    return seq if isinstance(seq, int) else None
+
+
+def _in_strict_scope(path: Path, since: int | None) -> bool:
+    """Whether a conflicting op counts under a scoped --strict."""
+    if since is None:
+        return True
+    seq = _op_lineage_seq(path)
+    return seq is None or seq >= since
+
+
 def evaluate(
     db_path: Path,
     op_paths: list[Path],
     cutover_seq: int | None = None,
     strict: bool = False,
+    strict_since: int | str | None = None,
 ) -> dict[str, Any]:
-    """Replay operations into the graph in one transaction and return each one's outcome and whether it aborted."""
+    """Replay operations into the graph in one transaction and return each one's outcome and whether it aborted.
+
+    `strict_since` scopes --strict (wv-1446ed): only conflicts of operations
+    whose lineage seq is at or after it abort the batch, so validation can tell
+    a new convergence conflict from the thousands a real catalog's history
+    holds. "snapshot" means the highest lineage the loaded snapshot holds. An
+    op whose lineage cannot be read stays in scope. None keeps strict whole.
+    """
     # Multi-pass, fixed-point dispatch. Every op in one emission carries the
     # SAME lineage tuple by design (wv-cdb45a/wv-4a05e7's writer contract), so
     # a catalog can legitimately contain a genuine causal CHAIN for one entity
@@ -1423,6 +1461,8 @@ def evaluate(
     # reported (or, under --strict, escalated) exactly as before.
     conn = sqlite3.connect(str(db_path))
     conn.executescript(TOMBSTONES_DDL)
+    since: int | None = _snapshot_lineage(conn) if strict_since == "snapshot" else (
+        strict_since if isinstance(strict_since, int) else None)
     conn.execute("BEGIN")
     seen: dict[str, str] = {}
     results_by_path: dict[str, dict[str, Any]] = {}
@@ -1487,11 +1527,16 @@ def evaluate(
                 # against what already committed this batch. Final.
                 break
             pending = still_pending
-        if not aborted and strict and any(
-            r["disposition"] in ("precondition_conflict", "ambiguous_same_lineage")
-            for r in results_by_path.values()
-        ):
-            aborted = True
+        if not aborted and strict:
+            in_scope = [
+                r for r in results_by_path.values()
+                if r["disposition"] in ("precondition_conflict", "ambiguous_same_lineage")
+                and _in_strict_scope(Path(r["path"]), since)
+            ]
+            if in_scope:
+                aborted = True
+                for r in in_scope:
+                    r["strict_refused"] = True
         lost: list[dict[str, Any]] = [] if aborted else _lost_writes(conn, op_paths, results_by_path)
         if aborted:
             conn.rollback()
@@ -1576,13 +1621,25 @@ def main(argv: list[str]) -> int:
                         help="skip operations whose lineage seq precedes this value")
     parser.add_argument("--strict", action="store_true",
                         help="treat precondition_conflict as a hard failure")
+    parser.add_argument("--strict-since", default=None, metavar="SEQ|snapshot",
+                        help="with --strict, only conflicts of operations at or after this lineage "
+                             "seq abort ('snapshot': the highest lineage the loaded snapshot holds)")
     # Intermixed: wv load passes "db --cutover-seq N ops...". Before Python 3.12
     # parse_args consumed both positionals at the first positional run and then
     # rejected the operations after the option, aborting every cutover replay on
     # 3.11 (wv-9d2036).
     args = parser.parse_intermixed_args(argv)
     operations = list(args.operations) + (_ops_from(args.ops_from) if args.ops_from else [])
-    outcome = evaluate(args.db, operations, cutover_seq=args.cutover_seq, strict=args.strict)
+    since: int | str | None = None
+    if args.strict_since is not None:
+        if args.strict_since == "snapshot":
+            since = "snapshot"
+        elif args.strict_since.isdigit():
+            since = int(args.strict_since)
+        else:
+            parser.error(f"--strict-since takes a lineage seq or 'snapshot', not {args.strict_since!r}")
+    outcome = evaluate(args.db, operations, cutover_seq=args.cutover_seq, strict=args.strict,
+                       strict_since=since)
     outcome["summary"] = _summary(outcome["results"])
     print(json.dumps(outcome, sort_keys=True, separators=(",", ":")))
     return 2 if outcome["aborted"] else 0

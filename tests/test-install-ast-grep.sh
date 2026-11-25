@@ -58,7 +58,9 @@ trap 'rm -rf "$tmp"' EXIT
 # discovery boundary: describe --dirty refreshes an index even with optional
 # locks disabled (wv-6900e1).
 mkdir -p "$tmp/src"
-git -C "$PROJECT_ROOT" ls-files -z | (cd "$PROJECT_ROOT" && tar --null -T - --ignore-failed-read -cf - 2>/dev/null) | tar -x -C "$tmp/src"
+# shellcheck source=tests/lib/copy-tracked.sh
+source "$PROJECT_ROOT/tests/lib/copy-tracked.sh"
+copy_tracked "$PROJECT_ROOT" "$tmp/src" || { echo "could not copy the tracked tree into $tmp/src"; exit 1; }
 git -C "$tmp/src" init -q
 PROJECT_ROOT="$tmp/src"
 cd "$PROJECT_ROOT"
@@ -76,6 +78,12 @@ touch "$lib_dir/weave_quality/default_patterns/prose-number-free-verification.ya
 make_stub "$stub_bin" cargo
 make_stub "$stub_bin" curl
 make_stub "$stub_bin" unzip
+# No python3 link of its own: under the fixed PATH below a Mac finds Apple's
+# /usr/bin/python3 3.9 (Mac run 45343700542), and install.sh's python floor
+# (wv-892318) puts a python >= 3.11 first. WV_PYTHON names the caller's, as a
+# Mac with no Homebrew python would.
+export WV_PYTHON
+WV_PYTHON=$(command -v python3)
 
 export WV_STUB_LOG="$tmp/stub.log"
 touch "$WV_STUB_LOG"
@@ -86,7 +94,13 @@ WV_INSTALL_DIR="$install_dir" \
 WV_LIB_DIR="$lib_dir" \
 WV_CONFIG_DIR="$config_dir" \
 SKIP_AST_GREP=0 \
-bash "$PROJECT_ROOT/install.sh" --no-mcp >"$tmp/default.out" 2>&1
+"$BASH" "$PROJECT_ROOT/install.sh" --no-mcp >"$tmp/default.out" 2>&1 || {
+    # Show why: a Mac run printed only rc=1 (wv-586cc3).
+    rc=$?
+    echo "default install exited $rc; its output (last 40 lines):"
+    tail -40 "$tmp/default.out"
+    exit 1
+}
 
 default_out=$(cat "$tmp/default.out")
 default_calls=$(cat "$WV_STUB_LOG")
@@ -105,7 +119,7 @@ HOME="$home_dir" \
 WV_INSTALL_DIR="$install_dir" \
 WV_LIB_DIR="$lib_dir" \
 WV_CONFIG_DIR="$config_dir" \
-bash "$PROJECT_ROOT/install.sh" --no-mcp --with-ast-grep >"$tmp/optin.out" 2>&1
+"$BASH" "$PROJECT_ROOT/install.sh" --no-mcp --with-ast-grep >"$tmp/optin.out" 2>&1
 rc=$?
 set -e
 

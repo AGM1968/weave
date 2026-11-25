@@ -359,7 +359,7 @@ wv_attempt_emit() {
         parent_json="\"$(wv_json_escape "$_WV_ATTEMPT_PARENT_CALL_ID")\""
 
     line=$(printf '{"format":"%s","event":"%s","ts":"%s","call_id":"%s","parent_call_id":%s,"workflow_id":"%s","trace_id":"%s","source":"%s","repo_root":"%s","operation":"%s","suboperation":"%s","evidence_class":"%s","mutation_targets":%s,"registry_identity":"%s","registry_schema":"%s","policy_identity":"%s","policy_schema":"%s","causal_identity_before":%s%s}' \
-        "$WV_ATTEMPT_JOURNAL_FORMAT" "$event" "$(date +%s.%6N)" \
+        "$WV_ATTEMPT_JOURNAL_FORMAT" "$event" "$(wv_now us)" \
         "$(wv_json_escape "$_WV_ATTEMPT_CALL_ID")" "$parent_json" "$(wv_json_escape "$_WV_ATTEMPT_WORKFLOW_ID")" \
         "$(wv_json_escape "$_WV_ATTEMPT_TRACE_ID")" "$(wv_json_escape "$_WV_ATTEMPT_SOURCE")" \
         "$(wv_json_escape "$_WV_ATTEMPT_REPO_ROOT")" "$(wv_json_escape "$_WV_ATTEMPT_OPERATION")" \

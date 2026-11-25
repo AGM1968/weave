@@ -23,6 +23,8 @@ export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# shellcheck disable=SC1091  # resolved at run time
+source "$ROOT/scripts/lib/wv-lock.sh"  # flock(1) is util-linux; macOS has none (wv-412db3)
 WV="$ROOT/scripts/wv"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; NC='\033[0m'
@@ -99,7 +101,7 @@ SQLITE_LOG="$TEST_DIR/sqlite-calls"
 printf '#!/bin/sh\necho call >> "%s"\nexec %s "$@"\n' "$SQLITE_LOG" "$(command -v sqlite3)" > "$SHIM/sqlite3"
 chmod +x "$SHIM/sqlite3"
 LIB="$TEST_DIR/lib"; mkdir -p "$LIB"
-cp "$ROOT/scripts/lib/wv-db.sh" "$ROOT/scripts/lib/wv-db-lineage.sh" "$LIB/"
+cp "$ROOT/scripts/lib/wv-db.sh" "$ROOT/scripts/lib/wv-db-lineage.sh" "$ROOT/scripts/lib/wv-lock.sh" "$LIB/"
 
 # fresh <snippet> — one new process: source the helpers (wv-db.sh from $LIB,
 # so an edit there is a code change), run the snippet with sqlite3 counted.
@@ -158,7 +160,7 @@ check "a stamp that does not match is migrated again" "1" "$(seeded)"
 fresh "db_ensure >/dev/null 2>&1" >/dev/null
 saved_stamp=$(cat "$WV_DB.ensured")
 unseed; rm -f "$WV_DB.ensured"
-( exec 8>"$WV_HOT_ZONE/.schema.lock"; flock 8; sleep 2; printf '%s\n' "$saved_stamp" > "$WV_DB.ensured" ) &
+( exec 8>"$WV_HOT_ZONE/.schema.lock"; wv_lock_fd 8 -x 10; sleep 2; printf '%s\n' "$saved_stamp" > "$WV_DB.ensured" ) &
 holder=$!
 sleep 0.5
 fresh "db_ensure >/dev/null 2>&1" >/dev/null

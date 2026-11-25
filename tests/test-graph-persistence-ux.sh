@@ -58,12 +58,12 @@ gc add -A && gc commit -qm side
 gc checkout -q main
 
 echo "=== writes publish deltas only ==="
-before=$(find .weave/deltas -name '*.sql' | wc -l)
+before=$(( $(find .weave/deltas -name '*.sql' | wc -l) ))
 ONE=$(add one)
 "$WV" work "$ONE" >/dev/null 2>&1
 "$WV" update "$ONE" --text="one, edited" >/dev/null 2>&1
 "$WV" link "$ONE" "$SEED" --type=relates_to >/dev/null 2>&1
-after=$(find .weave/deltas -name '*.sql' | wc -l)
+after=$(( $(find .weave/deltas -name '*.sql' | wc -l) ))
 check "add, work, update and link leave no tracked graph file dirty" "" "$(tracked_dirt)"
 check "each write published a delta" yes "$([ "$after" -gt "$before" ] && echo yes || echo no)"
 

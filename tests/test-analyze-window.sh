@@ -47,7 +47,7 @@ with open(sys.argv[1], "w", encoding="utf-8") as fh:
 PY
 # Read-only: WV_CALL_LOG points at this fixture, so each wv call would
 # otherwise append its own row and move the very counts under test.
-FIXTURE_ROWS=$(wc -l < "$LOG")
+FIXTURE_ROWS=$(( $(wc -l < "$LOG") ))
 chmod 444 "$LOG"
 echo "analyze window bounding  (fixture: $FIXTURE_ROWS rows, $(du -k "$LOG" | cut -f1)KB, read-only)"
 

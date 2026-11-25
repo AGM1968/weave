@@ -55,8 +55,9 @@ _hc_hot_zone() {
         printf '%s\n' "$WV_HOT_ZONE"
     else
         # Resolver unavailable: the default placement zone (wv-b831e3), by
-        # its legacy name, which is the physical directory (wv-95bddf).
-        printf '/tmp/weave-codex-%s/%s\n' "${UID}" "$repo_hash"
+        # its neutral name, which reaches the zone in both layouts: the real
+        # directory, or the alias of a legacy one (wv-95bddf, wv-97d68a).
+        printf '/tmp/weave-hotzone-%s/%s\n' "${UID}" "$repo_hash"
     fi
 }
 
@@ -136,24 +137,19 @@ _hc_wv() {
     _HC_WV_OUT="" _HC_WV_WAITED="wv $1"
     [ "$left_us" -gt 0 ] || return 124
     secs=$(printf '%d.%03d' $(( left_us / 1000000 )) $(( left_us % 1000000 / 1000 )))
-    if command -v timeout >/dev/null 2>&1; then
-        # -k: a call that ignores TERM is killed a second later, still inside
-        # the host's limit. timeout signals wv's whole process group, so a
-        # flock or sqlite3 it is waiting in goes with it.
-        _HC_WV_OUT=$(timeout -k 1 "$secs" "$WV" "$@" 2>/dev/null) || rc=$?
-        # 124 ends on TERM, 137 on the KILL that follows.
-        [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ] && return 124
+    # One mechanism on every host (wv-ea88cd): wv_bound --group signals wv's
+    # whole process group, so a flock or sqlite3 it waits in, which also
+    # holds this substitution's pipe, goes with it; KILL follows TERM after a
+    # second. The old no-timeout(1) watchdog signalled wv alone, and a child
+    # holding the pipe kept a 2 s budget waiting ~10 s on macOS.
+    if declare -F wv_bound >/dev/null 2>&1; then
+        _HC_WV_OUT=$(wv_bound --group "$secs" "$WV" "$@" 2>/dev/null) || rc=$?
     else
-        # No timeout(1) (macOS without coreutils): a watchdog ends wv instead.
-        _HC_WV_OUT=$(
-            "$WV" "$@" 2>/dev/null & pid=$!
-            ( sleep "$secs"; kill -TERM "$pid" ) >/dev/null 2>&1 & dog=$!
-            wait "$pid"; r=$?
-            kill "$dog" 2>/dev/null
-            exit "$r"
-        ) || rc=$?
-        [ "$rc" -gt 128 ] && [ "$(( _HC_WV_START_US + budget_ms * 1000 ))" -le "$(_hc_now_us)" ] && return 124
+        # wv-resolve-runtime did not load: no bounded call is possible, so
+        # spend the budget as an expiry rather than wait without one.
+        return 124
     fi
+    [ "$rc" -ne 124 ] || return 124
     return "$rc"
 }
 
@@ -220,7 +216,7 @@ _hc_check_read_size() {
     file_path=$(printf '%s' "$tool_input" | jq -r '.file_path // empty' 2>/dev/null)
     limit=$(printf '%s' "$tool_input" | jq -r '.limit // empty' 2>/dev/null)
     [[ -n "$file_path" && -z "$limit" && -f "$file_path" ]] || return 0
-    line_count=$(wc -l < "$file_path" 2>/dev/null || echo "0")
+    line_count=$(( $(wc -l < "$file_path" 2>/dev/null || echo "0") ))
     [[ "$line_count" -gt 500 ]] || return 0
     _hc_observe read_size_budget deny
     jq -n --arg path "$file_path" --arg lines "$line_count" \
@@ -228,7 +224,12 @@ _hc_check_read_size() {
     return 1
 }
 
-# _hc_check_installed_path — hard-block edits to ~/.local/bin or ~/.local/lib/weave.
+# _hc_check_installed_path — hard-block edits to an installed copy: ~/.local/bin,
+# ~/.local/lib/weave, and everything install.sh writes under ~/.config/weave
+# (hooks, lib, skills, agents, procedures, templates, WORKFLOW.md). The user's
+# own config.env, runtime.toml and weave.db there stay editable. Until
+# wv-7ab9d4 a ~/.config/weave edit was refused only by the session
+# checkout's claim, which a file in no checkout no longer meets.
 # Prints an explanation to stderr; returns 2 so caller can: ... || exit $?
 _hc_check_installed_path() {
     local tool="$1" tool_input="$2"
@@ -236,14 +237,21 @@ _hc_check_installed_path() {
     local file_path
     # VS Code sends camelCase (filePath); Claude Code sends snake_case (file_path)
     file_path=$(printf '%s' "$tool_input" | jq -r '.file_path // .filePath // empty' 2>/dev/null)
-    [[ "$file_path" =~ \.local/(bin|lib/weave) ]] || return 0
+    if [[ "$file_path" =~ \.config/weave/ ]]; then
+        [[ "$file_path" =~ \.config/weave/(config\.env|runtime\.toml|weave\.db)$ ]] && return 0
+    elif ! [[ "$file_path" =~ \.local/(bin|lib/weave) ]]; then
+        return 0
+    fi
     _hc_observe edit_source_not_installed_copy deny
     cat >&2 <<EOF
 ERROR: Editing installed copy at $file_path
 Edit the SOURCE file instead:
-  ~/.local/bin/wv          → scripts/wv
-  ~/.local/lib/weave/lib/  → scripts/lib/
-  ~/.local/lib/weave/cmd/  → scripts/cmd/
+  ~/.local/bin/wv            → scripts/wv
+  ~/.local/lib/weave/lib/    → scripts/lib/
+  ~/.local/lib/weave/cmd/    → scripts/cmd/
+  ~/.config/weave/lib/       → scripts/lib/
+  ~/.config/weave/hooks/     → .claude/hooks/
+  ~/.config/weave/ (other)   → templates/ or the matching source install.sh copies
 After editing source, run: ./install.sh
 EOF
     return 2
@@ -528,7 +536,7 @@ _hc_check_stale_node() {
     # Force UTC interpretation (strip a trailing Z first) so timezones ahead of UTC
     # don't make every active node look hours-stale and falsely trip the block.
     local node_epoch stale_id stale_text
-    node_epoch=$(date -d "${node_updated%Z} UTC" +%s 2>/dev/null || echo "0")
+    node_epoch=$(wv_date_epoch "$node_updated" || echo "0")
     stale_id=$(echo "${_HC_ACTIVE_NODES:-[]}" | jq -r '.[0].id' 2>/dev/null || echo "?")
     stale_text=$(echo "${_HC_ACTIVE_NODES:-[]}" | jq -r '.[0].text // "[unknown]"' 2>/dev/null || echo "[unknown]")
 

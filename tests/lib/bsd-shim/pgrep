@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+: "${WV_BSD_SHIM_REAL:=${0%/*}/../real}"  # env -i drops the export; this stand-in sits in bin/ beside real/ (wv-43082a)
+# BSD pgrep/pkill stand-in (wv-f8e26d): no -c count. BSD's -c takes a login
+# class, so 'pgrep -fc PATTERN' spends PATTERN as the class, has no pattern
+# left, prints usage and exits 2 with nothing on stdout: a count captured
+# with || true reads as empty. The tree never uses -c as a class.
+name=${0##*/}
+for a in "$@"; do
+    case "$a" in
+        --) break ;;
+        -[A-Za-z]*c*)
+            echo "usage: $name [-LSfilnoqvx] [-d delim] [-F pidfile] [-G gid] [-M core] [-N system] [-P ppid] [-U uid] [-c class] [-g pgrp] [-j jid] [-s sid] [-t tty] [-u euid] pattern ..." >&2
+            exit 2 ;;
+        -*) ;;
+        *) break ;;
+    esac
+done
+exec "$WV_BSD_SHIM_REAL/$name" "$@"

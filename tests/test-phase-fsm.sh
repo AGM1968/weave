@@ -255,7 +255,7 @@ test_doctor_flags_invalid_phase() {
     local output rc=0
     output=$("$WV" doctor 2>&1) || rc=$?
     # Check for the invalid value itself (not "phase" which may appear in path names)
-    if grep -q "bogus-xphase\|invalid.*phase\|unknown.*phase" <<< "$output"; then
+    if grep -qE "bogus-xphase|invalid.*phase|unknown.*phase" <<< "$output"; then
         echo -e "  ${GREEN}[PASS]${NC} wv doctor flags invalid phase value"
         TESTS_RUN=$((TESTS_RUN + 1))
         TESTS_PASSED=$((TESTS_PASSED + 1))

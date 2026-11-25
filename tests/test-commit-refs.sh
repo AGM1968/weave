@@ -509,7 +509,7 @@ BULK_RC=$?
 set -e
 assert_equals "0" "$BULK_RC" "--all --json exits 0 on a graph large enough to blow the old arg limit"
 assert_equals "2500" "$(echo "$BULK_OUT" | jq -r '.refs | length' 2>/dev/null)" "every seeded ref is present in the JSON"
-if [ "$(printf '%s' "$BULK_OUT" | wc -c)" -gt 131072 ]; then
+if [ "$(( $(printf '%s' "$BULK_OUT" | wc -c) ))" -gt 131072 ]; then
     echo -e "  ${GREEN}✓${NC} payload exceeds the 128KB per-argument limit that used to break it"
     TESTS_PASSED=$((TESTS_PASSED + 1))
 else
@@ -533,13 +533,15 @@ if [ -s "$TEST_DIR/big.json" ]; then
     slurp_rc=$?
     set -e
     assert_equals "0" "$slurp_rc" "a 200KB payload passes through --slurpfile"
+    # macOS has no per-argument limit (MAX_ARG_STRLEN is Linux's), so there
+    # the control cannot fire: a skip, not a failed test (wv-7551b6).
     if [ "$argjson_rc" -eq 0 ]; then
-        echo -e "  ${YELLOW}-${NC} this platform accepts a 200KB argv entry; the E2BIG control is inert here"
+        echo -e "  ${YELLOW}-${NC} this platform accepts a 200KB argv entry; the E2BIG control is inert here (skipped)"
     else
         echo -e "  ${GREEN}✓${NC} the same payload through --argjson fails (E2BIG), which is why composers use files"
         TESTS_PASSED=$((TESTS_PASSED + 1))
+        TESTS_RUN=$((TESTS_RUN + 1))
     fi
-    TESTS_RUN=$((TESTS_RUN + 1))
 fi
 # The structural rule that no composer passes a payload through --argjson lives
 # in tests/test-argjson-payload.sh: the grep that stood here read one module and

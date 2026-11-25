@@ -27,7 +27,7 @@ printf '#!/bin/bash\necho "Violation vocabulary: PASS"\n' > "$TMP/tests/test-vio
 # run_one <mode> <filter> -> the copied aggregate's output for that one suite.
 # Both modes print their own per-suite line; the release --verify runs the
 # parallel one, which printed a no-count suite as 0/0 (wv-0be4c5).
-run_one() { (cd "$TMP" && bash tests/run-all.sh "$1" --suite="$2" 2>&1 | sed 's/\x1b\[[0-9;]*m//g'); }
+run_one() { (cd "$TMP" && bash tests/run-all.sh "$1" --suite="$2" 2>&1 | LC_ALL=C sed $'s/\e\\[[0-9;]*m//g'); }
 
 for mode in --serial --parallel; do
     out=$(run_one "$mode" test-policy-cells)

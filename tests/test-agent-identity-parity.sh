@@ -70,20 +70,24 @@ python_recognizes_local() {
     # and the poetry indirection made this suite fail in any environment that
     # ships the tests without the development toolchain -- which is every
     # consumer of the public projection.
-    PYTHONPATH="$REPO_ROOT/scripts" python3 - "$1" <<'PY' 2>/dev/null
+    # Python sees the host and user that resolve_agent_id() read (hostname,
+    # whoami), not parts split back out of the identity: a hostname may hold
+    # hyphens (macOS runners: Mac-...-6A841F8F983F.local), and splitting on
+    # "-" then mocked a host python never has (wv-d71756).
+    local host user
+    host=$(hostname 2>/dev/null || echo "host")
+    user=$(whoami 2>/dev/null || echo "user")
+    PYTHONPATH="$REPO_ROOT/scripts" python3 - "$1" "$host" "$user" <<'PY' 2>/dev/null
 import sys
 from unittest.mock import patch
 import subprocess
 from weave_gh.phases import _desired_assignee_for_node, _current_gh_login
 from weave_gh.models import WeaveNode
 
-claimed_by = sys.argv[1]
+claimed_by, host, user = sys.argv[1:4]
 _current_gh_login.cache_clear()
 node = WeaveNode(id="wv-test", text="t", status="active", metadata={"claimed_by": claimed_by})
 ok = subprocess.CompletedProcess([], returncode=0, stdout="octocat\n", stderr="")
-import re
-base = re.sub(r"-(?:h[0-9a-f]{16}|s[A-Za-z0-9]{1,12})$", "", claimed_by)  # session suffix (wv-99978b, wv-24d57b)
-host, user = base.rsplit("-", 2)[-2:] if base.count("-") >= 2 else (base, "")
 with patch("weave_gh.phases.socket.gethostname", return_value=host), \
      patch("weave_gh.phases.getpass.getuser", return_value=user), \
      patch("weave_gh.phases._run", return_value=ok):
@@ -297,6 +301,29 @@ for envstr in "" "COPILOT_AGENT=1" "CLAUDECODE=1 WV_SESSION_IDENTITY=0" "CLAUDEC
         fail "require_agent_id admits an actor-owned identity (${envstr:-human})"
     fi
 done
+
+echo ""
+echo "Test: hyphenated, dotted, mixed-case hostname (wv-d71756, macOS runner shape)"
+echo "=============================================================================="
+
+HOST_SHIM=$(mktemp -d)
+printf '#!/bin/sh\necho Mac-Mini-6A841F8F983F.local\n' > "$HOST_SHIM/hostname"
+chmod +x "$HOST_SHIM/hostname"
+for envstr in "CLAUDECODE=1" "CLAUDECODE=1 CLAUDE_CODE_SESSION_ID=e2bbbaf2-606c-462b-8c2e-2d4305df0616"; do
+    # shellcheck disable=SC2086  # envstr is a controlled, script-local word list
+    ident=$(PATH="$HOST_SHIM:$PATH" bash_identity $envstr)
+    case "$ident" in
+        claude-Mac-Mini-6A841F8F983F.local-*) : ;;
+        *) fail "sanity: bash used the shimmed hostname" "got: $ident"; continue ;;
+    esac
+    recognized=$(PATH="$HOST_SHIM:$PATH" python_recognizes_local "$ident")
+    if [ "$recognized" = "true" ]; then
+        pass "python recognizes '$ident' as local"
+    else
+        fail "python recognizes '$ident' as local" "got: $recognized"
+    fi
+done
+rm -rf "$HOST_SHIM"
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Summary

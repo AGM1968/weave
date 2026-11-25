@@ -125,8 +125,8 @@ cmd_analyze_sessions() {
     if [ -n "$since_raw" ]; then
         case "$since_raw" in
             ''|*[!0-9.]*)
-                if ! since_epoch=$(date -d "$since_raw" +%s 2>/dev/null); then
-                    echo "wv analyze: invalid --since value: '$since_raw' (use YYYY-MM-DD or epoch seconds)" >&2
+                if ! since_epoch=$(wv_date_epoch "$since_raw"); then
+                    echo "wv analyze: invalid --since value: '$since_raw' (use YYYY-MM-DD, an ISO time in UTC, or epoch seconds)" >&2
                     return 1
                 fi
                 ;;
@@ -379,8 +379,11 @@ cmd_analyze_gates() {
     suite_log=$(_suite_log_path)
     gate_log=$(_gate_log_path)
     mode=$(wv_resolve_mode)
-    local cur_repo=""
-    cur_repo=$(basename "${REPO_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || echo "")}" 2>/dev/null || true)
+    # The repository's identity over rows re-keyed by _repo_log_view, as in
+    # wv analyze suites (wv-1e4c01).
+    local cur_repo="" cur_dir=""
+    cur_dir="${REPO_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || echo "")}"
+    [ -z "$cur_dir" ] || cur_repo=$(_repo_identity "$cur_dir")
     for arg in "$@"; do
         case "$arg" in
             --json)       want_json=1 ;;
@@ -398,6 +401,12 @@ cmd_analyze_gates() {
                 echo "  Suite runs recorded before gate records existed are grouped by commit"
                 echo "  and reported separately as approximate. Provisioning counts each route's"
                 echo "  mode (frozen or checkout) from the newest gate record that names it."
+                echo "  Attempts until green (pre-commit, pre-push): a series is the gates of one"
+                echo "  phase on one sha, closed by the first pass; per series and per ISO week it"
+                echo "  reports attempts, gate time to green and refused wall hours. Series whose"
+                echo "  every gate names its tree split extra attempts into same-tree retries and"
+                echo "  fix iterations (the staged tree changed). On pre-push a fix makes a new"
+                echo "  tip sha, so a refused push shows as an unresolved series, not an attempt."
                 echo "  Host pressure: gates recorded with PSI stall deltas report the share of"
                 echo "  wall time some task stalled on CPU and on IO (p50/p90); the gate's own"
                 echo "  suites contend too, so a share is host load including the gate."
@@ -416,8 +425,15 @@ cmd_analyze_gates() {
     local repo_filter=""
     [ "$all_repos" = "0" ] && repo_filter="$cur_repo"
 
-    local result
-    result=$(python3 - "$suite_log" "$gate_log" "$repo_filter" "$since" "$max_stall" <<'PYEOF'
+    local result view_suite="$suite_log" view_gate="$gate_log" view_dir=""
+    if [ -n "$repo_filter" ]; then
+        view_dir=$(mktemp -d "${TMPDIR:-/tmp}/wv-gate-view.XXXXXX") || return 1
+        view_suite="$view_dir/suite_runs.jsonl" view_gate="$view_dir/gate_runs.jsonl"
+        if ! _repo_log_view "$suite_log" "$view_suite" "$cur_dir" || ! _repo_log_view "$gate_log" "$view_gate" "$cur_dir"; then
+            rm -rf "$view_dir"; return 1
+        fi
+    fi
+    result=$(python3 - "$view_suite" "$view_gate" "$repo_filter" "$since" "$max_stall" <<'PYEOF'
 import json, math, os, sys
 from collections import defaultdict
 
@@ -597,12 +613,77 @@ provisioning = {
     "checkout": len(checkout_routes), "checkout_routes": checkout_routes,
     "gates_recorded": recorded, "gates_without_record": len(gates) - recorded,
 }
-print(json.dumps({"phases": phases, "estimate_misses": worst, "approximate_by_commit": approx,
+# Cycle metric (wv-c60fbf): attempts until the first green gate. A series is
+# the run of gates of one phase on one sha (the parent for pre-commit, the
+# pushed tip for pre-push), closed by its first passing gate; a series never
+# closed in the window is counted as unresolved, not timed. The tree each gate
+# judged (wv-abc855) splits a series' extra attempts into same-tree retries
+# (nothing changed, so a flake or the environment) and fix iterations (the
+# staged tree changed). Series with a gate that names no tree are counted but
+# left out of that split, never guessed.
+def iso_week(ts):
+    try:
+        from datetime import datetime
+        y, w, _ = datetime.strptime(str(ts)[:10], "%Y-%m-%d").isocalendar()
+        return "%d-W%02d" % (y, w)
+    except ValueError:
+        return "unknown"
+
+def cycle_figures(series):
+    green = [s for s in series if s["green"]]
+    attempts = [len(s["gates"]) for s in green]
+    gate_ms = [sum(int(g.get("duration_ms") or 0) for g in s["gates"]) for s in green]
+    elapsed = []
+    for s in green:
+        first, last = s["gates"][0], s["gates"][-1]
+        if num(first.get("started_ms")) is not None and num(last.get("started_ms")) is not None:
+            elapsed.append(int(last["started_ms"]) + int(last.get("duration_ms") or 0) - int(first["started_ms"]))
+    bound = [s for s in green if all(g.get("tree") for g in s["gates"])]
+    retries = sum(len(s["gates"]) - len({g["tree"] for g in s["gates"]}) for s in bound)
+    fixes = sum(len({g["tree"] for g in s["gates"]}) - 1 for s in bound)
+    refused = [g for s in series for g in s["gates"] if int(g.get("exit") or 0) != 0]
+    return {
+        "series": len(series), "green": len(green), "unresolved": len(series) - len(green),
+        "multi_attempt": sum(1 for a in attempts if a > 1),
+        "attempts_p50": pct(attempts, 0.5), "attempts_p90": pct(attempts, 0.9),
+        "gate_to_green_p50_s": secs(pct(gate_ms, 0.5)), "gate_to_green_p90_s": secs(pct(gate_ms, 0.9)),
+        "elapsed_to_green_p50_s": secs(pct(elapsed, 0.5)), "elapsed_to_green_p90_s": secs(pct(elapsed, 0.9)),
+        "refused_gates": len(refused),
+        "refused_wall_h": round(sum(int(g.get("duration_ms") or 0) for g in refused) / 3600000, 1),
+        "tree_bound_series": len(bound), "same_tree_retries": retries, "fix_iterations": fixes,
+    }
+
+def cycles_for(phase_gates):
+    open_by_key, series = {}, []
+    for g in sorted(phase_gates, key=lambda x: str(x.get("ts", ""))):
+        key = (str(g.get("repo", "")), str(g.get("sha", "")))
+        s = open_by_key.get(key)
+        if s is None:
+            s = {"gates": [], "green": False}
+            open_by_key[key] = s
+            series.append(s)
+        s["gates"].append(g)
+        if int(g.get("exit") or 0) == 0:
+            s["green"] = True
+            del open_by_key[key]
+    weeks = defaultdict(list)
+    for s in series:
+        weeks[iso_week(s["gates"][-1].get("ts"))].append(s)
+    return {**cycle_figures(series),
+            "weeks": [{"week": w, **cycle_figures(weeks[w])} for w in sorted(weeks)]}
+
+cycles = {p: cycles_for(by_phase[p]) for p in ("pre-commit", "pre-push") if by_phase.get(p)}
+
+print(json.dumps({"phases": phases, "cycles": cycles, "estimate_misses": worst, "approximate_by_commit": approx,
                   "provisioning": provisioning, "costly_lanes": costly_lanes, "stall_filter": stall_filter,
                   "gate_log": gate_log, "suite_log": suite_log,
                   "repo": repo_filter or "ALL", "since": since or None}))
 PYEOF
-    ) || return 1
+    ) || { [ -z "$view_dir" ] || rm -rf "$view_dir"; return 1; }
+    if [ -n "$view_dir" ]; then
+        rm -rf "$view_dir"
+        result=$(jq -c --arg s "$suite_log" --arg g "$gate_log" '.suite_log = $s | .gate_log = $g' <<< "$result") || return 1
+    fi
 
     if [ -n "$want_json" ]; then
         echo "$result"
@@ -617,6 +698,12 @@ PYEOF
                (if (.pressure_gates // 0) > 0 then "\n    host stall over \(.pressure_gates) gates: CPU p50 \(.cpu_stall_p50 * 100 | floor)% p90 \(.cpu_stall_p90 * 100 | floor)%, IO p50 \(.io_stall_p50 * 100 | floor)% p90 \(.io_stall_p90 * 100 | floor)% of wall" else "" end) +
                ([(.lane_schedulers // [])[] | "\n    candidate lanes (\(.scheduler)) in \(.lane_gates) gates: lanes p50 \(.lanes_p50_s)s p90 \(.lanes_p90_s)s, \((.lanes_share_of_wall // 0) * 100 | floor)% of their wall; protected pass p50 \(.protected_p50_s)s p90 \(.protected_p90_s)s"] | join(""))) end),
         "",
+        (if (.cycles | length) > 0 then "Attempts until the first green gate (series of gates on one sha, closed by a pass):",
+            (.cycles | to_entries[] | .key as $p | .value |
+                "  \($p): \(.series) series, \(.multi_attempt) needed more than one gate, \(.unresolved) unresolved; attempts p50 \(.attempts_p50) p90 \(.attempts_p90); gate time to green p50 \(.gate_to_green_p50_s)s p90 \(.gate_to_green_p90_s)s; refused \(.refused_gates) gates, \(.refused_wall_h) wall hours" +
+                (if .tree_bound_series > 0 then "\n    over \(.tree_bound_series) tree-bound series: \(.same_tree_retries) same-tree retries, \(.fix_iterations) fix iterations" else "" end) +
+                ([.weeks[] | "\n    \(.week): \(.series) series, \(.multi_attempt) multi-gate, to green p50 \(.gate_to_green_p50_s)s p90 \(.gate_to_green_p90_s)s, refused \(.refused_wall_h)h"] | join(""))),
+            "" else empty end),
         (if (.costly_lanes | length) > 0 then "Candidate lanes costing most (total over the window):",
             (.costly_lanes[] | "  \(.path) \(.total_s)s over \(.runs) lanes, \(.reran) reran their suites"), "" else empty end),
         "Suites whose estimates miss worst (actual/estimate, p50):",
@@ -643,16 +730,19 @@ cmd_analyze_suites() {
     local mode want_json="" all_repos=0
     mode=$(wv_resolve_mode)
 
-    # Default repo filter: basename of current repo root.
-    local cur_repo=""
-    cur_repo=$(basename "${REPO_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || echo "")}" 2>/dev/null || true)
+    # Default repo filter: the repository's identity, one for all of its
+    # worktrees, over rows re-keyed by _repo_log_view (wv-1e4c01). --repo
+    # names one key exactly, as before.
+    local cur_repo="" cur_dir="" repo_named=0
+    cur_dir="${REPO_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || echo "")}"
+    [ -z "$cur_dir" ] || cur_repo=$(_repo_identity "$cur_dir")
 
     for arg in "$@"; do
         case "$arg" in
             --log=*)    log_path="${arg#--log=}" ;;
             --json)     want_json=1 ;;
             --all)      all_repos=1 ;;
-            --repo=*)   cur_repo=$(basename "${arg#--repo=}") ;;
+            --repo=*)   cur_repo=$(basename "${arg#--repo=}"); repo_named=1 ;;
             --help|-h)
                 echo "Usage: wv analyze suites [--log=<path>] [--repo=<path>] [--all] [--json]"
                 echo ""
@@ -687,8 +777,13 @@ cmd_analyze_suites() {
         return 0
     fi
 
-    local result
-    result=$(python3 - "$log_path" "$repo_filter" <<'PYEOF'
+    local result view_log="$log_path" view_tmp=""
+    if [ -n "$repo_filter" ] && [ "$repo_named" = 0 ]; then
+        view_tmp=$(mktemp "${TMPDIR:-/tmp}/wv-suite-view.XXXXXX") || return 1
+        _repo_log_view "$log_path" "$view_tmp" "$cur_dir" || { rm -f "$view_tmp"; return 1; }
+        view_log=$view_tmp
+    fi
+    result=$(python3 - "$view_log" "$repo_filter" <<'PYEOF'
 import json, math, sys
 from collections import defaultdict
 
@@ -696,7 +791,8 @@ log_path = sys.argv[1]
 repo_filter = sys.argv[2]   # empty string = show all repos
 agg = defaultdict(lambda: {"runs": 0, "passed": 0, "failed": 0,
                            "total_ms": 0, "_durs": [], "_mono": [], "_legacy": [],
-                           "last_ts": "", "last_sha": ""})
+                           "last_ts": "", "last_sha": "",
+                           "_trees": defaultdict(set), "_by_sha": defaultdict(list)})
 
 def p95(vals):
     if not vals:
@@ -735,6 +831,12 @@ try:
                 elif clock is None:
                     a["_legacy"].append(dur)
             ts = str(e.get("ts", ""))
+            # The tree a run judged (wv-abc855). Rows from before it carry none
+            # and are left out of the flake split rather than guessed at.
+            tree = e.get("tree")
+            if isinstance(tree, str) and tree:
+                a["_trees"][tree].add(ok)
+                a["_by_sha"][str(e.get("sha", ""))].append((ts, tree, ok))
             if ts >= a["last_ts"]:           # ISO-8601 sorts lexicographically
                 a["last_ts"] = ts
                 a["last_sha"] = str(e.get("sha", ""))
@@ -745,10 +847,37 @@ except OSError as exc:
 def median(vals):
     return sorted(vals)[len(vals) // 2] if vals else 0
 
+def flake_split(a):
+    """(tree_runs, flaky_trees, fixed_recommits) for one suite.
+
+    flaky_trees: trees that both passed and failed: the same bytes, two
+    outcomes. fixed_recommits: failing trees on a commit base that a later
+    run of a different tree on the same base passed, with the failing tree
+    never passing itself: a fix, not a flake (wv-abc855).
+    """
+    tree_runs = sum(len(v) for v in a["_by_sha"].values())
+    flaky = {t for t, outcomes in a["_trees"].items() if len(outcomes) == 2}
+    fixed = set()
+    for rows in a["_by_sha"].values():
+        rows.sort()
+        for i, (_, tree, ok) in enumerate(rows):
+            # A failing tree that is not flaky never passed, so any later pass
+            # on this base came from a different tree.
+            if ok or tree in flaky:
+                continue
+            if any(later_ok for _, _, later_ok in rows[i + 1:]):
+                fixed.add(tree)
+    return tree_runs, len(flaky), len(fixed)
+
 suites = []
 total_runs = 0
+totals = {"tree_runs": 0, "flaky_trees": 0, "fixed_recommits": 0}
 for suite, a in agg.items():
     total_runs += a["runs"]
+    tree_runs, flaky_trees, fixed_recommits = flake_split(a)
+    totals["tree_runs"] += tree_runs
+    totals["flaky_trees"] += flaky_trees
+    totals["fixed_recommits"] += fixed_recommits
     # A suite with any monotonic run is estimated from those alone; one with
     # none yet falls back to its unlabelled history until it has one, so the
     # cutover does not make every suite look unmeasured (launched first).
@@ -774,12 +903,19 @@ for suite, a in agg.items():
         "estimate_basis": basis,
         "last_ts": a["last_ts"],
         "last_sha": a["last_sha"],
+        "tree_runs": tree_runs,
+        "flaky_trees": flaky_trees,
+        "fixed_recommits": fixed_recommits,
     })
 suites.sort(key=lambda s: s["total_ms"], reverse=True)   # heaviest first
 print(json.dumps({"suites": suites, "total_runs": total_runs, "log_path": log_path,
-                  "repo": repo_filter if repo_filter else "ALL"}))
+                  "repo": repo_filter if repo_filter else "ALL", "flake_split": totals}))
 PYEOF
-    ) || return 1
+    ) || { [ -z "$view_tmp" ] || rm -f "$view_tmp"; return 1; }
+    if [ -n "$view_tmp" ]; then
+        rm -f "$view_tmp"
+        result=$(jq -c --arg l "$log_path" '.log_path = $l' <<< "$result") || return 1
+    fi
 
     if [ -n "$want_json" ]; then
         echo "$result"
@@ -809,6 +945,13 @@ data = json.load(sys.stdin)
 for r in data['suites']:
     print(f\"{r['suite']:<28} {r['runs']:>6} {r['passed']:>6} {r['failed']:>6} \"
           f\"{r['total_ms']:>12,} {r['avg_ms']:>12,} {r['p95_ms']:>12,}\")
+"
+    echo "$result" | python3 -c "
+import json, sys
+t = json.load(sys.stdin).get('flake_split', {})
+if t.get('tree_runs'):
+    print(f\"\nFlake split over {t['tree_runs']} tree-bound runs: \"
+          f\"{t['flaky_trees']} flaky tree(s), {t['fixed_recommits']} fixed recommit(s)\")
 "
     printf "\nLog: %s\n" "$log_path"
 }

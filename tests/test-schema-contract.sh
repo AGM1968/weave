@@ -204,7 +204,7 @@ KNOWN_FILE="$TEST_DIR/known_tables"
 if grep -qxF "nodes" "$KNOWN_FILE" && grep -qxF "scan_meta" "$KNOWN_FILE"; then
     pass "known-tables set contains both schemas (nodes + scan_meta)"
 else
-    fail "known-tables set contains both schemas (nodes + scan_meta)" "$(wc -l < "$KNOWN_FILE") names collected"
+    fail "known-tables set contains both schemas (nodes + scan_meta)" "$(( $(wc -l < "$KNOWN_FILE") )) names collected"
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════

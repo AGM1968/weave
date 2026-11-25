@@ -15,6 +15,10 @@
     "@GUARD@": "libs[hook.lib].guard",
     "@EVENT@": "hook.events[0]"
   },
+  "preamble": {
+    "file": "scripts/lib/wv-bash-guard.sh",
+    "reason": "Every hook opens with the bash guard (wv-7257a8): harness hooks run by path, and on macOS /bin/bash is 3.2, so a hook re-executes under a bash >= 4 or refuses. The guard is read from this one master file, never copied into the templates; tests/test-bash-guard.sh checks each copy byte for byte."
+  },
   "libs": {
     "wv-pre-tool-use.sh": {
       "loop_var": "_ptu_dir",

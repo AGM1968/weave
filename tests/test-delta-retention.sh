@@ -16,6 +16,8 @@ export WV_CALL_SOURCE=test
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# shellcheck disable=SC1091  # resolved at run time
+source "$REPO_ROOT/scripts/lib/wv-lock.sh"  # flock(1) is util-linux; macOS has none (wv-412db3)
 WV="$REPO_ROOT/scripts/wv"
 
 T=$(mktemp -d)
@@ -133,7 +135,7 @@ copy() {
 
 echo "--- fixture ---"
 check "fixture has 6 header-less pre-marker-dir files, a marker and a tombstone" \
-    test "$(git ls-files '.weave/deltas/2026-08-01/*.sql' | wc -l)" -eq 6 -a -f "$FIX/.weave/causal-cutover"
+    test "$(( $(git ls-files '.weave/deltas/2026-08-01/*.sql' | wc -l) ))" -eq 6 -a -f "$FIX/.weave/causal-cutover"
 copy probe
 check "fixture load reports the lost write" bash -c "'$WV' load 2>&1 | grep -q 'lost a conflict on the same field'"
 check "fixture holds the tombstone" test "$(sqlite3 "$(db)" "SELECT COUNT(*) FROM tombstones WHERE id='$N_DEL';")" -eq 1
@@ -234,7 +236,7 @@ copy r-reserved; "$WV" update "$N_KEEP" --metadata='{"e5_reserved":true}' >/dev/
 gitc add -A; gitc commit -qm "reserve" >/dev/null
 refuses "an open E5 reservation"
 copy r-locked; mkdir -p "$(maint)"
-( exec 9>>"$(maint)/lock"; flock -s 9; sleep 30 ) & holder=$!
+( exec 9>>"$(maint)/lock"; wv_lock_fd 9 -s 10; sleep 30 ) & holder=$!
 sleep 0.5
 refuses "the lock held shared by another process"
 kill "$holder" 2>/dev/null; wait "$holder" 2>/dev/null
@@ -311,7 +313,7 @@ plant "sidecar-only top seq" "$(git ls-files '.weave/deltas/2026-09-11/v2/*.json
 echo "--- 4. coordination ---"
 # A local edit not yet published: the sync below has something to publish.
 copy k; WV_AUTO_SYNC=0 "$WV" update "$N_KEEP" --text="pending local edit" >/dev/null 2>&1
-before_files=$(git ls-files -o --exclude-standard .weave | wc -l)
+before_files=$(( $(git ls-files -o --exclude-standard .weave | wc -l) ))
 touch "$T/pause"
 ( WV_TEST_MODE=1 WV_TEST_COMPACT_PAUSE_FILE="$T/pause" "$WV" compact --pre-cutover >"$T/k.out" 2>&1; echo $? > "$T/k.rc" ) &
 for _ in $(seq 300); do [ -e "$T/pause.paused" ] && break; sleep 0.1; done
@@ -319,7 +321,7 @@ check "compaction is paused under its lock" test -e "$T/pause.paused"
 ( "$WV" sync >"$T/k-sync.out" 2>&1; echo $? > "$T/k-sync.rc" ) &
 sleep 2
 check "wv sync waits while compaction holds the lock" test ! -e "$T/k-sync.rc"
-check "nothing was published meanwhile" test "$(git ls-files -o --exclude-standard .weave | wc -l)" -eq "$before_files"
+check "nothing was published meanwhile" test "$(( $(git ls-files -o --exclude-standard .weave | wc -l) ))" -eq "$before_files"
 rm -f "$T/pause"
 for _ in $(seq 600); do [ -e "$T/k.rc" ] && [ -e "$T/k-sync.rc" ] && break; sleep 0.1; done
 check "compaction then commits (rc=$(cat "$T/k.rc" 2>/dev/null))" test "$(cat "$T/k.rc" 2>/dev/null)" = 0
@@ -327,7 +329,7 @@ check "the compaction commit holds no writer's files" bash -c \
     "git show --name-status --format= HEAD | grep -v '^D' | grep -v '.weave/compaction/' | grep -q . && exit 1 || exit 0"
 check "the waiting sync completes after it (rc=$(cat "$T/k-sync.rc" 2>/dev/null))" test "$(cat "$T/k-sync.rc" 2>/dev/null)" = 0
 copy k2; mkdir -p "$(maint)"
-( exec 9>>"$(maint)/lock"; flock -s 9; sleep 30 ) & holder=$!
+( exec 9>>"$(maint)/lock"; wv_lock_fd 9 -s 10; sleep 30 ) & holder=$!
 sleep 0.5
 refuses "while another process holds the lock shared"
 kill "$holder" 2>/dev/null; wait "$holder" 2>/dev/null
@@ -354,9 +356,11 @@ crash() {
 }
 crash i1
 check "the killed compaction left its pending record and manifest" test -f "$(maint)/pending.json" -a -n "$CRASH_MANIFEST"
-check "...and half the removals" test "$(git ls-files -d | wc -l)" -eq 2
+check "...and half the removals" test "$(( $(git ls-files -d | wc -l) ))" -eq 2
 check "...and no commit" test "$(git rev-parse HEAD)" = "$FIX_HEAD"
-check "...and released its lock" flock -x -n "$(maint)/lock" true
+# Through wv_lock_fd, the mechanism the product uses (flock(1), else python3
+# fcntl): flock(1) is util-linux, absent on macOS (wv-412db3).
+check "...and released its lock" bash -c '. "$1/scripts/lib/wv-lock.sh"; exec 9>>"$2"; wv_lock_fd 9 -x 0' _ "$REPO_ROOT" "$(maint)/lock"
 # The fence: every writer and capture-start refuses before recovery.
 "$WV" update "$N_KEEP" --text="edit during crash" >/dev/null 2>&1
 rc=0; out=$("$WV" sync 2>&1) || rc=$?

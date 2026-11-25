@@ -39,6 +39,10 @@ TESTS_FAILED=0
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# The product's md5sum (wv-resolve-runtime.sh, side-effect free): the repo hash a
+# product path is keyed on, the same on macOS, which has no md5sum(1) (wv-ef5621).
+# shellcheck disable=SC1091  # resolved at run time
+source "$PROJECT_ROOT/scripts/lib/wv-resolve-runtime.sh"
 WV="$PROJECT_ROOT/scripts/wv"
 
 TEST_DIR="/tmp/wv-doctor-hzshadow-fixture-$$"
@@ -204,21 +208,32 @@ test_zone_names() {
     l="$TEST_DIR/z/tmp/weave-codex-$uid"
     mkdir -p "$TEST_DIR/z/tmp"
 
+    # The two /tmp names are Linux placement; on macOS the zone is under
+    # $TMPDIR and doctor skips this check by design (wv-cmd-doctor.sh
+    # _doctor_check_hot_zone_names). Assert that, not the Linux cases (wv-f8e26d).
+    case "${OSTYPE:-}" in darwin*)
+        echo "-- zone names: darwin"
+        mkdir -m 700 "$l"
+        assert_equals "" "$(names_record)" "PASS: doctor reports no /tmp zone names on macOS"
+        rmdir "$l"
+        return 0 ;;
+    esac
+
     echo "-- zone names: neither exists"
     out=$(names_record)
-    assert_equals "pass|neither $n nor $l exists; first use creates $l and the alias $n" "$out" \
-        "PASS: doctor says what first use creates"
+    assert_equals "pass|neither $n nor $l is a zone; first use creates $n and the fence link $l" "$out" \
+        "PASS: doctor says what first use creates (wv-97d68a)"
 
     echo "-- zone names: legacy directory only"
     mkdir -m 700 "$l"
     out=$(names_record)
-    assert_equals "pass|physical: $l (legacy name); the alias $n is added on the next wv call that opens the zone" "$out" \
+    assert_equals "pass|physical: $l (legacy layout); the alias $n is added on the next wv call that opens the zone. To relocate: wv hotzone migrate, in a quiet window" "$out" \
         "PASS: doctor names the legacy directory physical"
 
     echo "-- zone names: the alias"
     ln -s "$l" "$n"
     out=$(names_record)
-    assert_equals "pass|physical: $l (legacy name, kept while hosts run mixed versions); $n is an alias of it" "$out" \
+    assert_equals "pass|physical: $l (legacy layout); $n is an alias of it. To relocate: wv hotzone migrate, in a quiet window" "$out" \
         "PASS: doctor reports both names and the physical one"
 
     echo "-- zone names: an alias with a trailing slash, which the guard refuses (wv-9d2cd2)"
@@ -227,10 +242,10 @@ test_zone_names() {
     assert_equals "warn|$n is a symlink to $l/, not $l; wv refuses it as a hot-zone base" "$out" \
         "WARN: doctor agrees with the guard about an inexact target"
 
-    echo "-- zone names: an alias whose target is absent, which first use recreates (wv-9d2cd2)"
+    echo "-- zone names: an alias whose target is absent, which first use replaces (wv-9d2cd2, wv-97d68a)"
     rm "$n"; ln -s "$l" "$n"; rmdir "$l"
     out=$(names_record)
-    assert_equals "pass|$n is an alias of $l, which is absent; the next wv call that opens the zone recreates it as the physical directory" "$out" \
+    assert_equals "pass|$n is an alias of $l, which is absent; the next wv call that opens the zone makes $n the physical directory" "$out" \
         "PASS: doctor agrees with the guard about a dangling alias"
     mkdir -m 700 "$l"
 
@@ -243,7 +258,15 @@ test_zone_names() {
     echo "-- zone names: neutral directory only"
     rm "$n"; rmdir "$l"; mkdir -m 700 "$n"
     out=$(names_record)
-    assert_equals "pass|physical: $n; legacy name $l absent" "$out" "PASS: doctor names the neutral directory physical"
+    assert_equals "pass|physical: $n; legacy name $l absent (the next wv call that opens the zone adds its fence link)" "$out" \
+        "PASS: doctor names the neutral directory physical"
+
+    echo "-- zone names: neutral directory with its legacy fence link (wv-97d68a)"
+    ln -s "$n" "$l"
+    out=$(names_record)
+    assert_equals "pass|physical: $n; legacy name $l is its fence link (wv-97d68a)" "$out" \
+        "PASS: doctor names the fence link"
+    rm "$l"
 
     echo "-- zone names: two directories, neither populated (wv-9d2cd2)"
     mkdir -m 700 "$l"

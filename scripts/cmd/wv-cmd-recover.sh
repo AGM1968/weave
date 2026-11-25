@@ -21,7 +21,10 @@
 cmd_recover() {
     _WV_RECOVER_CLOSE_DECIDED=false
     local rc=0
-    _recover_run "$@" || rc=$?
+    case " $* " in
+        *" --reproject "*) _recover_reproject "$@" || rc=$? ;;
+        *) _recover_run "$@" || rc=$? ;;
+    esac
     # Only the recover operation records it: init runs recovery as a side
     # effect of rehydrating, where this rule is not the call's to decide.
     [ "$_WV_RECOVER_CLOSE_DECIDED" = true ] || [ "${_WV_ATTEMPT_OPERATION:-recover}" != "recover" ] ||
@@ -286,6 +289,91 @@ _recover_run() {
     fi
 }
 
+# _recover_reproject [--json] [--event=NAME] — re-project the committed graph
+# snapshot after a rebase or merge kept another copy's (wv-6729a0). The graph
+# decides: the projection verdict (wv_projection_lag) must say the snapshot
+# lags the operations committed with it. Then wv load and wv sync rebuild it
+# (serialized_to_weave), and graph state alone is committed as a new commit
+# (git_committed_local); a commit holding code is never rewritten. Deferred,
+# with the reason, while a gate holds the checkout (wv_auto_commit_enabled),
+# while a pending autostash holds .weave/ changes the rebuild would collide
+# with, or while files outside graph state are staged. Called by the
+# post-rewrite and post-merge hooks, which only ask; pre-push stays the backstop.
+_recover_reproject() {
+    local json=false event=manual arg root verdict lag applied reason="" sha="" stash=""
+    for arg in "$@"; do
+        case "$arg" in
+            --json) json=true ;;
+            --event=*) event="${arg#--event=}" ;;
+        esac
+    done
+    _rp_report() { # action reason serialized committed
+        if [ "$json" = true ]; then
+            jq -cn --arg e "$event" --arg v "${verdict:-unchecked}" --arg ap "${applied:-0}" \
+                --arg a "$1" --arg r "$2" --arg s "$3" --arg c "$4" \
+                '{event:$e, verdict:$v, applied:($ap|tonumber), action:$a, reason:$r,
+                  serialized_to_weave:($s == "true"), git_committed_local:(if $c == "" then null else $c end)}'
+        elif [ "$1" = reprojected ]; then
+            echo "wv: re-projected .weave/ after $event: $applied operation(s) the kept snapshot lacked; committed $4"
+        elif [ "$1" != none ]; then
+            echo "wv: .weave/ snapshot lags its operations after $event; not re-projected: $2" >&2
+            echo "    run when ready: wv recover --reproject (pre-push refuses the push until then)" >&2
+        fi
+    }
+    root=$(git rev-parse --show-toplevel 2>/dev/null) || { _rp_report none "not a git repository" false ""; return 0; }
+    lag=$(wv_projection_lag "$root" 2>/dev/null) || lag=""
+    verdict=$(jq -r '.verdict // "unchecked"' <<< "$lag" 2>/dev/null) || verdict=unchecked
+    applied=$(jq -r '.applied // 0' <<< "$lag" 2>/dev/null) || applied=0
+    if [ "$verdict" != lags ]; then
+        _rp_report none "snapshot $verdict" false ""
+        return 0
+    fi
+    # The rebuild rewrites .weave/; an autostash git reapplies after this hook
+    # would collide with it when the stash holds .weave/ paths.
+    for arg in rebase-merge/autostash rebase-apply/autostash; do
+        arg=$(git -C "$root" rev-parse --git-path "$arg" 2>/dev/null) || continue
+        case "$arg" in /*) ;; *) arg="$root/$arg" ;; esac
+        [ -f "$arg" ] && stash=$(cat "$arg" 2>/dev/null) && break
+    done
+    if [ -n "$stash" ] && [ -n "$(git -C "$root" diff --name-only "$stash^1" "$stash" -- .weave 2>/dev/null)" ]; then
+        reason="the pending autostash holds .weave/ changes"
+    elif [ "${WV_AUTO_CHECKPOINT:-1}" = "0" ]; then
+        reason="automatic commits are off (WV_AUTO_CHECKPOINT=0)"
+    elif ! wv_auto_commit_enabled "$root"; then
+        reason="a commit or push gate holds the checkout"
+    elif [ -n "$(wv_staged_non_graph_state "$root" 2>/dev/null)" ]; then
+        reason="files outside graph state are staged"
+    fi
+    if [ -n "$reason" ]; then
+        _rp_report deferred "$reason" false ""
+        return 0
+    fi
+    # Checkpoints off for the rebuild: sync's own auto-checkpoint would commit
+    # (or amend) .weave/ itself, and the re-projection is this one commit.
+    if ! WV_AUTO_CHECKPOINT=0 cmd_load >/dev/null 2>&1; then
+        _rp_report failed "wv load failed; run it to see why" false ""
+        return 1
+    fi
+    if ! WV_AUTO_CHECKPOINT=0 cmd_sync >/dev/null 2>&1; then
+        _rp_report failed "wv sync failed after the load; run it to see why" false ""
+        return 1
+    fi
+    wv_stage_graph_state "$root" >/dev/null 2>&1 || true
+    if git -C "$root" diff --cached --quiet -- .weave 2>/dev/null; then
+        _rp_report failed "the rebuilt snapshot equals the committed one; run wv load and read its output" true ""
+        return 1
+    fi
+    # The index holds graph state only (the staged-files guard above), so the
+    # commit is that; a pathspec would also take unstaged .weave/ configuration.
+    if ! git -C "$root" commit -q -m "chore(weave): re-project graph state after $event [skip ci]" >/dev/null 2>&1; then
+        _rp_report failed "the commit of .weave/ was refused; commit it yourself" true ""
+        return 1
+    fi
+    sha=$(git -C "$root" rev-parse --short HEAD 2>/dev/null)
+    _rp_report reprojected "" true "$sha"
+    return 0
+}
+
 # Recovery helpers for specific operation types
 
 _recover_ship() {
@@ -524,7 +612,7 @@ _recover_session() {
 
     local active_count=0
     if [ -n "$active_nodes" ]; then
-        active_count=$(echo "$active_nodes" | wc -l)
+        active_count=$(( $(echo "$active_nodes" | wc -l) ))
     fi
 
     if [ "$active_count" -eq 0 ]; then

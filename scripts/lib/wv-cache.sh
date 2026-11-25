@@ -108,7 +108,7 @@ _wv_run_cache_is_fresh() {
 
     local now mtime age
     now=$(date +%s)
-    mtime=$(stat -c %Y "$cache_file" 2>/dev/null || echo 0)
+    mtime=$(wv_stat mtime "$cache_file" || echo 0)
     age=$((now - mtime))
     [ "$age" -le "$WV_RUN_CACHE_TTL" ] || return 1
 

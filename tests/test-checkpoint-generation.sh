@@ -17,7 +17,7 @@ wv_checkpoint_generation_stage "$TMP/weave" "$TMP/stage" gen-1
 [ -f "$TMP/stage/gen-1/state.sql" ] && [ -f "$TMP/stage/gen-1/manifest.json" ] && [ -f "$TMP/stage/gen-1/generation.json" ] && [ -f "$TMP/stage/gen-1/journal.json" ] && [ -f "$TMP/weave/deltas/day/a.sql" ]
 [ -f "$TMP/stage/gen-1/legacy-deltas/v1/day/a.sql" ] && [ -f "$TMP/stage/gen-1/legacy-deltas/v1/catalog.json" ]
 [ ! -e "$TMP/stage/gen-1/candidate.db" ] && [ ! -e "$TMP/stage/gen-1/entries.jsonl" ] && [ ! -e "$TMP/stage/gen-1/.work" ]
-[ "$(find "$TMP/stage/gen-1" -type f | wc -l)" -eq 6 ]
+[ "$(( $(find "$TMP/stage/gen-1" -type f | wc -l) ))" -eq 6 ]
 sqlite3 :memory: < "$TMP/stage/gen-1/state.sql"
 sqlite3 "$TMP/check.db" < "$TMP/stage/gen-1/state.sql"
 [ "$(sqlite3 "$TMP/check.db" "SELECT text FROM nodes WHERE id = 'wv-delta';")" = "delta" ]

@@ -341,7 +341,7 @@
     },
     {
       "rule_id": "init_preserves_existing_graph",
-      "summary": "Initialising may not replace a database that already holds nodes.",
+      "summary": "Initialising may not replace a database that already holds nodes, or one it cannot read to check (wv-4ccc98).",
       "basis": "invariant",
       "decisions": [
         "allow",
@@ -365,7 +365,7 @@
           "path": "scripts/cmd/wv-cmd-core.sh",
           "function": "cmd_init",
           "anchor": "wv_policy_verdict init_preserves_existing_graph",
-          "occurrences": 5
+          "occurrences": 6
         }
       ]
     },
@@ -1897,6 +1897,30 @@
       "notes": "Identity source: wv list --status=active --claimed-by=current, which resolves the actor as resolve_agent_id does for the Weave-ID trailers: WV_AGENT_ID if set, otherwise <harness>-<host>-<user>-s<sid12> when the harness carries a session id (Claude Code, Codex; WV_SESSION_IDENTITY=0 turns this off), else <harness>-<host>-<user> from the committing process's environment, with human when no agent harness is detected. A harness session whose id is missing fails the listing (wv-99978b). One identity policy for admission and attribution; they remain separate hooks and queries. Failure behaviour: a listing that fails reads as no claim, so admission fails closed. Continuing another actor's node is wv work <id> --force, which claim_ownership records as a takeover; it is not a bypass. Admission is session-owned where the harness carries a session id, and actor-owned for a human shell, Copilot or WV_SESSION_IDENTITY=0 (wv-99978b, design wv-d7f53e). A pre-session coarse claim is resumed with wv work <id> --continue. With no node active at all the second site refuses (the discover-phase message). Removed as exemptions (wv-68aeff): WV_AUTO_CHECKPOINT_ACTIVE and WV_STYLE_COMMIT (a flag is not authority), the whitespace-only shortcut (git diff -w cannot show semantic equivalence), and the closing phase (repository-shared; the graph commit it existed for is graph state). With no wv in a Weave-managed repository a substantive commit is refused. A commit cannot remove its own enforcement prerequisite (wv-49b687): Weave management, the shellcheck scope declaration, .shellcheckrc, the memory-parity map row and the release leak checker count when HEAD or the index has them, so staging their deletion or relaxation does not disable them for that commit."
     },
     {
+      "rule_id": "test_line_ratchet_advisory",
+      "summary": "A commit whose net added test lines exceed the budget is advised to record a one-line justification on its node; it is never refused.",
+      "basis": "heuristic",
+      "decisions": [
+        "allow",
+        "advisory"
+      ],
+      "applies_to": [
+        {
+          "kind": "git_event",
+          "event": "pre-commit"
+        }
+      ],
+      "bypass": [],
+      "sites": [
+        {
+          "owner": "git_hook",
+          "path": "scripts/lib/wv-test-ratchet.sh",
+          "anchor": "over the advisory budget; this commit is not refused"
+        }
+      ],
+      "notes": "Binding is advisory (wv-1163f5, guidance doc rec 2): disabled -> advisory -> enforced per the carrier, and enforcement needs an owner ruling after a month of advisory data. The count is the staged index's net lines over test paths (tests/, test_*, *.test.ts), with renames detected explicitly so a moved suite is not growth. The budget is WV_GATE_TEST_LINE_BUDGET (default 150, from a net per-commit p90 of 114 and p99 of 333 since 2026-10-01). It runs from the commit gate's exit handler, so it reports once per real gate and never in preflight or a candidate lane, and it never changes the gate's exit."
+    },
+    {
       "rule_id": "push_heavy_tier_tests_pushed_tip",
       "summary": "The heavy tier a push owes runs against exactly the commit being pushed.",
       "basis": "invariant",
@@ -1936,6 +1960,43 @@
   ],
   "non_policy_sites": [
     {
+      "category": "infrastructure_failure",
+      "summary": "A git hook started under a bash older than 4 (macOS /bin/bash is 3.2) re-executes under a newer bash or stops; no rule was evaluated (wv-7257a8).",
+      "sites": [
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-commit-weave.sh",
+          "function": "_wv_bash_guard"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-push-weave.sh",
+          "function": "_wv_bash_guard"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/reference-transaction-weave.sh",
+          "function": "_wv_bash_guard"
+        },
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/reproject-weave.sh",
+          "function": "_wv_bash_guard"
+        }
+      ]
+    },
+    {
+      "category": "infrastructure_failure",
+      "summary": "A git hook that finds no python 3.11 or newer (python3 on PATH, WV_PYTHON, python3.1x, Homebrew's; macOS /usr/bin/python3 is 3.9) puts the one it finds first on PATH or stops; no rule was evaluated (wv-892318).",
+      "sites": [
+        {
+          "owner": "git_hook",
+          "path": "scripts/hooks/pre-push-weave.sh",
+          "function": "_wv_python_floor"
+        }
+      ]
+    },
+    {
       "category": "input_validation",
       "summary": "A hook payload that cannot be parsed is refused before any rule runs.",
       "sites": [
@@ -1954,6 +2015,17 @@
           "owner": "host_hook",
           "path": "scripts/lib/wv-pre-tool-use.sh",
           "function": "_agent_hook_timeout_deny"
+        }
+      ]
+    },
+    {
+      "category": "infrastructure_failure",
+      "summary": "A close or claim whose checkout cannot be known without evaluating the command (a $var or backtick cd, cd -, popd, a missing directory, wv under ssh, sudo or bash -c) is refused unjudged: the guard did not evaluate it, so no rule was applied (wv-7ab9d4).",
+      "sites": [
+        {
+          "owner": "host_hook",
+          "path": "scripts/lib/wv-pre-tool-use.sh",
+          "function": "_ptu_checkout_unknown_deny"
         }
       ]
     },

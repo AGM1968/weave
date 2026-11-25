@@ -8,6 +8,8 @@
 # rules silent and was never countable. Each gate now records its allow when it
 # examined the call and let it through, and this suite drives one clean call
 # through every mutation-class operation that has applicable rules.
+# shellcheck source=tests/lib/sed-inplace.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/sed-inplace.sh"  # sed -i is GNU-only (wv-076a98)
 set -uo pipefail
 export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -34,7 +36,7 @@ node() { w add "$1" --standalone --criteria=c --risks=low --alias="$2" | grep -o
 counted() {
     local label="$1" before result
     shift
-    before=$(wc -l < "$J")
+    before=$(( $(wc -l < "$J") ))
     (cd "$R" && WEAVE_DIR="$R/.weave" WV_HOT_ZONE="$R/hot" WV_CONFIG_DIR="$R/cfg" WV_REQUIRE_QUALITY=0 \
         WV_EVIDENCE_MODE=1 WV_ATTEMPT_JOURNAL="$J" WV_CALL_SOURCE=agent "$WV" "$@") \
         < "${STDIN:-/dev/null}" >/dev/null 2>&1
@@ -80,7 +82,7 @@ counted "wv resolve --defer" resolve "$r1" "$r2" --defer
 r3=$(node "resolve three" r3); r4=$(node "resolve four" r4)
 counted "wv resolve --winner" resolve "$r3" "$r4" --winner="$r3"
 F="$TMP/fresh"; mkdir -p "$F/cfg"; git -C "$F" init -q .
-before=$(wc -l < "$J")
+before=$(( $(wc -l < "$J") ))
 (cd "$F" && WEAVE_DIR="$F/.weave" WV_HOT_ZONE="$F/hot" WV_CONFIG_DIR="$F/cfg" WV_EVIDENCE_MODE=1 \
     WV_ATTEMPT_JOURNAL="$J" WV_CALL_SOURCE=agent "$WV" init) </dev/null >/dev/null 2>&1
 [ "$(tail -n +"$((before + 1))" "$J" | jq -r 'select(.event=="call_completed") | .policy.countable' | tail -1)" = true ] &&
@@ -101,7 +103,7 @@ echo "=== a gate that stops recording its allow breaks countability ==="
 # Tripwire on a copy of the scripts: remove block_graph_acyclic's allow and
 # the same clean call must lose countability, naming the silent rule.
 cp -r "$ROOT/scripts" "$TMP/scripts-copy"
-sed -i '/wv_policy_verdict block_graph_acyclic allow/d' "$TMP/scripts-copy/cmd/wv-cmd-graph.sh"
+sed_inplace '/wv_policy_verdict block_graph_acyclic allow/d' "$TMP/scripts-copy/cmd/wv-cmd-graph.sh"
 T="$TMP/trip"; setup_repo "$T" "$TMP/scripts-copy/wv"
 tw() { (cd "$T" && WEAVE_DIR="$T/.weave" WV_HOT_ZONE="$T/hot" WV_CONFIG_DIR="$T/cfg" "$TMP/scripts-copy/wv" "$@") </dev/null 2>/dev/null; }
 t1=$(tw add "trip one" --standalone | grep -oE 'wv-[a-f0-9]{6}' | sed -n 1p)

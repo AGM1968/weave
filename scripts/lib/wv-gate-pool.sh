@@ -51,12 +51,6 @@ hook_gate_jobs() {
     echo "$j"
 }
 
-# gate_pool_estimates <suites-json> — set each suite's last_cost_s from the
-# durable suite log's median (wv-ffda33), not the tmpfs ledger's last run: wv
-# load wipes that, and one run in either direction skews it (test-release was
-# quoted at ~209s against a 362s average). The median of RECENT runs where the
-# log has it, because an all-history median lags a growing suite (wv-8138ec).
-# One definition for both gates (ultrareview #4575).
 # gate_pool_require_present <suites-json> <present-fn> <retired-record-text>
 # — the selection without the suites that may be absent, on stdout. present-fn
 # <suite> answers 0 present, 1 absent, anything else unknown. A suggestion
@@ -94,16 +88,43 @@ gate_pool_require_present() {
         || { echo "gate_pool_require_present: filter selection (status $?) — refusing" >&2; exit 1; }
 }
 
+# gate_pool_estimates <suites-json> — each suite's last_cost_s as wv impact
+# --suites priced it: the median of recent runs in the durable suite log,
+# keyed by the repository and not the worktree (_suite_cost_estimates,
+# wv-cmd-graph.sh; wv-870f67, wv-1e4c01). This pool used to price again from
+# wv analyze, floor()ing to whole seconds, so a sub-second suite and one with
+# no history in this worktree both read 0. Kept as the one place the pool
+# accepts a price: anything but a positive number becomes null, unmeasured.
+# Unmeasured runs first (gate_pool_launch_order) and runs in preflight.
 gate_pool_estimates() {
-    local hist
-    hist=$("$WV" analyze suites --json 2>/dev/null || echo '{}')
-    # One history row per suite, growing with the catalogue: a file, not argv,
-    # where E2BIG would drop every estimate through the fallback (wv-200d36).
-    jq -c --slurpfile h <(printf '%s' "$hist") '
-        $h[0] as $h
-        | (($h.suites // []) | map({key: .suite, value: (((.recent_p50_ms // .p50_ms) // 0) / 1000 | floor)}) | from_entries) as $m
-        | map(.last_cost_s = (if ($m[.name] // 0) > 0 then $m[.name] else (.last_cost_s // 0) end))' \
+    jq -c 'map(.last_cost_s = (.last_cost_s | if type == "number" and . > 0 then . else null end))' \
         <<< "$1" 2>/dev/null || printf '%s' "$1"
+}
+
+# gate_pool_preflight_select <suites-json> <fast-seconds> — the suites a
+# preflight runs by default, on stdout: each measured at <fast-seconds> or
+# less, and each light suite not yet measured. An unmeasured light suite is
+# unknown, not slow: dropping it skipped tests/test-hook-common.sh, which the
+# worktree's history had never timed, and the commit gate then refused on it
+# (wv-f4e3d2). A heavy-tier suite (still selected when no pre-push gate is
+# installed) is declared slow, so unmeasured it is named, not run. Each
+# unmeasured suite is named, and the pool prints a run's time when it ends,
+# so a new slow suite shows rather than costing silently. A selection it
+# cannot read is returned whole: preflight then runs more, never less.
+gate_pool_preflight_select() {
+    local all=$1 fast=$2 sel unmeasured heavy
+    unmeasured=$(jq -r '[.[] | select((.last_cost_s // 0) <= 0 and .tier != "heavy") | .name] | join(", ")' <<< "$all" 2>/dev/null) || unmeasured=""
+    heavy=$(jq -r '[.[] | select((.last_cost_s // 0) <= 0 and .tier == "heavy") | .name] | join(", ")' <<< "$all" 2>/dev/null) || heavy=""
+    sel=$(jq -c --arg s "$fast" '[.[] | (.last_cost_s // 0) as $c
+            | select(if $c <= 0 then .tier != "heavy" else $c <= ($s | tonumber) end)]' <<< "$all" 2>/dev/null) || {
+        hook_progress "preflight: could not narrow the selection; running every selected suite"
+        printf '%s' "$all"
+        return 0
+    }
+    hook_progress "preflight: $(jq 'length' <<< "$sel") of $(jq 'length' <<< "$all") selected suite(s) are measured at ${fast}s or less, or light and not yet measured, and run; --suites runs every light one"
+    [ -z "$unmeasured" ] || hook_progress "preflight: not yet measured, so run to learn their time: $unmeasured"
+    [ -z "$heavy" ] || hook_progress "preflight: heavy tier and not yet measured, so not run: $heavy"
+    printf '%s' "$sel"
 }
 
 # gate_pool_launch_order <suites-json> — the "<idx>\t<suite>\t<cost_s>" lines
@@ -160,14 +181,21 @@ gate_isolated() {
 # _pc_live_zones — each live hot-zone base once, by physical path: both names
 # of the /tmp zone, /dev/shm/weave and /tmp/weave-<uid>. Under WV_TEST_MODE=1,
 # WV_TEST_HOT_ZONE_ROOT prefixes them, as the resolver does, so a test of
-# this guard never touches the real zone.
+# this guard never touches the real zone. On macOS and Windows the zone a
+# suite resolves is the temp-directory one ($TMPDIR, $TEMP), prefixed the same
+# way (wv-19572f); without it the guard watched only Linux paths there and saw
+# no leak at all.
 _pc_live_zones() {
-    local root="" z
+    local root="" z tmpz=()
     if [ "${WV_TEST_MODE:-}" = "1" ] && [ "${WV_TEST_HOT_ZONE_ROOT:0:1}" = "/" ]; then
         root="${WV_TEST_HOT_ZONE_ROOT%/}"
     fi
+    case "${OSTYPE:-}" in
+        darwin*) z="${TMPDIR:-/tmp}"; z="${z%/}"; tmpz=("$root${z:-}/weave-$UID") ;;
+        msys*|cygwin*|win32*) z="${TEMP:-/tmp}"; z="${z%/}"; tmpz=("$root${z:-}/weave-$UID") ;;
+    esac
     for z in "$root/tmp/weave-hotzone-$UID" "$root/tmp/weave-codex-$UID" \
-             "$root/dev/shm/weave" "$root/tmp/weave-$UID"; do
+             "$root/dev/shm/weave" "$root/tmp/weave-$UID" ${tmpz[@]+"${tmpz[@]}"}; do
         [ -d "$z" ] && (cd "$z" 2>/dev/null && pwd -P)
     done | LC_ALL=C sort -u
 }
@@ -221,8 +249,11 @@ _pc_zone_leaks() {
 # its own is held to its export by that file's structural check). The gate
 # checks the outcome: it notes the log before the suites start and fails on any
 # row appended since that is tagged source=test or names a repository under the
-# temp directory, which is how a suite escaping the marker shows. The user's
-# own wv calls meanwhile are neither.
+# temp directory, which is how a suite escaping the marker shows. Such a row
+# counts against this gate only when it carries this pool's tag (gate_pool,
+# from WV_GATE_POOL_TAG, as hot zones do): another session's wv calls in a
+# scratch clone under the temp directory look the same and are not this
+# gate's (wv-4cbc3a). Untagged ones are reported without failing the gate.
 
 # _pc_inode <file> — its inode number, or 0. ls, not stat: the flags differ on
 # macOS, where this pool also runs.
@@ -242,11 +273,12 @@ _pc_call_log_mark() {
     printf '%s\t%s\t%s\n' "$log" "$(_pc_inode "$log")" "$(wc -c < "$log" 2>/dev/null || echo 0)"
 }
 
-# _pc_call_log_leaks <mark-file> — the rows a suite appended to the log since
-# the mark: a count line, then up to five of them. A log rotated meanwhile is
-# read from the mark on in <log>.1 and whole in <log>.
+# _pc_call_log_leaks <mark-file> [other] — the rows this pool's suites
+# appended to the log since the mark: a count line, then up to five of them.
+# With "other", the matching rows that do not carry this pool's tag instead.
+# A log rotated meanwhile is read from the mark on in <log>.1 and whole in <log>.
 _pc_call_log_leaks() {
-    local log ino size tmp="${TMPDIR:-/tmp}"
+    local log ino size tmp="${TMPDIR:-/tmp}" want="${2:-ours}"
     IFS=$'\t' read -r log ino size < "$1" 2>/dev/null || return 0
     [ -n "$log" ] || return 0
     tmp="${tmp%/}/"
@@ -257,11 +289,23 @@ _pc_call_log_leaks() {
             [ "$ino" != "0" ] && [ "$(_pc_inode "$log.1")" = "$ino" ] && tail -c +"$(( size + 1 ))" -- "$log.1"
             cat -- "$log"
         fi
-    } 2>/dev/null | jq -Rnr --arg tmp "$tmp" '
+    } 2>/dev/null | jq -Rnr --arg tmp "$tmp" --arg tag "${_pc_pool_tag:-}" --arg want "$want" '
         [inputs | fromjson? // empty
-         | select(.source == "test" or ((.repo_root // "") | startswith($tmp)))]
+         | select(.source == "test" or ((.repo_root // "") | startswith($tmp)))
+         | select(((.gate_pool // "") == $tag and $tag != "") == ($want == "ours"))]
         | select(length > 0)
         | "\(length)", (.[:5][] | "\(.cmd)  (source \(.source), repo \(.repo_root))")' 2>/dev/null || true
+}
+
+# _pc_failure_excerpt <output> — the lines of a failed suite's output the
+# report replays: a timeout diagnostic whole, then up to 15 failure lines. The
+# harness's own refusals ("gate supervisor: ...", argparse's "error:") match
+# none of the suite markers; without them a macOS ownership refusal read as a
+# bare exit 2 (wv-5ab927).
+_pc_failure_excerpt() {
+    LC_ALL=C sed $'s/\e\\[[0-9;]*m//g' "$1" \
+        | awk '/^TIMEOUT / { diagnostic=1 } diagnostic { print "    " $0; next }
+            !/✓/ && /✗|FAIL|Error|error:|gate supervisor:|Weave snapshot refused:/ && shown < 15 { print "    " $0; shown++ }'
 }
 
 # _pc_ns_to_ms <ns> — epoch milliseconds from a `date +%s%N` reading, or "-"
@@ -307,7 +351,7 @@ _pc_suite_worker() {
     local WV_GATE_EXECUTION_MODE="${_pc_q_mode[$1]}"
     local plan_args=()
     [ "$WV_GATE_EXECUTION_MODE" != frozen ] || plan_args=(--plan "$_pc_out_dir/plan.json")
-    _w_t0=$(date +%s%N 2>/dev/null || echo 0)
+    _w_t0=$(wv_now ns 2>/dev/null || echo 0)
     # Like gate_isolated, but clear the worker's own environment before the
     # supervisor forks, so its PID is also the PID cancellation can signal.
     unset GIT_INDEX_FILE GIT_DIR GIT_WORK_TREE GIT_PREFIX GIT_COMMON_DIR \
@@ -334,7 +378,7 @@ _pc_suite_worker() {
         WV_GATE_SLOT_STOP="$_pc_out_dir/stop" \
         WV_GATE_ELAPSED="$_pc_out_dir/$1.elapsed" \
         gate_run_bounded "$2" "${WV_GATE_TIMEOUT:-1800}" \
-        env -u WV_CALL_LOG -u WV_GATE_LANE_JOBS -u WV_GATE_SLOTS -u WV_GATE_SLOT_STAMP -u WV_GATE_SLOT_STOP -u WV_GATE_ELAPSED -u WV_SCRATCH_ROOT \
+        env -u WV_CALL_LOG -u WV_GATE_LANE_JOBS -u WV_GATE_SLOTS -u WV_GATE_SLOT_STAMP -u WV_GATE_SLOT_STOP -u WV_GATE_ELAPSED -u WV_SCRATCH_ROOT -u WV_GATE_KEEP_GOING \
         "${_pc_snapshot_args[@]}" "${plan_args[@]}" \
         --work "$_pc_out_dir/scratch/$1" --provenance "$_pc_out_dir/$1.identity.json" \
         "$2" </dev/null >"$_pc_out_dir/$1.out" 2>&1
@@ -353,7 +397,7 @@ _pc_suite_worker() {
         echo "✗ frozen suite receipt does not match its planned inputs" >> "$_pc_out_dir/$1.out"
         _w_rc=1
     fi
-    _w_t1=$(date +%s%N 2>/dev/null || echo 0)
+    _w_t1=$(wv_now ns 2>/dev/null || echo 0)
     # The suite's cost is the supervisor's monotonic reading, which leaves out
     # time the host spent suspended (wv-b17a85); the wall clock is the fallback
     # only when there is no such reading. Start and end stay epoch timestamps.
@@ -401,7 +445,8 @@ _pc_reap() {
 }
 
 # _pc_record_all — once no suite is running, record its immutable planned key
-# and its cost with the clock that measured it, in selection order. A live edit cannot change the bytes
+# and its cost with the clock that measured it, in selection order. Each row
+# names the tree run_hook_suites froze (_pc_suite_tree, wv-abc855). A live edit cannot change the bytes
 # this suite tested, or turn that result into certification of the new edit.
 _pc_record_all() {
     local i est key mode
@@ -424,6 +469,7 @@ _pc_record_all() {
             --estimate="$est" ${key:+--inputs-key="$key"} \
             "${plan_args[@]}" \
             --started-ms="${_pc_run_start[$i]:-}" --ended-ms="${_pc_run_end[$i]:-}" \
+            --tree="${_pc_suite_tree:-}" \
             --start-fingerprints="$_pc_out_dir/start.fps" >/dev/null 2>&1 || true
     done
 }
@@ -563,6 +609,9 @@ run_hook_suites() {
     if [ -z "$_pc_suite_base" ]; then
         _pc_suite_base=$(git -C "$REPO_ROOT" rev-parse --verify --quiet 'HEAD^{commit}') || _pc_suite_base=""
     fi
+    # The tree these suites judge, for the enclosing gate's own record: a push
+    # gate freezes it here rather than in gate_freeze (wv-abc855).
+    _GATE_JUDGED_TREE="$_pc_suite_tree"
     gate_pool_execution_mode "$_pc_suite_tree"
     hook_progress "execution mode: $WV_GATE_EXECUTION_MODE ($(gate_pool_mode_reason))"
     _pc_snapshot_args=(python3 -I "$_GATE_SUITE_LIB/wv-gate-suite.py" --repo "$REPO_ROOT"
@@ -606,7 +655,7 @@ run_hook_suites() {
     for idx in "${cand[@]}"; do names+=("${_pc_q_suite[$idx]}"); done
     if [ "${#frozen_names[@]}" -gt 0 ] && ! WV_GATE_CONTEXT="${_pc_pool_context:-precommit}" \
         PYTHONDONTWRITEBYTECODE=1 \
-        env -u WV_CALL_LOG -u WV_GATE_LANE_JOBS -u WV_GATE_SLOTS -u WV_GATE_SLOT_STAMP -u WV_GATE_SLOT_STOP -u WV_SCRATCH_ROOT \
+        env -u WV_CALL_LOG -u WV_GATE_LANE_JOBS -u WV_GATE_SLOTS -u WV_GATE_SLOT_STAMP -u WV_GATE_SLOT_STOP -u WV_SCRATCH_ROOT -u WV_GATE_KEEP_GOING \
         "${_pc_snapshot_args[@]}" --describe --work "$_pc_out_dir/scratch/description" \
         --provenance "$_pc_out_dir/plan.json" "${names[@]}"; then
         echo "✗ Weave gate: cannot establish frozen suite inputs — refusing" >&2
@@ -710,8 +759,9 @@ run_hook_suites() {
     done
     # The call log is read before the ledger is written: the test-record calls
     # below are the pool's own, and inside a suite they are tagged test too.
-    local rows
+    local rows other_rows
     rows=$(_pc_call_log_leaks "$_pc_out_dir/calllog.before")
+    other_rows=$(_pc_call_log_leaks "$_pc_out_dir/calllog.before" other)
     _pc_record_all
 
     # Replay failures in selection order, with the lines that name the failing
@@ -736,13 +786,13 @@ run_hook_suites() {
             echo "  run manually to see details: bash ${_pc_q_suite[$i]}" >&2
         fi
         if [ -s "$_pc_out_dir/$i.out" ]; then
-            if grep -qiE 'No space left on device|database or disk is full|ENOSPC' "$_pc_out_dir/$i.out"; then
+            # The storage errors themselves (Linux, macOS, SQLite, Node's ENOSPC
+            # message); a passed check's name that mentions ENOSPC is not one (wv-9cc226).
+            if grep -viE '^[[:space:]]*✓' "$_pc_out_dir/$i.out" | grep -qiE 'No space left on device|database or disk is full'; then
                 echo "  RESOURCE: failed suite output reports exhausted storage; scratch=$_pc_out_dir/scratch" >&2
                 df -Pk "$_pc_out_dir" >&2 || true
             fi
-            sed 's/\x1b\[[0-9;]*m//g' "$_pc_out_dir/$i.out" \
-                | awk '/^TIMEOUT / { diagnostic=1 } diagnostic { print "    " $0; next }
-                    !/✓/ && /✗|FAIL|Error|Weave snapshot refused:/ && shown < 15 { print "    " $0; shown++ }' >&2
+            _pc_failure_excerpt "$_pc_out_dir/$i.out" >&2
             echo "  full output: $_pc_out_dir/$i.out" >&2
         fi
     done
@@ -761,8 +811,15 @@ run_hook_suites() {
         printf '%s\n' "$rows" | sed '1d; s/^/    /' >&2
         echo "  One of the suites this gate ran ($ran) ran wv without" >&2
         echo "  WV_TEST_SUITE=1, or with WV_CONFIG_DIR naming the user's own config:" >&2
-        echo "  export WV_TEST_SUITE=1 at its top. Another session running suites at" >&2
-        echo "  the same time would show here too. The rows already written stay." >&2
+        echo "  export WV_TEST_SUITE=1 at its top. The rows already written stay." >&2
+    fi
+    if [ -n "$other_rows" ]; then
+        echo "" >&2
+        echo "⚠ ${other_rows%%$'\n'*} call-log row(s) from temporary repositories or test runs were written" >&2
+        echo "  while these suites ran, without this pool's tag: another session's wv calls" >&2
+        echo "  (a scratch clone, its own suites), or a suite that cleared its whole" >&2
+        echo "  environment. Not counted against this gate (wv-4cbc3a):" >&2
+        printf '%s\n' "$other_rows" | sed '1d; s/^/    /' >&2
     fi
     if [ -n "$leaks" ]; then
         failed_any=1
@@ -772,7 +829,7 @@ run_hook_suites() {
         echo "  One of the suites this gate ran ($ran) called wv in a temporary" >&2
         echo "  repository without isolating placement: give it WV_HOT_ZONE, or" >&2
         echo "  WV_TEST_MODE=1 WV_TEST_HOT_ZONE_ROOT=<its temp dir>. Each carries this" >&2
-        echo "  pool's tag (wv-7061a0). wv hotzone gc removes orphans of deleted repositories." >&2
+        echo "  pool's tag (wv-7061a0). wv hotzone gc quarantines orphans of deleted repositories." >&2
     fi
     if [ -n "$untagged" ]; then
         echo "" >&2

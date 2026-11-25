@@ -3,6 +3,8 @@
 # is enforced, and what is not a policy decision. Each negative control mutates
 # a scratch copy of the tree, never the real one.
 
+# shellcheck source=tests/lib/sed-inplace.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/sed-inplace.sh"  # sed -i is GNU-only (wv-076a98)
 set -euo pipefail
 export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 
@@ -94,7 +96,7 @@ fresh; printf '# BEGIN source-only: probe\n[ -f /nonexistent ] && exit 1\n# END 
 passes "a refusal inside a source-only block is outside the contract, as it is outside the release"
 fresh; printf '# BEGIN source-only: probe\n' >> "$TMP/t/scripts/hooks/pre-push-weave.sh"
 check "is never closed" "an unclosed source-only block fails validation instead of hiding the rest of the hook"
-fresh; sed -i 's/Continue that work as yourself:/Carry on as yourself:/' "$TMP/t/scripts/hooks/pre-commit-weave.sh"
+fresh; sed_inplace 's/Continue that work as yourself:/Carry on as yourself:/' "$TMP/t/scripts/hooks/pre-commit-weave.sh"
 check "occurs 0 time(s)" "the commit-admission site moving away from its anchor fails validation"
 
 fresh; printf '_probe() {\n    wv_attempt_emit policy_verdict \\\n        rule=invented_rule decision=deny\n}\n' >> "$TMP/t/scripts/cmd/wv-cmd-graph.sh"
@@ -102,11 +104,12 @@ check "does not declare" "an emitted verdict naming an undeclared rule fails val
 
 # Command gates are anchored on their emit, so rewording a message is harmless
 # and dropping the emit is not: the gate would decide again without a trace.
-fresh; sed -i '0,/wv_policy_verdict block_graph_acyclic deny/{/wv_policy_verdict block_graph_acyclic deny/d}' \
+fresh; sed_inplace -e '/wv_policy_verdict block_graph_acyclic deny/{' -e x -e '/^done$/{' -e x -e b -e '}' \
+  -e 's/.*/done/' -e x -e d -e '}' \
   "$TMP/t/scripts/cmd/wv-cmd-graph.sh"
 check "occurs 2 time(s)" "a gate that stops emitting its verdict fails validation instead of going quiet"
 
-fresh; sed -i 's/GraphPolicyViolation: test_gate red\/stale result/GraphPolicyViolation: tests red/' "$TMP/t/scripts/lib/wv-db.sh"
+fresh; sed_inplace 's/GraphPolicyViolation: test_gate red\/stale result/GraphPolicyViolation: tests red/' "$TMP/t/scripts/lib/wv-db.sh"
 check "occurs 0 time(s)" "an enforcement site whose code moved fails validation instead of pointing at nothing"
 
 fresh; edit_contract 'c["rules"][0]["applies_to"] = [{"kind": "operation", "operation": "no-such-op"}]'
@@ -131,7 +134,8 @@ check "undeclared" "the schema refuses a field it does not define"
 fresh; edit_contract 'c["completeness"]["declared_only"] = []'
 check "completeness must classify every enforcement owner" "every enforcement owner is declared proven or declared-only"
 
-fresh; sed -i '0,/wv_policy_verdict block_graph_acyclic deny/s//wv_policy_verdict block_graph_acyclic advisory/' \
+fresh; sed_inplace -e '/wv_policy_verdict block_graph_acyclic deny/{' -e x -e '/^done$/{' -e x -e b -e '}' \
+  -e 's/.*/done/' -e x -e 's/wv_policy_verdict block_graph_acyclic deny/wv_policy_verdict block_graph_acyclic advisory/' -e '}' \
   "$TMP/t/scripts/cmd/wv-cmd-graph.sh"
 check "which declares" "an emitted decision the rule does not declare fails validation"
 
@@ -246,11 +250,11 @@ check "bypasses the close receipt" "a close written as a bare UPDATE fails valid
 
 # wv-664b7f: a hook-owned rule names itself when its hook decides, with a
 # decision it declares, from a line a declared site claims.
-fresh; sed -i '/_hc_observe no_busy_wait_polling deny/d' "$TMP/t/scripts/lib/wv-pre-tool-use.sh"
+fresh; sed_inplace '/_hc_observe no_busy_wait_polling deny/d' "$TMP/t/scripts/lib/wv-pre-tool-use.sh"
 check "no_busy_wait_polling: its hook decides without naming it" "a hook rule that stops observing itself fails validation"
-fresh; sed -i 's/_hc_observe read_size_budget deny/_hc_observe orphan_prevention deny/' "$TMP/t/scripts/lib/wv-hook-common.sh"
+fresh; sed_inplace 's/_hc_observe read_size_budget deny/_hc_observe orphan_prevention deny/' "$TMP/t/scripts/lib/wv-hook-common.sh"
 check "observes orphan_prevention, which no host_hook site enforces" "a hook observing an in-call rule fails validation"
-fresh; sed -i 's/_hc_observe claim_premortem_advisory advisory/_hc_observe claim_premortem_advisory deny/' "$TMP/t/scripts/lib/wv-pre-tool-use.sh"
+fresh; sed_inplace 's/_hc_observe claim_premortem_advisory advisory/_hc_observe claim_premortem_advisory deny/' "$TMP/t/scripts/lib/wv-pre-tool-use.sh"
 check "observes deny for claim_premortem_advisory" "a hook observing an undeclared decision fails validation"
 
 echo "Results: $pass/$run passed"

@@ -99,7 +99,7 @@ assert_equals() {
 
 strip_ansi() {
     # Remove ANSI escape sequences for clean text comparison
-    sed 's/\x1b\[[0-9;]*m//g'
+    LC_ALL=C sed $'s/\e\\[[0-9;]*m//g'
 }
 
 assert_contains() {
@@ -238,7 +238,7 @@ test_tree() {
 
     # Multiple roots displayed
     local root_count
-    root_count=$(echo "$tree_orphan" | grep -c "Epic:\|Orphan" || true)
+    root_count=$(echo "$tree_orphan" | grep -cE "Epic:|Orphan" || true)
     TESTS_RUN=$((TESTS_RUN + 1))
     if [ "$root_count" -ge 2 ]; then
         echo -e "${GREEN}✓${NC} tree: multiple roots displayed"
@@ -755,7 +755,7 @@ test_health_history() {
     # Log file has 3 entries
     local log_file="$TEST_DIR/.weave/health.log"
     local line_count
-    line_count=$(wc -l < "$log_file" 2>/dev/null || echo 0)
+    line_count=$(( $(wc -l < "$log_file" 2>/dev/null || echo 0) ))  # BSD wc pads (wv-2dbe9e)
     assert_equals "3" "$line_count" "history: 3 health calls = 3 log entries"
 
     # TSV format: timestamp\tscore\tnodes\tedges\torphans\tghosts

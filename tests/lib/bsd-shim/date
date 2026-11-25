@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+: "${WV_BSD_SHIM_REAL:=${0%/*}/../real}"  # env -i drops the export; this stand-in sits in bin/ beside real/ (wv-43082a)
+# BSD date stand-in (wv-418760): no -d/--date, and %N is not a conversion:
+# BSD prints a literal N and still exits 0. BSD's own forms are emulated on
+# GNU date (wv-e1ee87): -r <seconds> formats an epoch, and -j -f <format>
+# <value> parses a value without setting the clock (GNU parses the value).
+args=() parse=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -d|--date|--date=*|-d*) echo "date: illegal option -- d" >&2; echo "usage: date [-jnRu] [-I[date|hours|minutes|seconds]] [-f input_fmt] [-r filename|seconds] [-v[+|-]val[y|m|w|d|H|M|S]] [[[[mm]dd]HH]MM[[cc]yy][.SS] | new_date] [+output_fmt]" >&2; exit 1 ;;
+        -j) ;;
+        -f) shift 2; parse=$1 ;;  # the format, then the value it describes
+        -r) shift; case "$1" in *[!0-9]*|'') args+=(-r "$1") ;; *) args+=(-d "@$1") ;; esac ;;
+        +*) args+=("${1//%N/N}") ;;
+        *) args+=("$1") ;;
+    esac
+    shift
+done
+[ -z "$parse" ] || args+=(-d "$parse")
+exec "$WV_BSD_SHIM_REAL/date" "${args[@]}"

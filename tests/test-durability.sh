@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Suite-driven wv calls are tagged test so call-stats retro reads can exclude them.
+# shellcheck source=tests/lib/sed-inplace.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/sed-inplace.sh"  # sed -i is GNU-only (wv-076a98)
 export WV_CALL_SOURCE=test
 # test-durability.sh — Test durable execution patterns
 #
@@ -211,7 +213,7 @@ setup_test_env
 journal_file="$WV_HOT_ZONE/ops.journal"
 if [ -f "$journal_file" ] && [ -s "$journal_file" ]; then
     # File exists but should be empty (cleaned after complete op)
-    local_size=$(wc -c < "$journal_file")
+    local_size=$(( $(wc -c < "$journal_file") ))
     assert_equals "0" "$local_size" "Journal clean after successful sync"
 else
     TESTS_RUN=$((TESTS_RUN + 1))
@@ -289,7 +291,7 @@ assert_equals "0" "$(grep -c 'network/SSH approval' <<< "$gh_output")" \
 
 # An unexpected exception exits 4 (wv-e869e3): a bug or unanticipated data,
 # possibly after GitHub writes, so it fails the command too.
-sed -i 's/^    exit 3$/    exit 4/' "$fake_bin/python3"
+sed_inplace 's/^    exit 3$/    exit 4/' "$fake_bin/python3"
 gh_output=""
 gh_exit=0
 gh_output=$(env -u VIRTUAL_ENV PATH="$fake_bin:$PATH" "$WV" sync --gh 2>&1) || gh_exit=$?
@@ -317,7 +319,8 @@ case "\$1 \$2" in
         case "\$*" in *url*) echo "https://github.com/owner/repo" ;; *) echo "owner/repo" ;; esac ;;
     "api graphql")
         head -n 1 "$gh_counts"
-        [ "\$(wc -l < "$gh_counts")" -gt 1 ] && sed -i 1d "$gh_counts"
+        # not sed -i: GNU-only, and this stub runs without the suite's helpers (wv-076a98)
+        [ "\$(wc -l < "$gh_counts")" -gt 1 ] && { tail -n +2 "$gh_counts" > "$gh_counts.next"; cat "$gh_counts.next" > "$gh_counts"; rm -f "$gh_counts.next"; }
         exit 0 ;;
     "issue list") cat "$gh_listing" ;;
     "issue view")
@@ -401,7 +404,7 @@ echo ""
 echo -e "${CYAN}--- cmd_delete journal wrapping ---${NC}"
 setup_test_env
 
-node_id=$("$WV" add "node to delete" 2>/dev/null | grep -oP 'wv-[a-f0-9]+')
+node_id=$("$WV" add "node to delete" 2>/dev/null | grep -oE 'wv-[a-f0-9]+')
 "$WV" delete "$node_id" --force 2>/dev/null
 
 # Verify node is gone
@@ -418,8 +421,8 @@ echo -e "${CYAN}--- delete gh-close ownership guard ---${NC}"
 setup_test_env
 
 # Texts must be dissimilar or the add similarity guard rejects the second node.
-owner_a=$("$WV" add "node being deleted with linked issue" 2>/dev/null | grep -oP 'wv-[a-f0-9]+')
-owner_b=$("$WV" add "surviving owner that maps the same gh number" 2>/dev/null | grep -oP 'wv-[a-f0-9]+')
+owner_a=$("$WV" add "node being deleted with linked issue" 2>/dev/null | grep -oE 'wv-[a-f0-9]+')
+owner_b=$("$WV" add "surviving owner that maps the same gh number" 2>/dev/null | grep -oE 'wv-[a-f0-9]+')
 # gh_issue is stored as a JSON number (jq tonumber at creation) — replicate that.
 sqlite3 "$WV_DB" "UPDATE nodes SET metadata=json_set(COALESCE(metadata,'{}'),'\$.gh_issue', 4242) WHERE id IN ('$owner_a','$owner_b');"
 
@@ -447,7 +450,7 @@ source "$PROJECT_ROOT/scripts/lib/wv-config.sh"
 source "$PROJECT_ROOT/scripts/lib/wv-journal.sh"
 
 # Create and claim a node
-node_id=$("$WV" add "ship crash test" 2>/dev/null | grep -oP 'wv-[a-f0-9]+')
+node_id=$("$WV" add "ship crash test" 2>/dev/null | grep -oE 'wv-[a-f0-9]+')
 "$WV" work "$node_id" >/dev/null 2>&1
 
 # Simulate: ship started, done completed, sync pending (crash)
@@ -468,7 +471,7 @@ assert_contains "$recovery" '"action":"sync"' "recover identifies stuck at sync"
 # A failed done policy gate must leave both recovery records intact and must
 # never be journaled or reported as recovered.
 setup_test_env
-node_id=$("$WV" add "ship policy failure" --force 2>/dev/null | grep -oP 'wv-[a-f0-9]+')
+node_id=$("$WV" add "ship policy failure" --force 2>/dev/null | grep -oE 'wv-[a-f0-9]+')
 "$WV" work "$node_id" >/dev/null 2>&1
 sqlite3 "$WV_DB" "INSERT INTO node_files(node_id,path) VALUES('$node_id','violating.sh');
   INSERT INTO file_metrics(path,mccabe_max,language) VALUES('violating.sh',999,'sh');
@@ -488,7 +491,7 @@ assert_fails "failed ship recovery does not print success" grep -q "Recovery com
 
 # New ship journals carry an initial recoverable phase in the begin record.
 setup_test_env
-node_id=$("$WV" add "begin-only recovery" 2>/dev/null | grep -oP 'wv-[a-f0-9]+')
+node_id=$("$WV" add "begin-only recovery" 2>/dev/null | grep -oE 'wv-[a-f0-9]+')
 "$WV" work "$node_id" >/dev/null 2>&1
 journal_begin "ship" "{\"id\":\"$node_id\",\"gh\":false}" "persist_intent"
 begin_recovery=$("$WV" recover --json 2>/dev/null)
@@ -501,7 +504,7 @@ assert_fails "begin-only recovery completes the obsolete journal" journal_has_in
 # If the target changes after validation but before intent persistence, the
 # markerless initial phase remains safe to abort rather than poisoning recovery.
 setup_test_env
-node_id=$("$WV" add "raced begin-only recovery" 2>/dev/null | grep -oP 'wv-[a-f0-9]+')
+node_id=$("$WV" add "raced begin-only recovery" 2>/dev/null | grep -oE 'wv-[a-f0-9]+')
 journal_begin "ship" "{\"id\":\"$node_id\",\"gh\":false}" "persist_intent"
 sqlite3 "$WV_DB" "UPDATE nodes SET status='done' WHERE id='$node_id';"
 "$WV" recover --auto >/dev/null 2>&1
@@ -509,7 +512,7 @@ assert_fails "markerless target-state race does not poison recovery" journal_has
 
 # Invalid ship targets are rejected before any marker or journal is created.
 setup_test_env
-node_id=$("$WV" add "already completed ship target" 2>/dev/null | grep -oP 'wv-[a-f0-9]+')
+node_id=$("$WV" add "already completed ship target" 2>/dev/null | grep -oE 'wv-[a-f0-9]+')
 "$WV" "done" "$node_id" --skip-verification >/dev/null 2>&1
 ship_rc=0
 "$WV" ship "$node_id" --skip-verification --no-gh >/dev/null 2>&1 || ship_rc=$?
@@ -528,7 +531,7 @@ echo ""
 echo -e "${CYAN}--- ship_pending metadata fallback ---${NC}"
 setup_test_env
 
-node_id=$("$WV" add "pending test" 2>/dev/null | grep -oP 'wv-[a-f0-9]+')
+node_id=$("$WV" add "pending test" 2>/dev/null | grep -oE 'wv-[a-f0-9]+')
 "$WV" work "$node_id" >/dev/null 2>&1
 
 # Manually set ship_pending (simulating cmd_ship start before crash)
@@ -553,7 +556,7 @@ assert_equals "1" "$pending" "rejected ship_pending fallback preserves marker"
 
 # Pre-close intent must survive loss of both the hot database and journal.
 setup_test_env
-node_id=$("$WV" add "pre-close reboot" 2>/dev/null | grep -oP 'wv-[a-f0-9]+')
+node_id=$("$WV" add "pre-close reboot" 2>/dev/null | grep -oE 'wv-[a-f0-9]+')
 "$WV" work "$node_id" >/dev/null 2>&1
 sqlite3 "$WV_DB" "UPDATE nodes SET metadata=json_set(COALESCE(metadata,'{}'),
   '\$.ship_pending',json('true'),'\$.ship_pending_mode','pre_close') WHERE id='$node_id';"
@@ -571,7 +574,7 @@ assert_equals "pre_close" "$recovery_mode" "recover reports persisted pre-close 
 # A real ship whose post-close publish fails must reboot to the last complete
 # pre-close snapshot, never a markerless or partially closed state.
 setup_test_env
-node_id=$("$WV" add "atomic close publish failure" 2>/dev/null | grep -oP 'wv-[a-f0-9]+')
+node_id=$("$WV" add "atomic close publish failure" 2>/dev/null | grep -oE 'wv-[a-f0-9]+')
 "$WV" work "$node_id" >/dev/null 2>&1
 setup_state_publish_fault 2
 ship_rc=0
@@ -590,7 +593,7 @@ assert_equals "active|pre_close" "$reboot_state" "failed atomic close publish re
 # which loses the mutation for every existing clone with nothing to show it ever
 # existed.
 setup_test_env
-node_id=$("$WV" add "delta publication failure" 2>/dev/null | grep -oP 'wv-[a-f0-9]+')
+node_id=$("$WV" add "delta publication failure" 2>/dev/null | grep -oE 'wv-[a-f0-9]+')
 mkdir -p "$TEST_DIR/mock-bin"
 cat > "$TEST_DIR/mock-bin/mv" <<'EOF'
 #!/usr/bin/env bash
@@ -648,7 +651,7 @@ assert_equals "0" "$post_close_ops" "a refused acknowledgement publishes no delt
 # A real ship whose final clearance publish fails leaves the prior durable
 # done/post_close snapshot available for idempotent reboot recovery.
 setup_test_env
-node_id=$("$WV" add "clear publish failure" 2>/dev/null | grep -oP 'wv-[a-f0-9]+')
+node_id=$("$WV" add "clear publish failure" 2>/dev/null | grep -oE 'wv-[a-f0-9]+')
 "$WV" work "$node_id" >/dev/null 2>&1
 setup_state_publish_fault 3
 ship_rc=0
@@ -667,7 +670,7 @@ assert_equals "0" "$pending" "post-close publish failure recovers idempotently a
 
 # Post-close state is durably pending until recovery clears and persists it.
 setup_test_env
-node_id=$("$WV" add "post-close reboot" 2>/dev/null | grep -oP 'wv-[a-f0-9]+')
+node_id=$("$WV" add "post-close reboot" 2>/dev/null | grep -oE 'wv-[a-f0-9]+')
 sqlite3 "$WV_DB" "UPDATE nodes SET status='done', metadata=json_set(COALESCE(metadata,'{}'),
   '\$.ship_pending',json('true'),'\$.ship_pending_mode','post_close') WHERE id='$node_id';"
 "$WV" sync >/dev/null 2>&1
@@ -682,7 +685,7 @@ assert_equals "0" "$pending" "post-close marker clearance survives a second rebo
 
 # Legacy boolean-only markers remain recoverable during protocol rollout.
 setup_test_env
-node_id=$("$WV" add "legacy pending reboot" 2>/dev/null | grep -oP 'wv-[a-f0-9]+')
+node_id=$("$WV" add "legacy pending reboot" 2>/dev/null | grep -oE 'wv-[a-f0-9]+')
 sqlite3 "$WV_DB" "UPDATE nodes SET status='done', metadata=json_set(COALESCE(metadata,'{}'),
   '\$.ship_pending',json('true')) WHERE id='$node_id';"
 "$WV" sync >/dev/null 2>&1
@@ -694,7 +697,7 @@ assert_equals "0" "$pending" "legacy boolean ship_pending remains recoverable"
 
 # A completed ship persists marker clearance before reporting a clean journal.
 setup_test_env
-node_id=$("$WV" add "completed ship reboot" 2>/dev/null | grep -oP 'wv-[a-f0-9]+')
+node_id=$("$WV" add "completed ship reboot" 2>/dev/null | grep -oE 'wv-[a-f0-9]+')
 "$WV" work "$node_id" >/dev/null 2>&1
 "$WV" ship "$node_id" --skip-verification --no-gh >/dev/null 2>&1
 status=$(sqlite3 "$WV_DB" "SELECT status FROM nodes WHERE id='$node_id';")
@@ -715,17 +718,17 @@ echo ""
 echo -e "${CYAN}--- pending_close metadata fallback ---${NC}"
 setup_test_env
 
-seed_id=$("$WV" add "seed pending-close learning" 2>/dev/null | grep -oP 'wv-[a-f0-9]+')
+seed_id=$("$WV" add "seed pending-close learning" 2>/dev/null | grep -oE 'wv-[a-f0-9]+')
 overlap_learning="decision: keep overlap prompts resumable | pattern: store pending close state | pitfall: tty prompts hang unattended flows"
 WV_REQUIRE_LEARNING=1 "$WV" "done" "$seed_id" --learning="$overlap_learning" >/dev/null 2>&1
 
-node_id=$("$WV" add "pending close test" 2>/dev/null | grep -oP 'wv-[a-f0-9]+')
+node_id=$("$WV" add "pending close test" 2>/dev/null | grep -oE 'wv-[a-f0-9]+')
 pending_close_exit=0
 WV_REQUIRE_LEARNING=1 WV_NONINTERACTIVE=1 "$WV" "done" "$node_id" --learning="$overlap_learning" >/dev/null 2>&1 || pending_close_exit=$?
 assert_equals "0" "$pending_close_exit" "done succeeds non-interactively when overlap detected (advisory only)"
 
 # Recovery of legacy pending_close nodes (nodes stuck under old blocking behavior)
-legacy_stuck=$("$WV" add "legacy stuck node" 2>/dev/null | grep -oP 'wv-[a-f0-9]+')
+legacy_stuck=$("$WV" add "legacy stuck node" 2>/dev/null | grep -oE 'wv-[a-f0-9]+')
 legacy_stuck_meta=$(jq -n --arg node "$legacy_stuck" \
     '{"needs_human_verification": true, "pending_close": {"reason": "learning_overlap", "overlap_with": "wv-fake", "learning": "test", "resume_command": ("wv done " + $node + " --acknowledge-overlap")}}')
 "$WV" update "$legacy_stuck" --metadata="$legacy_stuck_meta" >/dev/null 2>&1

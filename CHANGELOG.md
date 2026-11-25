@@ -2,14 +2,120 @@
 
 <!-- markdownlint-disable MD024 -->
 
+## [1.71.0-rc.19] - 2026-11-25
+
+### Upgrading
+
+- Weave now needs Python 3.11 or newer and bash 4 or newer, and checks both up front. On macOS,
+  install them with Homebrew; Weave finds Homebrew's copies even when Apple's python 3.9 or bash 3.2
+  comes first on PATH. Set `WV_PYTHON` or `WV_BASH` to name a specific one.
+- The sqlite3 Weave uses must include FTS5. `./install.sh --check-deps` now exits nonzero when a
+  required dependency is missing, and the install names the sqlite3 it found.
+- Run `wv init-repo --update` in each repository. It removes Weave's unedited copy of the retired
+  `context-guard.sh` hook, installs the hooks that rebuild the `.weave/` snapshot after a rebase or
+  merge, and refreshes every Copilot or Codex surface the repository already has.
+- If the install reports that it skipped or failed the MCP server rebuild, it now exits 1. Run the
+  rebuild command it names, then `wv mcp-status`, which now fails when the server's version differs
+  from the CLI's.
+- Restart agent sessions after upgrading: the MCP server and hooks load the new version only at
+  session start.
+
+### Added
+
+- **The `.weave/` snapshot is rebuilt after a rebase or merge.** A merge keeps one side's graph
+  snapshot while both sides' operations travel, and `git push` then refused with
+  `projection_lags_operations`. The new `post-rewrite` and `post-merge` hooks run
+  `wv recover --reproject`, which loads, syncs and makes a new commit holding only `.weave/`. It
+  never amends your commits and never fails git, and it says why when it defers (during a gate, with
+  `WV_AUTO_CHECKPOINT=0`, or with other files staged).
+- **`wv hotzone migrate`** moves a hot zone from the earlier `/tmp/weave-codex-<uid>` layout to its
+  neutral name in a quiet window. Without `--apply` it reports what it would do, and it moves
+  nothing while any process holds the old path.
+- **`wv analyze gates` reports attempts until the first green gate**, per commit and per week, with
+  gate time and elapsed time to green. Suite and gate records name the tree they judged.
+- **The commit gate reports a commit's net test lines** when it stages test files, against
+  `WV_GATE_TEST_LINE_BUDGET` (default 150). It is advisory and never refuses.
+- **`WV_DELTA_V2_STRICT_SINCE`** limits strict replay (`WV_DELTA_V2_STRICT=1`) to operations at or
+  after a lineage, or after the loaded snapshot with `snapshot`. A strict abort names the operations
+  that caused it and puts back the graph the hot zone held.
+
+### Changed
+
+- **Hooks judge a command in the checkout it runs in.** `cd <worktree> && wv done <id>` is judged
+  against that worktree's log, files and graph, not the session's checkout. A command whose
+  directory the hook cannot know without running it (`$var`, `cd -`, `ssh`, `sudo`, `bash -c`) is
+  refused. `ssh host wv done <id>` used to pass when the node was not in the local graph; it is now
+  refused.
+- **One session's running command no longer blocks another's.** The duplicate-command lock is kept
+  per agent session. A call that names no session keeps the shared lock, and its denial says so.
+- **The prettier hook skips files git ignores**, such as `node_modules`, build output and
+  `.claude/settings.local.json`.
+- **The Copilot adapter no longer writes the root `.mcp.json`**, which belongs to Claude Code. VS
+  Code reads `.vscode/mcp.json`. `wv init-repo --update` removes a Weave-written root copy in the VS
+  Code shape and keeps any other.
+- **A fresh `/tmp` hot zone is created under its neutral name**, `/tmp/weave-hotzone-<uid>`, with
+  the legacy name as a link to it. An existing legacy layout is used as it stands.
+- **The commit gate stops its lanes at the first refusal** instead of waiting for the others, and
+  reports the stopped lanes as not judged.
+
+### Fixed
+
+- **macOS fixes.** macOS is not yet a supported platform: some test suites still fail there. With
+  Homebrew's bash 4 and python 3.11 installed, these failures under Apple's tools are fixed:
+  - `wv load` replayed no deltas and reported success, losing every unsynced write.
+  - `wv load` could replace a healthy database that another process held locked.
+  - Graph locks took no lock without `flock(1)`, which let a load and a write race.
+  - The claim and close hooks judged no policy, and the pre-close guard let through a close it
+    should have held.
+  - `wv query <predicate>` exited 1 with no message, and every `wv graduate` verdict refused.
+  - The commit gate refused or misjudged every suite, and gate recovery refused outright.
+  - A second session removed a live peer's session files as an ended session's.
+  - Counts, sizes and dates printed padding or literal format codes, and `wv doctor` reported host
+    versions as `unknown`.
+  - Read-only opens of a graph copy failed with Apple's sqlite3.
+  - Hot zones under a `TMPDIR` with a trailing slash failed their path checks, and `wv hotzone gc`
+    could misjudge them.
+- **With git 2.56, the commit gate checks every commit's tree again.** A new reference-transaction
+  state let a commit through unchecked, including a file staged after the gate's last check.
+- **A sqlite3 without FTS5 is refused instead of half-initialising the graph.** `wv init` had
+  reported success, every write then failed, and `wv doctor` advised a repair that could not help.
+- **`wv hotzone gc` no longer deletes a hot zone whose repository it cannot see**, such as one on an
+  unmounted disk. A zone whose repository is known to be gone moves to `<base>/.quarantine/` and is
+  purged only after `WV_HOTZONE_QUARANTINE_DAYS` (default 7); `wv hotzone restore <name>` moves one
+  back. Rebuild advice moves a zone aside instead of removing it.
+- **An MCP server the install could not rebuild no longer passes as current.** With node on PATH and
+  npm absent, as under nvm in a non-interactive shell, an old server could run under a new CLI.
+- **Two clones that claim one node at once now agree on the holder**, and the clone whose claim lost
+  is told.
+- **A clone without Weave's merge drivers is reported at session start**, with one `git config` line
+  that registers them. `wv doctor --repair` registers them too.
+- **The generated Codex hooks and contract work in a consumer repository.** They named a
+  `./scripts/wv` that only Weave's source checkout has. A repository with no `AGENTS.md` now gets
+  one from the shipped template; an existing file is never overwritten.
+- **`wv doctor` and `wv init-repo` agree on retired hooks and adapter surfaces.** A retired hook is
+  reported as retired with its `git rm` command, not as missing. `wv init-repo --update` refreshes
+  every adapter surface present, and the doctor names the `--agent` to adopt a new one.
+- **`wv init-repo` names generated files your ignore rules hide**, such as `.codex/weave.json` under
+  a `*.json` rule, with the rule that hides each. `wv doctor` has the same check.
+- **`wv init-repo --codex-mcp` finds the installed MCP server**, and finds a codex binary outside
+  PATH (`--codex-bin=PATH`, the VS Code extension, nvm).
+- **The refusal for a remote Weave cannot verify names the flag its remedy needs**
+  (`--acknowledge-upstream-fork`).
+- **A blocked node whose last blocker is removed returns to ready.** `wv unlink`, `wv delete`,
+  `wv prune` and `wv clean-ghosts` left it blocked. `wv health` lists nodes already stuck that way,
+  and `wv health --fix` returns them to todo.
+- **`wv test-status` reads its records on a sqlite3 that escapes control characters**; every fresh
+  green record had read as stale.
+- **Another session's `wv` calls no longer fail a running gate.**
+
 ## [1.71.0-rc.18] - 2026-11-18
 
 ### Upgrading
 
-- Run `wv init-repo --update` in each repository. It refreshes the generated skills, removes
-  Weave's own unedited copies of retired skills (`fix-issue`, `sanity-check`, `wv-detect-loop`,
-  `ship-it`, `resolve-refs` among them; an edited copy stays and is reported), and registers the
-  `.weave/` merge drivers, including `wv-trails`.
+- Run `wv init-repo --update` in each repository. It refreshes the generated skills, removes Weave's
+  own unedited copies of retired skills (`fix-issue`, `sanity-check`, `wv-detect-loop`, `ship-it`,
+  `resolve-refs` among them; an edited copy stays and is reported), and registers the `.weave/`
+  merge drivers, including `wv-trails`.
 - If `git push` refuses with `projection_lags_operations`, run `wv load`, then `wv sync`, then push
   again.
 - Codex users: run `wv doctor`. It now reads hook trust from your Codex config and names any event
@@ -29,33 +135,33 @@
   names the unrouted files, which no test checked. `wv impact --suites --unmatched --files=<paths>`
   lists them. Add a `[default]` entry to route every remaining file to a fail-safe suite.
 
-- **Graph-only memories.** `wv remember --exposure=graph-only` captures a memory that stays out
-  of the instruction-file projections and `wv bootstrap`'s memory index, while `wv memory recall`,
+- **Graph-only memories.** `wv remember --exposure=graph-only` captures a memory that stays out of
+  the instruction-file projections and `wv bootstrap`'s memory index, while `wv memory recall`,
   `wv show` and `wv search` still return it. An existing memory changes through a review verdict,
   `wv memory review <id> --verdict=exposure --exposure=graph-only --reason=<why>`, applied by
   `wv memory review --apply`, which records who chose it, when and why. Memories are rendered by
   default, and existing ones are unchanged until such a verdict is applied.
 
 - **Upgrades replace Weave's own earlier skill files.** A skill file Weave installed before skills
-  were marked as managed is recognised by its content: when a newer release projects that skill,
-  an unedited copy is replaced and the replacement is reported. A copy you edited is left alone
-  and the projection says so.
+  were marked as managed is recognised by its content: when a newer release projects that skill, an
+  unedited copy is replaced and the replacement is reported. A copy you edited is left alone and the
+  projection says so.
 
-- **`wv show <id> --actors` says who created, claimed and closed a node.** It reads the
-  append-only operation log, which records one actor per change, and lists every event. Also on
-  `--json`, `--json-v2` and the MCP `weave_show` tool. History older than that log reports a
-  reason instead of a guess.
+- **`wv show <id> --actors` says who created, claimed and closed a node.** It reads the append-only
+  operation log, which records one actor per change, and lists every event. Also on `--json`,
+  `--json-v2` and the MCP `weave_show` tool. History older than that log reports a reason instead of
+  a guess.
 
-- **`wv doctor` names more problems it used to pass over.** Each is a warning with its remedy:
-  a pattern rule file under `.weave/patterns/` that breaks the rule contract and is therefore not
+- **`wv doctor` names more problems it used to pass over.** Each is a warning with its remedy: a
+  pattern rule file under `.weave/patterns/` that breaks the rule contract and is therefore not
   applied; an edge whose endpoint is no node; a node closed over a day ago that the `main` branch's
   committed graph does not hold as done; a `.weave/` merge driver named in `.gitattributes` but not
   registered in this clone; and, for Codex, each hook event that is untrusted or whose entry changed
   since you trusted it. `wv doctor` reads these and changes none of them.
 
-- **The pre-commit hook refuses a broken pattern rule file.** A staged file under
-  `.weave/patterns/` that breaks the rule contract is refused and named with its error, instead of
-  committing and then being skipped. A broken rule already committed does not block other commits.
+- **The pre-commit hook refuses a broken pattern rule file.** A staged file under `.weave/patterns/`
+  that breaks the rule contract is refused and named with its error, instead of committing and then
+  being skipped. A broken rule already committed does not block other commits.
 
 - **`wv hook dispatch` accepts the neutral hook event names** (`session_start`, `before_edit`,
   `before_commit`, `session_end` and the rest). The host event names in existing hook files keep
@@ -66,31 +172,31 @@
   those tools read. It is written only when you select one of them or the repository already holds
   Weave's managed copy there, because those tools load it without asking.
 
-- **Claiming a node that retires a name lists what still uses it.** Set
-  `metadata.retires` (for example `"skill:<name>"`) and `wv work` prints every reference to that
-  name under `tests/`, `scripts/`, `templates/` and `install.sh` before work starts.
+- **Claiming a node that retires a name lists what still uses it.** Set `metadata.retires` (for
+  example `"skill:<name>"`) and `wv work` prints every reference to that name under `tests/`,
+  `scripts/`, `templates/` and `install.sh` before work starts.
 
 ### Changed
 
-- **Graph writes no longer modify tracked files; a branch switch is not refused.** Each `wv`
-  write publishes its change as a new file under `.weave/deltas/`; `state.sql`, `nodes.jsonl` and
-  `edges.jsonl` are rewritten by `wv sync`, the auto-checkpoint and `wv load`. `wv load` replays
-  the deltas over `state.sql`: a write that reported success survives a reboot. Deltas not yet
-  committed stay in the working tree across `git checkout`.
+- **Graph writes no longer modify tracked files; a branch switch is not refused.** Each `wv` write
+  publishes its change as a new file under `.weave/deltas/`; `state.sql`, `nodes.jsonl` and
+  `edges.jsonl` are rewritten by `wv sync`, the auto-checkpoint and `wv load`. `wv load` replays the
+  deltas over `state.sql`: a write that reported success survives a reboot. Deltas not yet committed
+  stay in the working tree across `git checkout`.
 - **Concurrent `.weave/trails.md` notes merge instead of conflicting.** Run `wv init-repo --update`
   to register the `wv-trails` merge driver: both sides' notes and completion records are kept, and
   the next `wv trails save` rebuilds the generated sections.
 
-- **AGENTS.md points to graph memory instead of carrying it.** The AGENTS.md template has no
-  memory block any more; it says that durable memory lives in the Weave graph and names
-  `wv memory recall --agent=all --json`, `wv remember` and `wv bootstrap --json`. An AGENTS.md
-  that already has the `WEAVE:MEMORY` block keeps it and is still refreshed; delete the two
-  markers to stop that.
+- **AGENTS.md points to graph memory instead of carrying it.** The AGENTS.md template has no memory
+  block any more; it says that durable memory lives in the Weave graph and names
+  `wv memory recall --agent=all --json`, `wv remember` and `wv bootstrap --json`. An AGENTS.md that
+  already has the `WEAVE:MEMORY` block keeps it and is still refreshed; delete the two markers to
+  stop that.
 
-- **Session start is faster.** It now skips the full graph rebuild when the live graph already
-  holds what `.weave/` holds. A pull, a sync from elsewhere, an unsynced write, a new Weave version
-  or a fresh boot still rebuilds in full. Measured on a large graph: 36 s on a cold start, 8 s on
-  the starts after it.
+- **Session start is faster.** It now skips the full graph rebuild when the live graph already holds
+  what `.weave/` holds. A pull, a sync from elsewhere, an unsynced write, a new Weave version or a
+  fresh boot still rebuilds in full. Measured on a large graph: 36 s on a cold start, 8 s on the
+  starts after it.
 
 - **Skills are generated from Weave's procedures.** Every shipped skill is now a projection of a
   procedure that `wv guide --procedure=<name>` prints, and each rule has one home. Overlapping
@@ -105,27 +211,27 @@
   multi-hour suite.
 
 - **Copilot CLI is recognised as Copilot**, with its own session, in hooks and in its tool shell.
-  Amp and pi sessions that do not set `AI_AGENT` are recognised from their session variables when
-  no other agent's marker is present.
+  Amp and pi sessions that do not set `AI_AGENT` are recognised from their session variables when no
+  other agent's marker is present.
 
 - **`wv context-policy` states what each level means** (search first, read limits, summarise), and
   the session-start line, `wv guide --topic=context` and the MCP overview print the same table.
 
-- **The stale-findings warning moves to `wv bootstrap`.** The unregistered `context-guard.sh`
-  hook is retired and `install.sh` removes an installed copy.
+- **The stale-findings warning moves to `wv bootstrap`.** The unregistered `context-guard.sh` hook
+  is retired and `install.sh` removes an installed copy.
 
 ### Fixed
 
 - **The edit guard no longer lets an edit through when the graph is busy.** While a load, sync or
   migration held the graph, the guard could wait past the host's 10 s hook limit, and the host then
-  ran the edit unchecked. The guard now finishes within 7 s (`WV_PTU_WAIT_BUDGET_MS`) and refuses
-  an edit it could not judge in that time; retry once the other work finishes. An edit whose
-  Context Pack cannot be made is also refused instead of passed through.
+  ran the edit unchecked. The guard now finishes within 7 s (`WV_PTU_WAIT_BUDGET_MS`) and refuses an
+  edit it could not judge in that time; retry once the other work finishes. An edit whose Context
+  Pack cannot be made is also refused instead of passed through.
 
-- **Checks no longer pass on empty input under jq 1.6.** On jq 1.6, `jq -e` exits 0 on empty
-  input, and a guard reading an empty value took its permissive branch: a gate that ran no lane
-  wrote no gate record, and empty evidence output skipped a pre-push refusal. Every such check now
-  refuses empty, unparsable or multiple values on jq 1.6 and 1.7 alike.
+- **Checks no longer pass on empty input under jq 1.6.** On jq 1.6, `jq -e` exits 0 on empty input,
+  and a guard reading an empty value took its permissive branch: a gate that ran no lane wrote no
+  gate record, and empty evidence output skipped a pre-push refusal. Every such check now refuses
+  empty, unparsable or multiple values on jq 1.6 and 1.7 alike.
 
 - **A pull no longer lets a sync drop another copy's nodes.** After pulling graph commits without
   `wv load`, a write and `wv sync` rewrote `state.sql` from a graph that lacked them. Every writer
@@ -135,29 +241,28 @@
   upstream copy of `state.sql` while this copy's changes still travel. The pre-push hook now detects
   it and refuses with the remedy; `wv status`, `wv recover` and `wv doctor` report it.
 
-- **Two agent sessions in one checkout no longer disturb each other's session state.** The
-  session start marker, heartbeat, stop record and edit budget are kept per session. A second
-  session's start no longer marks the first session's claim stale or reads its live heartbeat as
-  a crash.
+- **Two agent sessions in one checkout no longer disturb each other's session state.** The session
+  start marker, heartbeat, stop record and edit budget are kept per session. A second session's
+  start no longer marks the first session's claim stale or reads its live heartbeat as a crash.
 
-- **A push refuses while a gate runs in another worktree.** Each worktree has its own gate lock,
-  and a push from one worktree could publish beneath a gate running in another. The pre-push hook
-  now refuses while a live gate runs in any worktree of the repository and names it. An automatic
+- **A push refuses while a gate runs in another worktree.** Each worktree has its own gate lock, and
+  a push from one worktree could publish beneath a gate running in another. The pre-push hook now
+  refuses while a live gate runs in any worktree of the repository and names it. An automatic
   checkpoint during such a gate commits locally but skips its fetch, and a hold made in the main
   worktree now covers the linked worktrees.
 
 - **Copilot CLI patch edits are judged instead of refused.** Copilot CLI on a GPT model sends a
-  patch as a bare string, which the edit guard refused as malformed even with a claimed node. A
-  live Copilot CLI or VS Code Copilot session in the checkout is now also reported as a live peer.
+  patch as a bare string, which the edit guard refused as malformed even with a claimed node. A live
+  Copilot CLI or VS Code Copilot session in the checkout is now also reported as a live peer.
 
 - **A pasted readiness command no longer creates a file.** The stale-findings advisory and the
   `wv query` help now quote comparison predicates such as `'stale>=14'`.
 
-- **The session-start summary no longer shows an empty graph when it cannot read status.** It
-  reads `wv status --json` and says when status is unavailable instead of printing zero counts.
+- **The session-start summary no longer shows an empty graph when it cannot read status.** It reads
+  `wv status --json` and says when status is unavailable instead of printing zero counts.
 
-- **The `weave-audit` report finishes on a populated graph.** It exited early in its first section and
-  checked fields `wv list --json` does not have. It is rewritten and installed beside the
+- **The `weave-audit` report finishes on a populated graph.** It exited early in its first section
+  and checked fields `wv list --json` does not have. It is rewritten and installed beside the
   `weave-audit` skill.
 
 - **Bash function complexity is measured correctly.** Two parser faults made some functions run to

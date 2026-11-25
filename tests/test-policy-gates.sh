@@ -389,7 +389,7 @@ echo "=== a pre-invocation hook denial is outside the wv-call denominator ==="
 # denominator check, and a row synthesized for one must fail it.
 HOOK_J="$TEST_DIR/hook-journal.jsonl"
 WV_ATTEMPT_JOURNAL="$HOOK_J" "$WV" status >/dev/null 2>&1
-before=$(wc -l < "$HOOK_J")
+before=$(( $(wc -l < "$HOOK_J") ))
 echo '{"tool_name":"Edit","tool_input":{"file_path":"'"$HOME"'/.local/bin/wv"}}' |
     WV_ATTEMPT_JOURNAL="$HOOK_J" bash "$ROOT/.claude/hooks/pre-action.sh" >/dev/null 2>&1
 hook_rc=$?
@@ -399,8 +399,8 @@ if jq -e 'select(.rule=="edit_source_not_installed_copy" or .rule=="edit_require
 else
     ok "the hook denial wrote no wv call row"
 fi
-new_started=$(tail -n +"$((before + 1))" "$HOOK_J" | jq -r 'select(.event=="call_started") | .call_id' | wc -l)
-new_ids=$(tail -n +"$((before + 1))" "$HOOK_J" | jq -r '.call_id' | sort -u | wc -l)
+new_started=$(( $(tail -n +"$((before + 1))" "$HOOK_J" | jq -r 'select(.event=="call_started") | .call_id' | wc -l) ))
+new_ids=$(( $(tail -n +"$((before + 1))" "$HOOK_J" | jq -r '.call_id' | sort -u | wc -l) ))
 [ "$new_started" = "$new_ids" ] && ok "any wv call the hook launched is a real call with its own call_started ($new_started)" ||
     bad "any wv call the hook launched is a real call with its own call_started" "$new_started started, $new_ids ids"
 if report=$(python3 "$ROOT/scripts/weave_policy.py" denominator "$HOOK_J"); then
@@ -435,7 +435,7 @@ fi
 
 echo "=== every event is schema-valid ==="
 if python3 "$ROOT/tests/lib/journal-validate.py" "$JOURNAL" 2>"$TEST_DIR/schema.err"; then
-    ok "all $(wc -l < "$JOURNAL") events validate against the attempt-journal schema"
+    ok "all $(( $(wc -l < "$JOURNAL") )) events validate against the attempt-journal schema"
 else
     bad "all events validate against the attempt-journal schema" "$(head -3 "$TEST_DIR/schema.err")"
 fi

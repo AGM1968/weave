@@ -11,9 +11,10 @@ export WV_CALL_SOURCE=test
 #
 # The /tmp zone has two names (wv-95bddf, owner decision 2026-10-05):
 # /tmp/weave-hotzone-<uid> (NEUZ), the neutral one a process is given, and
-# /tmp/weave-codex-<uid> (TMPZ), the legacy one, which stays the physical
-# directory while old binaries can still create it. The neutral name is a
-# symlink to it, never a second real directory, until a deliberate relocation.
+# /tmp/weave-codex-<uid> (TMPZ), the legacy one. Created fresh (wv-97d68a), the
+# neutral name is the real directory and the legacy name a fence symlink to it;
+# the earlier layout (the legacy directory real, the neutral name its alias) is
+# still adopted as it stands, and wv hotzone migrate relocates it.
 #
 # Every case runs bash (wv hotzone db) and python (weave_gh _resolve_db_path)
 # with and without an agent marker, in both start orders, and requires one DB
@@ -24,6 +25,10 @@ export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# The product's md5sum (wv-resolve-runtime.sh, side-effect free): the repo hash a
+# product path is keyed on, the same on macOS, which has no md5sum(1) (wv-ef5621).
+# shellcheck disable=SC1091  # resolved at run time
+source "$ROOT/scripts/lib/wv-resolve-runtime.sh"
 WV="$ROOT/scripts/wv"
 
 run=0; pass=0
@@ -32,9 +37,13 @@ bad() { run=$((run+1)); echo "  ✗ $1"; [ -n "${2:-}" ] && echo "      $2"; }
 check() { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1" "expected [$2], got [$3]"; fi; }
 has() { if [[ "$3" == *"$2"* ]]; then ok "$1"; else bad "$1" "expected to contain [$2], got [$3]"; fi; }
 
+# macOS has one zone base, $TMPDIR/weave-<uid>, and none of the Linux names:
+# a short section below checks that instead of skipping (wv-4ccc98).
+DARWIN=0
 case "${OSTYPE:-}" in
     linux*) ;;
-    *) echo "Linux placement only; skipped on ${OSTYPE:-unknown}"; echo "Results: 0/0 passed"; exit 0 ;;
+    darwin*) DARWIN=1 ;;
+    *) echo "Linux and macOS placement only; skipped on ${OSTYPE:-unknown}"; echo "Results: 0/0 passed"; exit 0 ;;
 esac
 
 T=$(mktemp -d /tmp/wv-hot-zone-placement-XXXXXX)
@@ -91,6 +100,22 @@ agree() {
         check "$label: python, $who" "$want" "$(py_db "$who")"
     done
 }
+
+if [ "$DARWIN" = 1 ]; then
+    # The test root prefixes the temp-directory zone as it prefixes the Linux
+    # zones, so a suite isolates the same way on every OS (wv-19572f, owner
+    # 2026-11-23); before, darwin ignored the root and a suite that set only
+    # the root reached the live per-user zone.
+    echo "macOS: one zone under <test root>\$TMPDIR/weave-<uid>, bash and python agreeing"
+    mkdir -p "$T/tmpdir"
+    export TMPDIR="$T/tmpdir/"   # macOS's own TMPDIR ends in a slash
+    agree "TMPDIR with a trailing slash" "$Z$T/tmpdir/weave-$uid/$HASH/brain.db"
+    check "no doubled slash in the resolved path" "" "$(bash_db1 human | grep -F '//' || true)"
+    echo ""
+    echo "Results: $pass/$run passed"
+    [ "$pass" -eq "$run" ]
+    exit $?
+fi
 
 echo "no database: every process uses the /tmp zone"
 reset
@@ -149,15 +174,14 @@ echo "the /tmp zone's two names (wv-95bddf)"
 is_link_to() { [ -L "$1" ] && [ "$(readlink -- "$1")" = "$2" ] && echo yes || echo no; }
 reset
 as human "$WV" init >/dev/null 2>&1
-check "wv init makes the legacy directory real" "yes" "$([ -d "$TMPZ" ] && [ ! -L "$TMPZ" ] && echo yes || echo no)"
-check "and the neutral name a symlink to it" "yes" "$(is_link_to "$NEUZ" "$TMPZ")"
+check "wv init makes the neutral directory real (wv-97d68a)" "yes" "$([ -d "$NEUZ" ] && [ ! -L "$NEUZ" ] && echo yes || echo no)"
+check "and the legacy name a fence symlink to it" "yes" "$(is_link_to "$TMPZ" "$NEUZ")"
 check "one database under both names" "yes" "$([ "$NEUZ/$HASH/brain.db" -ef "$TMPZ/$HASH/brain.db" ] && echo yes || echo no)"
-# An old binary knows only the legacy name; what it writes is what we read.
-as human env WV_HOT_ZONE="$TMPZ/$HASH" "$WV" add "written by the legacy name" >/dev/null 2>&1
-# Read the file itself, read-only: through wv, a fresh database at any path
-# loads the same rows from the repository's .weave/, which proves nothing.
-check "a write by the legacy name is in the file the neutral name reaches" "1" \
-    "$(sqlite3 -readonly "$NEUZ/$HASH/brain.db" "SELECT count(*) FROM nodes WHERE text='written by the legacy name';" 2>&1)"
+# A process that knows only the legacy name (an old binary, a resolved
+# WV_HOT_ZONE) is refused by the base guard rather than given a second zone.
+out=$(as human env WV_HOT_ZONE="$TMPZ/$HASH" "$WV" add "written by the legacy name" 2>&1; echo "rc=$?")
+has "a write by the legacy name is refused at the fence" "refusing to use hot-zone base $TMPZ: it is a symlink" "$out"
+check "and no second directory appears under it" "yes" "$(is_link_to "$TMPZ" "$NEUZ")"
 
 reset; populate "$TMPZ"
 agree "legacy only: used by its legacy name" "$TMPZ/$HASH/brain.db"
@@ -170,7 +194,7 @@ check "nothing moved: the database is still in the real legacy directory" "yes" 
 reset; populate "$NEUZ"
 agree "relocated (neutral only): used directly" "$NEUZ/$HASH/brain.db"
 as human "$WV" status >/dev/null 2>&1
-check "no legacy directory is recreated beside it" "no" "$([ -e "$TMPZ" ] && echo yes || echo no)"
+check "no legacy directory is recreated beside it: only the fence link" "yes" "$(is_link_to "$TMPZ" "$NEUZ")"
 
 # Another repository's database in the legacy directory: the refusal is about
 # the zone's two names, not this repository holding two copies.
@@ -207,7 +231,13 @@ rm -rf "$T/elsewhere"
 reset; ln -s "$TMPZ" "$NEUZ"
 agree "an alias whose legacy directory was removed is usable" "$NEUZ/$HASH/brain.db"
 as human "$WV" status >/dev/null 2>&1
-check "first use recreates the legacy directory" "yes" "$([ -d "$TMPZ" ] && [ ! -L "$TMPZ" ] && echo yes || echo no)"
+check "first use makes the neutral name the directory (wv-97d68a)" "yes" "$([ -d "$NEUZ" ] && [ ! -L "$NEUZ" ] && echo yes || echo no)"
+check "and the legacy name its fence link" "yes" "$(is_link_to "$TMPZ" "$NEUZ")"
+
+reset; ln -s "$NEUZ" "$TMPZ"
+agree "a fence link whose directory was removed: the neutral name" "$NEUZ/$HASH/brain.db"
+as human "$WV" status >/dev/null 2>&1
+check "first use recreates the neutral directory behind the fence link" "yes" "$([ -d "$NEUZ" ] && [ ! -L "$NEUZ" ] && echo yes || echo no)"
 
 echo "the test root is inert without WV_TEST_MODE=1"
 # shellcheck disable=SC2016  # $1/$2 expand in the bash -c child, passed as positional arguments

@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+: "${WV_BSD_SHIM_REAL:=${0%/*}/../real}"  # env -i drops the export; this stand-in sits in bin/ beside real/ (wv-43082a)
+# BSD sed stand-in (wv-418760): GNU sed run with --posix, and -i read the BSD
+# way. BSD takes the argument after a bare -i as the backup suffix, so the
+# script is then read as a file and the file as a script. A label ends at the
+# newline in BSD sed, so ':a;N;ba' names a label 'a;N;ba' and the branch has
+# no target; GNU sed --posix still accepts it, so it is refused here
+# (wv-0bf286: the real macOS run stopped test-init-repo on it, the shim did not).
+label_semi='(^|[;{[:space:]]):[A-Za-z_][A-Za-z0-9_]*;'
+for ((k = 1; k <= $#; k++)); do
+    a="${!k}"
+    if [[ "$a" =~ $label_semi ]]; then
+        echo "sed: 1: \"$a\": undefined label (BSD sed: a label ends at the newline, not ';')" >&2; exit 1
+    fi
+    case "$a" in
+        --in-place*|-i) n=$((k + 1)); echo "sed: 1: \"${!n:-}\": invalid command code (BSD sed: -i takes the next argument as the backup suffix)" >&2; exit 1 ;;
+        --*) ;;
+        -*i*) [[ "$a" == -*i ]] && { echo "sed: 1: invalid command code (BSD sed: $a takes the next argument as the backup suffix)" >&2; exit 1; } ;;
+    esac
+done
+exec "$WV_BSD_SHIM_REAL/sed" --posix "$@"

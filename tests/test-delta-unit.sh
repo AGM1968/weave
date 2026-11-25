@@ -14,6 +14,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 source "$REPO_ROOT/scripts/lib/wv-delta.sh"
+# wv_now: a validated clock; BSD date may print %N literally (wv-43082a).
+source "$REPO_ROOT/scripts/lib/wv-resolve-runtime.sh"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -37,7 +39,7 @@ fail() {
 
 make_db() {
     local db
-    db=$(mktemp /tmp/delta-unit-XXXXXX.db)
+    db=$(mktemp /tmp/delta-unit-XXXXXX)
     sqlite3 "$db" "
 CREATE TABLE nodes(
     id TEXT PRIMARY KEY,
@@ -68,7 +70,7 @@ CREATE TABLE edges(
 make_recv() {
     # Receiver DB: same schema, no triggers needed (receives replayed SQL)
     local r
-    r=$(mktemp /tmp/delta-recv-XXXXXX.db)
+    r=$(mktemp /tmp/delta-recv-XXXXXX)
     sqlite3 "$r" "
 CREATE TABLE nodes(
     id TEXT PRIMARY KEY,
@@ -236,7 +238,7 @@ CS=$(wv_delta_changeset "$DB")
 
 # T12a: Fail-fast replay — bad delta aborts transaction, DB unchanged
 REPLAY_DB=$(make_db)
-BAD_DELTA=$(mktemp /tmp/bad-XXXXXX.sql)
+BAD_DELTA=$(mktemp /tmp/bad-XXXXXX)
 printf ".bail on\nBEGIN;\nINSERT INTO nodes(id,text) VALUES('wv-new','new node');\nINSERT INTO nonexistent_table VALUES(1);\nCOMMIT;\n" \
     > "$BAD_DELTA"
 sqlite3 "$REPLAY_DB" < "$BAD_DELTA" 2>/dev/null || true
@@ -466,7 +468,7 @@ rm -f "$DB"
 # that was never a real contender. These tests build that exact index so a
 # bug the plain-UNIQUE fixtures above cannot see is not concealed here too.
 make_partial_db() {
-    local db; db=$(mktemp /tmp/delta-partial-XXXXXX.db)
+    local db; db=$(mktemp /tmp/delta-partial-XXXXXX)
     sqlite3 "$db" "
 CREATE TABLE nodes(
     id TEXT PRIMARY KEY, text TEXT, status TEXT DEFAULT 'ready', metadata TEXT DEFAULT '{}',
@@ -827,9 +829,9 @@ SQL
 ) &
 BG_PID=$!
 sleep 0.5
-_race_start=$(date +%s.%N)
+_race_start=$(wv_now us)
 sqlite3 -cmd ".timeout 20000" "$DB" "UPDATE nodes SET status='CONCURRENT' WHERE id='wv-race';"
-_race_end=$(date +%s.%N)
+_race_end=$(wv_now us)
 wait "$BG_PID"
 _race_elapsed=$(awk -v s="$_race_start" -v e="$_race_end" 'BEGIN{printf "%.0f", (e-s)*1000}')
 _bg_watermark=$(grep -o 'watermark=[0-9]*' "$BG_OUT" | cut -d= -f2)

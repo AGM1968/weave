@@ -71,7 +71,7 @@ grep -qxF -- "$(sha "$SRC/.claude/skills/foo/SKILL.md") foo" "$LIST" && pass "th
     || fail "the current version is listed"
 grep -qE ' gone$' "$LIST" && pass "a skill deleted later keeps the versions it shipped" \
     || fail "a skill deleted later keeps the versions it shipped"
-[ "$(wc -l < "$LIST")" -eq 3 ] && pass "exactly the three shipped versions, no deletion entry" \
+[ "$(( $(wc -l < "$LIST") ))" -eq 3 ] && pass "exactly the three shipped versions, no deletion entry" \
     || fail "exactly the three shipped versions, no deletion entry" "$(cat "$LIST")"
 mkdir -p "$SCRATCH/nogit"
 if bash "$GEN" --repo="$SCRATCH/nogit" --out="$SCRATCH/nogit.txt" 2>/dev/null; then
@@ -79,6 +79,19 @@ if bash "$GEN" --repo="$SCRATCH/nogit" --out="$SCRATCH/nogit.txt" 2>/dev/null; t
 else
     [ -e "$SCRATCH/nogit.txt" ] && fail "a refused run writes nothing" || pass "a directory without git history is refused and writes nothing"
 fi
+# Hook versions are listed as hook:<file>, so a retired hook's unedited copy
+# can be told from an edited one (wv-96b61e); nested files are not hooks.
+mkdir -p "$SRC/.claude/hooks/lib"
+printf '#!/bin/bash\n# hook v1\n' > "$SRC/.claude/hooks/old-hook.sh"
+printf 'helper\n' > "$SRC/.claude/hooks/lib/helper.sh"
+git_q -C "$SRC" add -A && git_q -C "$SRC" commit -qm hooks
+git_q -C "$SRC" rm -q .claude/hooks/old-hook.sh && git_q -C "$SRC" commit -qm retire
+bash "$GEN" --repo="$SRC" --out="$LIST"
+grep -qxF -- "$(printf '#!/bin/bash\n# hook v1\n' | sha256sum | cut -d' ' -f1) hook:old-hook.sh" "$LIST" \
+    && pass "a deleted hook keeps the version it shipped, as hook:<file>" \
+    || fail "a deleted hook keeps the version it shipped, as hook:<file>" "$(cat "$LIST")"
+grep -q 'helper' "$LIST" && fail "a file below .claude/hooks/ is not a hook" "$(cat "$LIST")" \
+    || pass "a file below .claude/hooks/ is not a hook"
 
 echo ""
 echo "Projector"

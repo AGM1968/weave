@@ -25,7 +25,12 @@ TESTS_FAILED=0
 
 # Paths
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/lib/bounded.sh"  # timeout(1) is GNU-only; macOS has none (wv-f8e26d)
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# The product's md5sum (wv-resolve-runtime.sh, side-effect free): the repo hash a
+# product path is keyed on, the same on macOS, which has no md5sum(1) (wv-ef5621).
+# shellcheck disable=SC1091  # resolved at run time
+source "$PROJECT_ROOT/scripts/lib/wv-resolve-runtime.sh"
 WV="$PROJECT_ROOT/scripts/wv"
 
 # Test environment
@@ -325,9 +330,13 @@ test_codex_runtime_uses_tmp_hot_zone() {
     if [ "${WV_TEST_MODE:-}" = "1" ] && [[ "${WV_TEST_HOT_ZONE_ROOT:-}" == /* ]]; then
         zone_root="${WV_TEST_HOT_ZONE_ROOT%/}"
     fi
+    # On macOS the default zone is the temp-directory one, under the same test
+    # root (wv-19572f): the claim checked is "the default zone", not its name.
+    local tmpdir_zone="$zone_root${TMPDIR:-/tmp}"; tmpdir_zone="${tmpdir_zone%/}/weave-$uid/"
     _in_tmp_zone() {
-        case "$1" in
-            "$zone_root/tmp/weave-hotzone-$uid/"*|"$zone_root/tmp/weave-codex-$uid/"*) echo "in the /tmp zone" ;;
+        case "${OSTYPE:-}:$1" in
+            linux*:"$zone_root/tmp/weave-hotzone-$uid/"*|linux*:"$zone_root/tmp/weave-codex-$uid/"*) echo "in the /tmp zone" ;;
+            darwin*:"$tmpdir_zone"*) echo "in the /tmp zone" ;;
             *) echo "$1" ;;
         esac
     }
@@ -1233,7 +1242,10 @@ test_bootstrap_agent() {
     assert_equals "$PROJECT_ROOT/scripts/wv" "$agent_wv" "bootstrap-agent prefers repo-local wv wrapper"
 
     agent_db=$(echo "$bootstrap_json" | jq -r '.agent.db_path // empty')
-    assert_equals "$WV_DB" "$agent_db" "bootstrap-agent reports active db path"
+    # The product reports the physical path; WV_DB was named under /tmp, a
+    # link into /private on macOS (wv-e6ca42): compare canonical paths.
+    assert_equals "$(cd "$(dirname "$WV_DB")" && pwd -P)/$(basename "$WV_DB")" \
+        "$(cd "$(dirname "$agent_db")" 2>/dev/null && pwd -P)/$(basename "$agent_db")" "bootstrap-agent reports active db path"
 
     readiness_state=$(echo "$bootstrap_json" | jq -r '.agent.readiness.state // empty')
     assert_equals "ready" "$readiness_state" "bootstrap-agent reports ready state when command/db/python resolve"
@@ -2258,7 +2270,7 @@ SQL
 
     # --- Case 3: migration path also creates file_trend ---
     local migrated_db
-    migrated_db=$(mktemp /tmp/wv-migtest-XXXXXX.db)
+    migrated_db=$(mktemp /tmp/wv-migtest-XXXXXX)  # Xs last: BSD mktemp (wv-f6b909)
     sqlite3 "$migrated_db" <<'SQL'
 CREATE TABLE IF NOT EXISTS nodes (id TEXT PRIMARY KEY, text TEXT, status TEXT,
     metadata TEXT DEFAULT '{}', created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -2312,7 +2324,7 @@ SQL
 
     # --- Case 4: migration creates chunks table on existing DB ---
     local migrated_db
-    migrated_db=$(mktemp /tmp/wv-chunktest-XXXXXX.db)
+    migrated_db=$(mktemp /tmp/wv-chunktest-XXXXXX)  # Xs last: BSD mktemp (wv-f6b909)
     sqlite3 "$migrated_db" <<'SQL'
 CREATE TABLE IF NOT EXISTS nodes (id TEXT PRIMARY KEY, text TEXT, status TEXT,
     metadata TEXT DEFAULT '{}', created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -2941,6 +2953,16 @@ test_test_results_ledger() {
         "$WV" test-status "tests/test-status.sh" --files="a.sh,b.sh" --quiet
     assert_success "test-status --staged accepts matching index blobs" \
         "$WV" test-status "tests/test-status.sh" --files="a.sh,b.sh" --staged --quiet
+    # A sqlite3 shell that escapes control characters in output, as 3.50.6 did
+    # on the Mac runner: the packed row must still split (wv-bfd445).
+    local esc_bin real_sq
+    esc_bin="$TEST_DIR/esc-sqlite-bin"; real_sq=$(command -v sqlite3); mkdir -p "$esc_bin"
+    printf '#!/bin/sh\n%q "$@" | LC_ALL=C sed "s/\\x1f/^_/g; s/\\x1e/^^/g"\n' "$real_sq" > "$esc_bin/sqlite3"
+    chmod +x "$esc_bin/sqlite3"
+    assert_equals "^_" "$(printf 'select char(31);' | PATH="$esc_bin:$PATH" sqlite3 :memory:)" \
+        "(control) the stand-in sqlite3 escapes a control character in output"
+    assert_success "test-status accepts a fresh green result where sqlite3 escapes control characters" \
+        env PATH="$esc_bin:$PATH" "$WV" test-status "tests/test-status.sh" --files="a.sh,b.sh" --quiet
 
     echo "unstaged-working-copy" > "$TEST_DIR/a.sh"
     assert_fails "test-status current-content mode rejects an edited working copy" \
@@ -3578,12 +3600,12 @@ test_stdin_never_blocks() {
     exec 9<>"$idle_fifo"
 
     set +e
-    timeout 5 "$WV" bulk-update <"$idle_fifo" >/dev/null 2>&1
+    bounded 5 "$WV" bulk-update <"$idle_fifo" >/dev/null 2>&1
     rc=$?
     set -e
     assert_equals "1" "$rc" "bulk-update on an idle stdin pipe fails fast (124 = still blocked)"
 
-    out=$(timeout 5 "$WV" bulk-update <"$idle_fifo" 2>&1 || true)
+    out=$(bounded 5 "$WV" bulk-update <"$idle_fifo" 2>&1 || true)
     assert_contains "$out" "no input on stdin" "bulk-update on an idle stdin pipe shows usage"
 
     exec 9>&-
@@ -3595,18 +3617,18 @@ test_stdin_never_blocks() {
     # passed, `count` came back empty, `[ "" -eq 0 ]` raised "integer expression
     # expected", and the command still returned 0.
     set +e
-    timeout 5 "$WV" bulk-update </dev/null >/dev/null 2>"$TEST_DIR/empty-stdin.err"
+    bounded 5 "$WV" bulk-update </dev/null >/dev/null 2>"$TEST_DIR/empty-stdin.err"
     rc=$?
     set -e
     assert_equals "1" "$rc" "bulk-update on empty stdin exits nonzero"
     assert_not_contains "$(cat "$TEST_DIR/empty-stdin.err")" "integer expression expected" "bulk-update on empty stdin emits no bash integer error"
 
-    out=$(printf '   \n' | timeout 5 "$WV" bulk-update 2>&1 || true)
+    out=$(printf '   \n' | bounded 5 "$WV" bulk-update 2>&1 || true)
     assert_contains "$out" "no input on stdin" "bulk-update on whitespace-only stdin shows usage"
 
     # A real pipe is still read and applied.
     id=$("$WV" add "stdin probe target" 2>/dev/null | grep -oE 'wv-[a-f0-9]+' | sed -n 1p)
-    out=$(echo "[{\"id\":\"$id\",\"alias\":\"stdin-probe\"}]" | timeout 8 "$WV" bulk-update 2>&1 || true)
+    out=$(echo "[{\"id\":\"$id\",\"alias\":\"stdin-probe\"}]" | bounded 8 "$WV" bulk-update 2>&1 || true)
 
     # This assertion carries the probe's other half: it must consume nothing.
     # A readability check that ate the first line would truncate every real

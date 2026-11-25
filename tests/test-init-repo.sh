@@ -29,6 +29,9 @@ TESTS_FAILED=0
 # Paths
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# wv_stat: GNU and BSD stat behind one call (wv-resolve-runtime.sh, side-effect free).
+# shellcheck disable=SC1091  # resolved at run time
+source "$PROJECT_ROOT/scripts/lib/wv-resolve-runtime.sh"
 WV="$PROJECT_ROOT/scripts/wv"
 
 # Test environment
@@ -39,14 +42,16 @@ export WV_DB="$TEST_DIR/hotzone/brain.db"
 # One hot zone per test repository, all under TEST_DIR. The first repository to
 # initialise a shared exported zone stamps it, and wv refuses it in every other
 # repository (wv-5e804e); before that, each later repository fell back silently
-# to a default hot zone outside TEST_DIR. An explicit per-call WV_HOT_ZONE (the
+# to a default hot zone outside TEST_DIR. The name is a cksum of the repo path:
+# POSIX on every host, where md5sum(1) is absent on macOS and an empty hash put
+# every repository in one zone (wv-ef5621). An explicit per-call WV_HOT_ZONE (the
 # repo-class cases) is left alone.
 mkdir -p "$TEST_DIR/bin"
 cat > "$TEST_DIR/bin/wv" <<EOF
 #!/usr/bin/env bash
 if [ "\${WV_HOT_ZONE:-}" = "$TEST_DIR/hotzone" ]; then
     root=\$(git rev-parse --show-toplevel 2>/dev/null || pwd)
-    WV_HOT_ZONE="$TEST_DIR/hotzone/\$(printf '%s' "\$root" | md5sum | cut -c1-12)"
+    WV_HOT_ZONE="$TEST_DIR/hotzone/\$(printf '%s' "\$root" | cksum | cut -d' ' -f1)"
     export WV_HOT_ZONE WV_DB="\$WV_HOT_ZONE/brain.db"
 fi
 # The commit gate injects core.hooksPath=/dev/null through GIT_CONFIG_* so
@@ -289,7 +294,9 @@ REPO3=$(make_test_repo "copilot")
 cd "$REPO3"
 
 OUTPUT=$("$WV" init-repo --agent=copilot 2>&1)
-assert_file_exists "$REPO3/.mcp.json"                       "copilot: creates .mcp.json"
+assert_file_exists "$REPO3/.vscode/mcp.json"               "copilot: creates .vscode/mcp.json"
+assert_equals "absent" "$([ -e "$REPO3/.mcp.json" ] && echo present || echo absent)" \
+    "copilot: writes no root .mcp.json (Claude Code's file, wv-d1ef4b)"
 assert_file_exists "$REPO3/.github/copilot-instructions.md" "copilot: creates copilot-instructions.md"
 assert_file_exists "$REPO3/.github/hooks/README.md"         "copilot: scaffolds .github/hooks/"
 assert_file_exists "$REPO3/.github/hooks/weave.json"        "copilot: registers executable VS Code Local hooks"
@@ -312,8 +319,8 @@ rm "$REPO3/.github/hooks/weave.json"
 OUTPUT=$("$WV" init-repo --agent=copilot 2>&1)
 assert_file_exists "$REPO3/.github/hooks/weave.json" "copilot: existing hook directory still gains missing registrations"
 
-# Verify mcp.json points to MCP server and uses VS Code 'servers' key (not 'mcpServers')
-MCP_JSON=$(cat "$REPO3/.mcp.json")
+# Verify .vscode/mcp.json points to MCP server and uses VS Code 'servers' key (not 'mcpServers')
+MCP_JSON=$(cat "$REPO3/.vscode/mcp.json")
 assert_contains "$MCP_JSON" '"weave"'                       "copilot: mcp.json has weave server"
 assert_contains "$MCP_JSON" '"weave-session"'               "copilot: mcp.json has weave-session server"
 assert_contains "$MCP_JSON" '"weave-lite"'                  "copilot: mcp.json has weave-lite server"
@@ -325,8 +332,26 @@ assert_contains "$MCP_JSON" '"WV_AGENT_ID"'                 "copilot: mcp.json p
 assert_contains "$MCP_JSON" 'copilot-${workspaceFolderBasename}' "copilot: mcp.json uses workspace-scoped Copilot identity"
 assert_not_contains "$MCP_JSON" '"mcpServers"'              "copilot: mcp.json uses 'servers' not 'mcpServers'"
 assert_not_contains "$MCP_JSON" '"inputs"'                  "copilot: mcp.json has no 'inputs' key"
-SERVER_COUNT=$(jq '.servers | keys | length' "$REPO3/.mcp.json")
+SERVER_COUNT=$(jq '.servers | keys | length' "$REPO3/.vscode/mcp.json")
 assert_equals "4" "$SERVER_COUNT"                           "copilot: mcp.json ships exactly four servers"
+
+# A legacy root .mcp.json that Weave wrote (VS Code shape) is removed on
+# --update; a user-owned root .mcp.json is kept (wv-d1ef4b).
+jq '{servers: .servers}' "$REPO3/.vscode/mcp.json" > "$REPO3/.mcp.json"
+OUTPUT=$("$WV" init-repo --agent=copilot 2>&1)
+assert_file_exists "$REPO3/.mcp.json"                       "copilot: plain init leaves an existing root .mcp.json"
+OUTPUT=$("$WV" init-repo --agent=copilot --update 2>&1)
+assert_equals "absent" "$([ -e "$REPO3/.mcp.json" ] && echo present || echo absent)" \
+    "copilot: --update removes the Weave-written VS Code-shaped root .mcp.json"
+assert_contains "$OUTPUT" "removed legacy VS Code-shaped copy" "copilot: --update reports the legacy removal"
+printf '{"mcpServers":{"weave":{"command":"node","args":["x.js"]}}}\n' > "$REPO3/.mcp.json"
+OUTPUT=$("$WV" init-repo --agent=copilot --force 2>&1)
+assert_equals '{"mcpServers":{"weave":{"command":"node","args":["x.js"]}}}' "$(cat "$REPO3/.mcp.json")" \
+    "copilot: --force keeps a user-owned mcpServers root .mcp.json"
+jq '{servers: (.servers + {"team-tool": {"command": "x"}})}' "$REPO3/.vscode/mcp.json" > "$REPO3/.mcp.json"
+OUTPUT=$("$WV" init-repo --agent=copilot --update 2>&1)
+assert_file_exists "$REPO3/.mcp.json"                       "copilot: --update keeps a root .mcp.json with non-Weave servers"
+rm -f "$REPO3/.mcp.json"
 
 # Verify ghost setting is NOT written
 if [ -f "$REPO3/.vscode/settings.json" ]; then
@@ -405,14 +430,19 @@ cd "$REPO_HOOK"
 "$WV" init-repo --agent=claude >/dev/null 2>&1
 assert_equals "yes" "$([ -f "$REPO_HOOK/.git/hooks/pre-commit" ] && echo yes || echo no)" \
     "hook: pre-commit is installed"
-HOOK_INODE_BEFORE=$(stat -c %i "$REPO_HOOK/.git/hooks/pre-commit" 2>/dev/null || echo before)
+# Inodes through the product's wv_stat (GNU and BSD). The old stat -c read
+# failed on BSD and its "|| echo before/after" fallbacks always differed, so the
+# rename check passed without measuring anything (wv-0bf286, wv-b30dc6).
+HOOK_INODE_BEFORE=$(wv_stat ino "$REPO_HOOK/.git/hooks/pre-commit" 2>/dev/null)
 # Prove the refresh actually happens, or the inode comparison proves nothing.
 printf '# drift marker\n' >> "$REPO_HOOK/.git/hooks/pre-commit"
 "$WV" init-repo --agent=claude --update >/dev/null 2>&1
-HOOK_INODE_AFTER=$(stat -c %i "$REPO_HOOK/.git/hooks/pre-commit" 2>/dev/null || echo after)
+HOOK_INODE_AFTER=$(wv_stat ino "$REPO_HOOK/.git/hooks/pre-commit" 2>/dev/null)
 assert_not_contains "$(cat "$REPO_HOOK/.git/hooks/pre-commit" 2>/dev/null)" "# drift marker" \
     "hook: refresh actually replaced the file"
-if [ "$HOOK_INODE_BEFORE" != "$HOOK_INODE_AFTER" ]; then HOOK_REPLACE=rename; else HOOK_REPLACE=in-place; fi
+if ! [[ "$HOOK_INODE_BEFORE" =~ ^[0-9]+$ && "$HOOK_INODE_AFTER" =~ ^[0-9]+$ ]]; then
+    HOOK_REPLACE="unmeasured (inodes [$HOOK_INODE_BEFORE] [$HOOK_INODE_AFTER])"
+elif [ "$HOOK_INODE_BEFORE" != "$HOOK_INODE_AFTER" ]; then HOOK_REPLACE=rename; else HOOK_REPLACE=in-place; fi
 assert_equals "rename" "$HOOK_REPLACE" \
     "hook: replaced by rename (new inode), not rewritten under a running process"
 
@@ -446,18 +476,41 @@ assert_file_exists "$REPO_CODEX/.weave/runtime.md"           "codex: creates .we
 CODEX_JSON=$(cat "$REPO_CODEX/.codex/weave.json")
 assert_contains "$CODEX_JSON" '"schema": "weave.codex.v1"'   "codex: contract has schema"
 assert_contains "$CODEX_JSON" '"universal_instructions": "AGENTS.md"' "codex: contract points at universal AGENTS.md"
-assert_contains "$CODEX_JSON" '"noninteractive_close": "./scripts/wv ship-agent"' "codex: contract names repo-local ship-agent close"
-assert_contains "$CODEX_JSON" '"local_first": "./scripts/wv sync"' "codex: contract names local-first sync"
-assert_contains "$CODEX_JSON" '"external_network": "./scripts/wv sync --gh"' "codex: contract names external GitHub sync"
+# shellcheck disable=SC2016  # the expected text holds a literal $HOME or $(...)
+assert_contains "$CODEX_JSON" '"noninteractive_close": "$HOME/.local/bin/wv ship-agent"' "codex: contract names repo-local ship-agent close"
+# shellcheck disable=SC2016  # the expected text holds a literal $HOME or $(...)
+assert_contains "$CODEX_JSON" '"local_first": "$HOME/.local/bin/wv sync"' "codex: contract names local-first sync"
+# shellcheck disable=SC2016  # the expected text holds a literal $HOME or $(...)
+assert_contains "$CODEX_JSON" '"external_network": "$HOME/.local/bin/wv sync --gh"' "codex: contract names external GitHub sync"
 assert_contains "$CODEX_JSON" '"requires_sandbox_approval": true' "codex: contract marks GitHub sync approval"
 # shellcheck disable=SC2016  # the expected text contains a literal $ reference
 assert_contains "$CODEX_JSON" '"fallback": "$HOME/.local/bin/wv bootstrap-agent --json"' "codex: bootstrap fallback is portable"
 assert_contains "$CODEX_JSON" '"authority": "weave-graph"' "codex: memory contract marks graph authority"
-assert_contains "$CODEX_JSON" '"command": "./scripts/wv memory recall --agent=all --json"' "codex: memory recall is graph-wide"
-assert_contains "$CODEX_JSON" '"command": "./scripts/wv memory scan --source=codex --json"' "codex: memory scan names Codex evidence source"
-assert_contains "$CODEX_JSON" '"command": "./scripts/wv memory import --source=codex --json"' "codex: memory import names Codex candidate import"
-assert_contains "$CODEX_JSON" '"claim": "./scripts/wv work <id>"' "codex: contract includes safe claim command"
-assert_contains "$CODEX_JSON" '"record_edit": "./scripts/wv touch <id> --files=<path>"' "codex: contract includes safe edit attribution command"
+# shellcheck disable=SC2016  # the expected text holds a literal $HOME or $(...)
+assert_contains "$CODEX_JSON" '"command": "$HOME/.local/bin/wv memory recall --agent=all --json"' "codex: memory recall is graph-wide"
+# shellcheck disable=SC2016  # the expected text holds a literal $HOME or $(...)
+assert_contains "$CODEX_JSON" '"command": "$HOME/.local/bin/wv memory scan --source=codex --json"' "codex: memory scan names Codex evidence source"
+# shellcheck disable=SC2016  # the expected text holds a literal $HOME or $(...)
+assert_contains "$CODEX_JSON" '"command": "$HOME/.local/bin/wv memory import --source=codex --json"' "codex: memory import names Codex candidate import"
+# shellcheck disable=SC2016  # the expected text holds a literal $HOME or $(...)
+assert_contains "$CODEX_JSON" '"claim": "$HOME/.local/bin/wv work <id>"' "codex: contract includes safe claim command"
+# shellcheck disable=SC2016  # the expected text holds a literal $HOME or $(...)
+assert_contains "$CODEX_JSON" '"record_edit": "$HOME/.local/bin/wv touch <id> --files=<path>"' "codex: contract includes safe edit attribution command"
+# A consumer has no scripts/wv (wv-dce969): no entry may name one, the memory
+# render included, which used to put ./scripts/wv back on every sync.
+assert_not_contains "$CODEX_JSON" './scripts/wv' "codex: a consumer's contract names no repo-local scripts/wv"
+assert_contains "$CODEX_JSON" '"prefer_repo_local_wv": false' "codex: a consumer's contract does not prefer a repo-local wv"
+SELF_HOST=$(make_test_repo "codex-self-host"); cd "$SELF_HOST"
+mkdir -p "$SELF_HOST/scripts/lib"
+printf '#!/bin/sh\n' > "$SELF_HOST/scripts/wv"; chmod +x "$SELF_HOST/scripts/wv"
+: > "$SELF_HOST/scripts/lib/wv-config.sh"
+"$WV" init-repo --agent=codex --codex-hooks >/dev/null 2>&1 || true
+assert_contains "$(cat "$SELF_HOST/.codex/weave.json" 2>/dev/null)" '"claim": "./scripts/wv work <id>"' \
+    "codex: the source checkout's contract keeps its own scripts/wv"
+# shellcheck disable=SC2016  # the expected text holds a literal $HOME or $(...)
+assert_contains "$(cat "$SELF_HOST/.codex/hooks.json" 2>/dev/null)" '$(git rev-parse --show-toplevel)/scripts/wv' \
+    "codex: the source checkout's hooks keep its own scripts/wv"
+cd "$REPO_CODEX"
 assert_contains "$CODEX_JSON" '"default_registration": "weave-lite"' "codex: contract names lite MCP default"
 assert_contains "$CODEX_JSON" '"full_requires": "--codex-mcp=full"' "codex: contract requires explicit full MCP"
 assert_contains "$CODEX_JSON" "Use CLI for GitHub sync" "codex: contract keeps network operations on CLI"
@@ -509,6 +562,86 @@ CODEX_MCP_LOG="$TEST_DIR/codex-mcp-full.log" PATH="$FAKE_BIN:$PATH" \
 assert_contains "$(cat "$TEST_DIR/codex-mcp-full.log")" "mcp add weave" "codex: full MCP registration is explicit"
 assert_contains "$(cat "$TEST_DIR/codex-mcp-full.log")" "--scope=all" "codex: full MCP registration uses all scope"
 
+# wv-d3c35c: a consumer has no mcp/ and wv does not export WV_LIB_DIR, so the
+# server is looked up in the installed library wv-init-repo resolves itself, and
+# a codex outside PATH is named with --codex-bin or found in the VS Code
+# extension. HOME is a fake whose library mirrors this install's, with (mcp) or
+# without (nomcp) a built server; WV_LIB_DIR is unset for these calls.
+codex_fake_home() {
+    local h="$TEST_DIR/codex-home-$1" e
+    mkdir -p "$h/.local/lib/weave"
+    for e in "$WV_LIB_DIR"/*; do
+        [ "${e##*/}" = mcp ] || ln -s "$e" "$h/.local/lib/weave/"
+    done
+    if [ "$1" = mcp ]; then
+        mkdir -p "$h/.local/lib/weave/mcp/dist"
+        printf '%s\n' '/* installed mcp bundle */' > "$h/.local/lib/weave/mcp/dist/index.js"
+    fi
+    printf '%s' "$h"
+}
+# PATH with every codex taken out, so only --codex-bin or the extension finds one.
+NOCODEX_PATH=""
+IFS=: read -ra _nc_dirs <<< "$PATH"
+for _nc_d in "${_nc_dirs[@]}"; do
+    if [ -e "$_nc_d/codex" ]; then
+        _nc_f="$TEST_DIR/nocodex-$(printf '%s' "$_nc_d" | cksum | cut -d' ' -f1)"
+        mkdir -p "$_nc_f"
+        for _nc_x in "$_nc_d"/*; do [ "${_nc_x##*/}" = codex ] || ln -sf "$_nc_x" "$_nc_f/"; done
+        _nc_d="$_nc_f"
+    fi
+    NOCODEX_PATH="${NOCODEX_PATH:+$NOCODEX_PATH:}$_nc_d"
+done
+OUTSIDE_CODEX="$TEST_DIR/outside/codex"
+mkdir -p "${OUTSIDE_CODEX%/*}"
+printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$0 $*" >> "$CODEX_MCP_LOG"\n' > "$OUTSIDE_CODEX"
+chmod +x "$OUTSIDE_CODEX"
+REPO_NOMCP="$TEST_DIR/consumer-no-mcp"
+mkdir -p "$REPO_NOMCP" && git -C "$REPO_NOMCP" init -q
+codex_consumer() { # home args...
+    local h="$1"; shift
+    (cd "$REPO_NOMCP" && env -u WV_LIB_DIR HOME="$h" PATH="$NOCODEX_PATH" \
+        CODEX_MCP_LOG="$TEST_DIR/codex-lookup.log" "$WV" init-repo --agent=codex --force "$@" 2>&1)
+}
+CH=$(codex_fake_home mcp)
+: > "$TEST_DIR/codex-lookup.log"
+OUTPUT=$(codex_consumer "$CH" --codex-mcp --codex-bin="$OUTSIDE_CODEX")
+assert_contains "$(cat "$TEST_DIR/codex-lookup.log")" "$OUTSIDE_CODEX mcp add weave-lite" "codex: --codex-bin names a codex outside PATH"
+assert_contains "$(cat "$TEST_DIR/codex-lookup.log")" "$CH/.local/lib/weave/mcp/dist/index.js" "codex: the installed MCP server is found with WV_LIB_DIR unset"
+OUTPUT=$(codex_consumer "$CH" --codex-mcp --codex-bin="$TEST_DIR/no-such-codex")
+assert_contains "$OUTPUT" "--codex-bin=$TEST_DIR/no-such-codex is not an executable file" "codex: a --codex-bin that is not executable is reported"
+OUTPUT=$(codex_consumer "$CH" --codex-mcp)
+assert_contains "$OUTPUT" "codex not found on PATH, in a VS Code extension's bin/ or under nvm" "codex: with no codex anywhere, the message names where it looked"
+CODEX_EXT="$CH/.vscode/extensions/openai.chatgpt-9.9.9-linux-x64/bin/linux-x86_64"
+mkdir -p "$CODEX_EXT" && cp "$OUTSIDE_CODEX" "$CODEX_EXT/codex"
+: > "$TEST_DIR/codex-lookup.log"
+OUTPUT=$(codex_consumer "$CH" --codex-mcp)
+assert_contains "$(cat "$TEST_DIR/codex-lookup.log")" "$CODEX_EXT/codex mcp add weave-lite" "codex: the VS Code extension's codex is found when PATH has none"
+CH2=$(codex_fake_home nomcp)
+OUTPUT=$(codex_consumer "$CH2" --codex-mcp --codex-bin="$OUTSIDE_CODEX")
+assert_contains "$OUTPUT" "looked for $CH2/.local/lib/weave/mcp/dist/index.js" "codex: a missing MCP server names the path looked in"
+assert_not_contains "$OUTPUT" "npm run build" "codex: ...and never an mcp/ build the consumer lacks"
+assert_not_contains "$OUTPUT" "$REPO_NOMCP/mcp/dist" "codex: ...nor a consumer mcp/ directory"
+
+# wv-f2a6a3: a consumer whose ignore rules hide *.json and *.md never sees the
+# Codex contract, its hooks or CLAUDE.md in git status; init-repo and doctor name
+# each hidden surface with the rule, and a re-included or tracked one is not named.
+REPO_IGN="$TEST_DIR/consumer-ignores-json"
+mkdir -p "$REPO_IGN" && git -C "$REPO_IGN" init -q
+printf '%s\n' '*.json' '*.md' '!AGENTS.md' > "$REPO_IGN/.gitignore"
+printf '%s\n' '# team agents file' > "$REPO_IGN/AGENTS.md"
+OUTPUT=$(cd "$REPO_IGN" && "$WV" init-repo --agent=claude,codex --codex-hooks 2>&1)
+assert_contains "$OUTPUT" "written for the team but hidden from git by this repository's ignore rules" "ignored surfaces: init-repo reports hidden surfaces"
+assert_contains "$OUTPUT" ".codex/weave.json  (rule .gitignore:1:*.json)" "ignored surfaces: init-repo names .codex/weave.json with its rule"
+assert_contains "$OUTPUT" ".codex/hooks.json  (rule .gitignore:1:*.json)" "ignored surfaces: init-repo names .codex/hooks.json with its rule"
+assert_contains "$OUTPUT" "CLAUDE.md  (rule .gitignore:2:*.md)" "ignored surfaces: init-repo names CLAUDE.md with its rule"
+assert_not_contains "$OUTPUT" "AGENTS.md  (rule" "ignored surfaces: a re-included surface is not named"
+DOCTOR=$(cd "$REPO_IGN" && "$WV" doctor --json 2>/dev/null | jq -c '[.checks[] | select(.check == "shared surfaces")][0]')
+assert_contains "$DOCTOR" '"status":"warn"' "ignored surfaces: doctor warns"
+assert_contains "$DOCTOR" ".codex/weave.json (rule .gitignore:1:*.json)" "ignored surfaces: doctor names the surface and rule"
+git -C "$REPO_IGN" add -A -f
+DOCTOR=$(cd "$REPO_IGN" && "$WV" doctor --json 2>/dev/null | jq -c '[.checks[] | select(.check == "shared surfaces")][0]')
+assert_contains "$DOCTOR" '"status":"pass"' "ignored surfaces: once tracked (git add -f), doctor passes"
+
 OUTPUT=$("$WV" init-repo --agent=codex --force --codex-hooks 2>&1)
 assert_file_exists "$REPO_CODEX/.codex/hooks.json"             "codex: --codex-hooks generates project hooks"
 assert_contains "$(cat "$REPO_CODEX/.codex/hooks.json")" '"PreToolUse"' "codex: hook config includes edit guard"
@@ -520,6 +653,21 @@ assert_contains "$(cat "$REPO_CODEX/.codex/hooks.json")" 'hook dispatch --event=
 assert_contains "$(cat "$REPO_CODEX/.codex/hooks.json")" 'hook dispatch --event=PreCompact --format=host' "codex: hook config checkpoints before compaction"
 assert_contains "$(cat "$REPO_CODEX/.codex/weave.json")" '"enabled": 1' "codex: opt-in contract records hooks enabled"
 assert_contains "$OUTPUT" 'Review and trust these project hooks with /hooks' "codex: opt-in prints trust guidance"
+# A consumer's hooks call the installed wv, absolute, since hooks run without
+# the login PATH; none names the scripts/wv it lacks (wv-dce969).
+CODEX_HOOKS_JSON=$(cat "$REPO_CODEX/.codex/hooks.json")
+# shellcheck disable=SC2016  # the expected text holds a literal $HOME or $(...)
+assert_equals "5 0" "$(jq -r '[.hooks[][].hooks[].command] | "\(map(select(startswith("\"$HOME/.local/bin/wv\" hook dispatch"))) | length) \(map(select(test("scripts/wv"))) | length)"' <<< "$CODEX_HOOKS_JSON")" \
+    "codex: all five consumer hooks call the installed wv and none names scripts/wv"
+NO_AGENTS=$(make_test_repo "codex-no-agents"); cd "$NO_AGENTS"
+"$WV" init-repo --agent=codex >/dev/null 2>&1 || true
+assert_file_exists "$NO_AGENTS/AGENTS.md" "codex: a consumer with no AGENTS.md gets one the contract can name"
+assert_contains "$(cat "$NO_AGENTS/AGENTS.md" 2>/dev/null)" 'BEGIN WEAVE PROCEDURES' \
+    "codex: ...from the shipped template, with the block procedures refresh"
+# shellcheck disable=SC2016  # the expected text holds literal backticks
+assert_not_contains "$(cat "$NO_AGENTS/AGENTS.md" 2>/dev/null)" 'repo-local `./scripts/wv` wrapper' \
+    "codex: ...which sends a consumer to the installed wv, not a scripts/wv it lacks"
+cd "$REPO_CODEX"
 
 # --- --agent=all creates all supported agent surfaces ---
 echo ""
@@ -530,7 +678,9 @@ cd "$REPO4"
 OUTPUT=$("$WV" init-repo --agent=all 2>&1)
 assert_file_exists "$REPO4/.claude/settings.json"           "all: creates .claude/settings.json"
 assert_file_exists "$REPO4/CLAUDE.md"                       "all: creates CLAUDE.md"
-assert_file_exists "$REPO4/.mcp.json"                       "all: creates .mcp.json"
+assert_file_exists "$REPO4/.vscode/mcp.json"               "all: creates .vscode/mcp.json"
+assert_equals "absent" "$([ -e "$REPO4/.mcp.json" ] && echo present || echo absent)" \
+    "all: writes no VS Code-shaped root .mcp.json"
 assert_file_exists "$REPO4/.github/copilot-instructions.md" "all: creates copilot-instructions.md"
 assert_file_exists "$REPO4/.codex/weave.json"               "all: creates Codex contract"
 
@@ -693,7 +843,7 @@ ln -s "$TEST_DIR/pattern-external" .weave/patterns
 if "$WV" init-repo --agent=claude >/dev/null 2>&1; then
     assert_equals "failure" "success" "init: rejects symlinked pattern destination"
 else
-    assert_equals "0" "$(find "$TEST_DIR/pattern-external" -mindepth 1 | wc -l)" \
+    assert_equals "0" "$(( $(find "$TEST_DIR/pattern-external" -mindepth 1 | wc -l) ))" \
         "init: symlink rejection does not write outside repository"
 fi
 
@@ -705,7 +855,7 @@ ln -s "$TEST_DIR/weave-external" .weave
 if "$WV" init-repo --agent=claude >/dev/null 2>&1; then
     assert_equals "failure" "success" "init: rejects symlinked .weave ancestor"
 else
-    assert_equals "0" "$(find "$TEST_DIR/weave-external" -mindepth 1 | wc -l)" \
+    assert_equals "0" "$(( $(find "$TEST_DIR/weave-external" -mindepth 1 | wc -l) ))" \
         "init: .weave symlink rejection does not write outside repository"
 fi
 
@@ -976,9 +1126,11 @@ echo "--- consumer skills match the installed skills ---"
 SK_INIT=$(sed -n "/^cat > \"\$INSTALL_DIR\/wv-init-repo\" << 'INITEOF'/,/^INITEOF\$/p" "$PROJECT_ROOT/install.sh")
 assert_equals "0" "$(grep -cE '^ +SKILLS=\([a-z]' <<< "$SK_INIT" || true)" \
     "skills: wv init-repo carries no skill list of its own"
-# Join lines until the closing paren: a /start/,/)/ range looks for its end
-# only from the next line, so a one-line array ran on to a later ')' (wv-1fc64f).
-SK_CONFIG=$(sed -n '/^WV_CONFIG_SKILLS=(/{:a;/)/!{N;ba;};p;}' "$PROJECT_ROOT/install.sh" | tr '\n' ' ' \
+# From the opening line through the first line with ')': a /start/,/)/ sed
+# range looks for its end only from the next line, so a one-line array ran on to
+# a later ')' (wv-1fc64f). awk, not sed's ':a;...;ba': BSD sed ends a label at
+# the newline, so ';' joined it to the label name (wv-0bf286).
+SK_CONFIG=$(awk '/^WV_CONFIG_SKILLS=\(/ { f = 1 } f { print; if (/\)/) exit }' "$PROJECT_ROOT/install.sh" | tr '\n' ' ' \
     | sed 's/^WV_CONFIG_SKILLS=(//; s/)//' | tr ' ' '\n' | { grep . || true; } | sort -u | tr '\n' ' ')
 # Both sets are empty since every Weave skill is a projection (wv-c7f784); an
 # empty grep must not end the suite under pipefail.
@@ -1118,7 +1270,7 @@ cd "$REPO_CLASS_TYPO"
 TYPO_RC=0
 "$WV" init-repo --repository-clas=vendored-upstream >/dev/null 2>&1 || TYPO_RC=$?
 assert_equals "2" "$TYPO_RC" "repo-class: installed init rejects unknown classification flags"
-assert_equals "0" "$(find . -path ./.git -prune -o -type f -print | wc -l)" \
+assert_equals "0" "$(( $(find . -path ./.git -prune -o -type f -print | wc -l) ))" \
     "repo-class: unknown init flag fails before worktree writes"
 
 REPO_CLASS_FORK=$(make_test_repo "repo-class-fork")
@@ -1169,9 +1321,14 @@ assert_equals "1" "$([ "$AMBIG_OVERRIDE_RC" -ne 0 ] && echo 1 || echo 0)" \
 if "$WV" init-repo >/dev/null 2>&1; then
     assert_equals "refused" "allowed" "repo-class: ambiguous init is refused"
 else
-    assert_equals "0" "$(find . -path ./.git -prune -o -type f -print | wc -l)" \
+    assert_equals "0" "$(( $(find . -path ./.git -prune -o -type f -print | wc -l) ))" \
         "repo-class: ambiguous refusal occurs before first worktree write"
 fi
+# The refusal's hint must name the flag its owned override then demands; it
+# used to name it only for a vendored-upstream class (wv-bd5115).
+AMBIG_HINT=$("$WV" init-repo 2>&1 >/dev/null || true)
+assert_contains "$AMBIG_HINT" "wv repo-class set owned --acknowledge-upstream-fork" \
+    "repo-class: an ambiguous refusal names the flag the owned override demands"
 
 # The owned override fingerprint includes push topology, not only fetch URLs.
 "$WV" repo-class set owned --acknowledge-upstream-fork >/dev/null
@@ -1269,7 +1426,7 @@ if env -u WV_DB -u WV_DB_CUSTOM WV_PROJECT_DIR="$REPO_CLASS_AUDIT" \
     WV_HOT_ZONE="$TEST_DIR/repo-class-audit-hot" "$WV" init >/dev/null 2>&1; then
     assert_equals "refused" "allowed" "repo-class: wv init refuses vendored repository"
 else
-    assert_equals "0" "$(find .weave -type f 2>/dev/null | wc -l)" \
+    assert_equals "0" "$(( $(find .weave -type f 2>/dev/null | wc -l) ))" \
         "repo-class: refused wv init creates no graph files"
 fi
 REPO_CLASS_OTHER=$(make_test_repo "repo-class-other-cwd")
@@ -1278,7 +1435,7 @@ if env -u WV_DB -u WV_DB_CUSTOM WEAVE_DIR="$REPO_CLASS_AUDIT/.weave" \
     WV_HOT_ZONE="$TEST_DIR/repo-class-other-hot" "$WV" init >/dev/null 2>&1; then
     assert_equals "refused" "allowed" "repo-class: wv init guards the persistent target, not caller cwd"
 else
-    assert_equals "0" "$(find "$REPO_CLASS_AUDIT/.weave" -type f 2>/dev/null | wc -l)" \
+    assert_equals "0" "$(( $(find "$REPO_CLASS_AUDIT/.weave" -type f 2>/dev/null | wc -l) ))" \
         "repo-class: cross-directory init refusal creates no graph files"
 fi
 SYMLINK_TARGET="$TEST_DIR/repo-class-symlink-target"
@@ -1288,14 +1445,14 @@ if env -u WV_DB -u WV_DB_CUSTOM WEAVE_DIR="$REPO_CLASS_OTHER/.weave" \
     WV_HOT_ZONE="$TEST_DIR/repo-class-symlink-hot" "$WV" init --force >/dev/null 2>&1; then
     assert_equals "refused" "allowed" "repo-class: wv init refuses symlinked persistent target"
 else
-    assert_equals "0" "$(find "$SYMLINK_TARGET" -type f | wc -l)" \
+    assert_equals "0" "$(( $(find "$SYMLINK_TARGET" -type f | wc -l) ))" \
         "repo-class: symlink refusal writes nothing through the target"
 fi
 if env -u WV_DB -u WV_DB_CUSTOM WEAVE_DIR="$REPO_CLASS_AUDIT/.weave" \
     WV_HOT_ZONE="$TEST_DIR/repo-class-doctor-hot" "$WV" doctor --repair >/dev/null 2>&1; then
     assert_equals "refused" "allowed" "repo-class: doctor repair guards persistent target, not caller cwd"
 else
-    assert_equals "0" "$(find "$REPO_CLASS_AUDIT/.weave" -type f 2>/dev/null | wc -l)" \
+    assert_equals "0" "$(( $(find "$REPO_CLASS_AUDIT/.weave" -type f 2>/dev/null | wc -l) ))" \
         "repo-class: cross-directory repair refusal creates no graph files"
 fi
 cd "$REPO_CLASS_AUDIT"
@@ -1486,7 +1643,7 @@ assert_contains "$GATE_PATH_DETAIL" 'computed paths are not evaluated' "a clean 
 
 # Exercise doctor with the installed CLI too, not only the checkout wrapper.
 printf 'source .private/bin/activate\n' > checks/unconditional.sh
-GATE_PATH_ZONE="$TEST_DIR/hotzone/$(printf '%s' "$REPO_GATE_PATHS" | md5sum | cut -c1-12)"
+GATE_PATH_ZONE="$TEST_DIR/hotzone/$(printf '%s' "$REPO_GATE_PATHS" | cksum | cut -d' ' -f1)"  # as the wrapper names it
 DOCTOR_JSON=$(WV_HOT_ZONE="$GATE_PATH_ZONE" WV_DB="$GATE_PATH_ZONE/brain.db" \
     "$TEST_INSTALL/bin/wv" doctor --json 2>/dev/null || true)
 GATE_PATH_DETAIL=$(jq -r '.checks[] | select(.check == "gate ignored paths") | .detail' <<< "$DOCTOR_JSON")

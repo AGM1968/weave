@@ -126,13 +126,13 @@ dump_state_sql() {
 # against a live writer; state.sql and both JSONL projections can then all
 # be derived from this ONE static file, decoupled from anything that
 # happens on the live DB afterward. Prints the backup's path to stdout on
-# success; the caller MUST `rm -f` it when done.
+# success; the caller MUST db_remove_file it when done.
 _wv_snapshot_db() {
     local live_db="$1" weave_dir="$2"
     local snap
     snap=$(mktemp "$weave_dir/.export-snapshot.db.XXXXXX") || return 1
     if ! sqlite3 -cmd ".timeout 5000" "$live_db" ".backup '$snap'" 2>/dev/null; then
-        rm -f "$snap"
+        db_remove_file "$snap"
         return 1
     fi
     printf '%s\n' "$snap"
@@ -563,6 +563,16 @@ wv_maint_pending_refusal() {
     return 1
 }
 
+# _wv_maint_lock_refusal WHO RC WAIT LOCK -- say why wv_lock_fd (RC) did not
+# give WHO the maintenance lock: no mechanism (2) or a holder past WAIT.
+_wv_maint_lock_refusal() {
+    if [ "$2" -eq 2 ]; then
+        echo "wv: $1 refused: the maintenance lock cannot be taken" >&2
+    else
+        echo "wv: $1 refused: catalog maintenance held the lock for over ${3}s ($4)" >&2
+    fi
+}
+
 # wv_maint_shared_enter WHO -- take the maintenance lock shared for the rest of
 # this process, then refuse when a maintenance transaction is pending. Waits
 # up to WV_MAINT_LOCK_WAIT seconds (default 600) for a running maintenance to
@@ -577,16 +587,14 @@ wv_maint_shared_enter() {
     # exclusive hold it already took; re-taking it would deadlock on itself.
     [ "${WV_MAINT_HOLDER:-}" = "$lock" ] && return 0
     if [ -z "${_WV_MAINT_SHARED_FD:-}" ] || [ "${_WV_MAINT_SHARED_LOCK:-}" != "$lock" ]; then
-        command -v flock >/dev/null 2>&1 || {
-            echo "wv: $who refused: flock is unavailable, so the maintenance lock cannot be taken" >&2
-            return 1
-        }
         (umask 077 && mkdir -p "$dir") || return 1
-        local fd
+        local fd lrc=0
         exec {fd}>>"$lock" || return 1
-        if ! flock -s -w "$wait" "$fd"; then
+        # wv_lock_fd: flock(1), else python3 fcntl (wv-7faa60); rc 2 has said why.
+        wv_lock_fd "$fd" -s "$wait" || lrc=$?
+        if [ "$lrc" -ne 0 ]; then
             exec {fd}>&-
-            echo "wv: $who refused: catalog maintenance held the lock for over ${wait}s ($lock)" >&2
+            _wv_maint_lock_refusal "$who" "$lrc" "$wait" "$lock"
             return 1
         fi
         _WV_MAINT_SHARED_FD=$fd
@@ -608,8 +616,14 @@ _delta_compact() {
     local delta_root="$weave_dir/deltas"
     [ -d "$delta_root" ] || return 0
     local cutoff=$(( now - retain_days * 86400 ))
-    local deleted=0
+    local deleted=0 delta_list
+    # A walk that fails is an error, not "nothing older" (wv-8ea297).
+    if ! delta_list=$(wv_delta_paths_by_name "$delta_root" -name '*.sql'); then
+        echo "wv: delta compaction could not list $delta_root" >&2
+        return 1
+    fi
     while IFS= read -r delta; do
+        [ -n "$delta" ] || continue
         local delta_name delta_ts
         delta_name="${delta##*/}"
         delta_ts="${delta_name%%-*}"
@@ -617,7 +631,7 @@ _delta_compact() {
             rm -f "$delta"
             deleted=$(( deleted + 1 ))
         fi
-    done < <(find "$delta_root" -name '*.sql' 2>/dev/null)
+    done <<< "$delta_list"
     # Remove empty date subdirectories left behind
     find "$delta_root" -mindepth 1 -maxdepth 1 -type d -empty -delete 2>/dev/null || true
     echo "$deleted"
@@ -851,7 +865,7 @@ _wv_dump_bundle() {
     fi
 
     if ! dump_state_sql "$_snap_db" "$tmp_sql" || [ ! -s "$tmp_sql" ]; then
-        rm -f "$tmp_sql" "$tmp_nodes" "$tmp_edges" "$_snap_db"
+        rm -f "$tmp_sql" "$tmp_nodes" "$tmp_edges"; db_remove_file "$_snap_db"
         echo "wv: failed to generate portable state snapshot" >&2
         return 1
     fi
@@ -860,7 +874,7 @@ _wv_dump_bundle() {
     # over committed truth (the 2026-06-06 sandbox data-loss path). Skip the dump,
     # keep deltas + _warp_changes pending, leave state.sql intact. Loud on stderr.
     if ! _sync_floor_guard_ok "$tmp_sql"; then
-        rm -f "$tmp_sql" "$tmp_nodes" "$tmp_edges" "$_snap_db"
+        rm -f "$tmp_sql" "$tmp_nodes" "$tmp_edges"; db_remove_file "$_snap_db"
         return 1
     fi
 
@@ -869,18 +883,18 @@ _wv_dump_bundle() {
     # the dump output directly — if state.sql is byte-identical, skip the jsonl
     # regeneration and checkpoint entirely.
     if [ -f "$WEAVE_DIR/state.sql" ] && cmp -s "$tmp_sql" "$WEAVE_DIR/state.sql"; then
-        rm -f "$tmp_sql" "$tmp_nodes" "$tmp_edges" "$_snap_db"
+        rm -f "$tmp_sql" "$tmp_nodes" "$tmp_edges"; db_remove_file "$_snap_db"
         rm -f "$WV_HOT_ZONE/.bundle_behind"
         return 2
     fi
 
     if ! _wv_query_json_snapshot "$_snap_db" "SELECT * FROM nodes;" | jq -c '.[]' > "$tmp_nodes" \
         || ! _wv_query_json_snapshot "$_snap_db" "SELECT * FROM edges;" | jq -c '.[]' > "$tmp_edges"; then
-        rm -f "$tmp_sql" "$tmp_nodes" "$tmp_edges" "$_snap_db"
+        rm -f "$tmp_sql" "$tmp_nodes" "$tmp_edges"; db_remove_file "$_snap_db"
         echo "wv: failed to generate portable JSONL projections" >&2
         return 1
     fi
-    rm -f "$_snap_db"
+    db_remove_file "$_snap_db"
 
     # Publish all three artifacts as a group (_publish_weave_bundle): a
     # partial failure previously left whichever renames had already
@@ -1280,7 +1294,7 @@ Weave-ID: $primary"
         fi
 
         local ts
-        ts=$(date -d "@$now" '+%H:%M' 2>/dev/null || date '+%H:%M')
+        ts=$(wv_date_fmt "$now" '+%H:%M' || date '+%H:%M')
 
         # Collapse consecutive weave-auto commits: amend the previous commit when
         # it's (a) an unpushed, (b) .weave/-only checkpoint. This keeps each
@@ -1362,9 +1376,11 @@ _sync_gh() {
             _wv_pypath=$(dirname "$(dirname "$_wv_real")")
         fi
     fi
-    # Use system python to avoid Poetry/venv conflicts with PYTHONPATH
+    # Use system python to avoid Poetry/venv conflicts with PYTHONPATH, only
+    # when it meets the floor: macOS's /usr/bin/python3 is 3.9 (wv-892318).
     local _wv_python3
-    if [ -n "${VIRTUAL_ENV:-}" ] && [ -x /usr/bin/python3 ]; then
+    if [ -n "${VIRTUAL_ENV:-}" ] && [ -x /usr/bin/python3 ] \
+        && /usr/bin/python3 -c 'import sys; sys.exit(sys.version_info < (3, 11))' 2>/dev/null; then
         _wv_python3=/usr/bin/python3
     else
         _wv_python3=python3
@@ -1507,7 +1523,7 @@ _sync_gh() {
     else
         _dump_ok=false
     fi
-    rm -f "$_snap_db2" 2>/dev/null || true
+    db_remove_file "$_snap_db2"
 
     if [ "$_dump_ok" = true ]; then
         if _publish_weave_bundle "$WEAVE_DIR" "$tmp_nodes2" "$tmp_edges2" "$tmp_sql2"; then
@@ -1661,7 +1677,7 @@ cmd_sync() {
     local tmp_edges=$(mktemp "$WEAVE_DIR/.edges.jsonl.XXXXXX")
     local _snap_db=""
     # shellcheck disable=SC2016  # the trap body expands when the trap runs, not here
-    _wv_exit_trap 'rm -f "$tmp_sql" "$tmp_nodes" "$tmp_edges" "$_snap_db" 2>/dev/null; _wv_discard_staged_deltas "$_sync_staging"'
+    _wv_exit_trap 'rm -f "$tmp_sql" "$tmp_nodes" "$tmp_edges" 2>/dev/null; db_remove_file "$_snap_db"; _wv_discard_staged_deltas "$_sync_staging"'
 
     # Point-in-time snapshot (round 4 finding 5): state.sql and both JSONL
     # projections are all derived from this ONE static backup copy, not
@@ -1682,7 +1698,7 @@ cmd_sync() {
     # Guard: refuse to overwrite state.sql with an empty dump (data loss prevention)
     if [ ! -s "$tmp_sql" ]; then
         echo -e "${RED}✗${NC} Sync aborted: database dump was empty (possible lock contention)" >&2
-        rm -f "$tmp_sql" "$tmp_nodes" "$tmp_edges" "$_snap_db"
+        rm -f "$tmp_sql" "$tmp_nodes" "$tmp_edges"; db_remove_file "$_snap_db"
         _wv_discard_staged_deltas "$_sync_staging"
         _wv_exit_trap
         [ "$_sync_journaled" = true ] && journal_end
@@ -1691,7 +1707,7 @@ cmd_sync() {
 
     # Floor-guard: refuse a drastic shrink (partial/wiped tmpfs over committed truth)
     if ! _sync_floor_guard_ok "$tmp_sql" "$force"; then
-        rm -f "$tmp_sql" "$tmp_nodes" "$tmp_edges" "$_snap_db"
+        rm -f "$tmp_sql" "$tmp_nodes" "$tmp_edges"; db_remove_file "$_snap_db"
         _wv_discard_staged_deltas "$_sync_staging"
         _wv_exit_trap
         [ "$_sync_journaled" = true ] && journal_end
@@ -1707,13 +1723,13 @@ cmd_sync() {
     if ! ( set -o pipefail; _wv_query_json_snapshot "$_snap_db" "SELECT * FROM nodes;" | jq -c '.[]' > "$tmp_nodes" ) \
         || ! ( set -o pipefail; _wv_query_json_snapshot "$_snap_db" "SELECT * FROM edges;" | jq -c '.[]' > "$tmp_edges" ); then
         echo -e "${RED}✗${NC} Sync aborted: failed to generate portable JSONL projections" >&2
-        rm -f "$tmp_sql" "$tmp_nodes" "$tmp_edges" "$_snap_db"
+        rm -f "$tmp_sql" "$tmp_nodes" "$tmp_edges"; db_remove_file "$_snap_db"
         _wv_discard_staged_deltas "$_sync_staging"
         _wv_exit_trap
         [ "$_sync_journaled" = true ] && journal_end
         return 1
     fi
-    rm -f "$_snap_db"
+    db_remove_file "$_snap_db"
     _snap_db=""
 
     # Publish human-readable projections first and state.sql last. A successful
@@ -2154,18 +2170,103 @@ _delta_classify() {
 # (S4 wv-806a6b, alongside the E6/E7 recapture). A catalog that predates the
 # flip carries no v2/*.json ops, so this stays a no-op on the historical
 # back-catalog and only engages once post-cutover syncs have emitted sidecars.
+# The v1 fence (wv-20c98c). The v2 replay refuses a write that lost a fork and
+# keeps the row as the merge left it ("reported, never changed", _lost_writes).
+# The v1 SQL replay runs after it and breaks a same-lineage tie by actor name,
+# so it could apply the very write v2 refused: two clones that claimed one node
+# at one lineage both ended with the alphabetically later actor's claim, while
+# the warning said the other value was kept. The rows a refused write names are
+# read before the v1 replay and put back after it, only where the v1 replay
+# stamped that write's own (seq, actor), so v1 never applies what v2 refused and
+# leaves later writes to the same row alone.
+
+# _v2_fence_snapshot DB — read the rows _V2_LOST_FENCE names into _V2_FENCE_ROWS.
+_v2_fence_snapshot() {
+    local db="$1" entity seq actor e_q row
+    _V2_FENCE_ROWS=""
+    [ -n "${_V2_LOST_FENCE:-}" ] || return 0
+    while IFS=$'\t' read -r entity seq actor; do
+        [ -n "$entity" ] || continue
+        case "$seq" in '' | *[!0-9]*) continue ;; esac
+        e_q=${entity//\'/\'\'}
+        case "$entity" in
+            *:*:*) row=$(sqlite3 "$db" "SELECT json_object('weight', weight, 'context', context,
+                        'lineage_seq', lineage_seq, 'lineage_actor', lineage_actor)
+                        FROM edges WHERE source || ':' || target || ':' || type = '$e_q';" 2>/dev/null) ;;
+            *) row=$(sqlite3 "$db" "SELECT json_object('text', text, 'status', status, 'metadata', metadata,
+                        'alias', alias, 'updated_at', updated_at,
+                        'lineage_seq', lineage_seq, 'lineage_actor', lineage_actor)
+                        FROM nodes WHERE id = '$e_q';" 2>/dev/null) ;;
+        esac
+        [ -n "$row" ] && _V2_FENCE_ROWS+="$entity"$'\t'"$seq"$'\t'"$actor"$'\t'"$row"$'\n'
+    done <<< "$_V2_LOST_FENCE"
+    return 0
+}
+
+# _v2_fence_restore DB — after the v1 replay, put back each fenced row the v1
+# replay overwrote with the refused write's own lineage. Prints nothing when
+# none was; a failed restore is a load gap, never silent.
+_v2_fence_restore() {
+    local db="$1" entity seq actor row e_q a_q j sql n=0 got
+    [ -n "${_V2_FENCE_ROWS:-}" ] || return 0
+    while IFS=$'\t' read -r entity seq actor row; do
+        [ -n "$entity" ] || continue
+        e_q=${entity//\'/\'\'} a_q=${actor//\'/\'\'} j=${row//\'/\'\'}
+        case "$entity" in
+            *:*:*) sql="UPDATE edges SET weight = json_extract('$j', '\$.weight'),
+                        context = json_extract('$j', '\$.context'),
+                        lineage_seq = json_extract('$j', '\$.lineage_seq'),
+                        lineage_actor = json_extract('$j', '\$.lineage_actor')
+                    WHERE source || ':' || target || ':' || type = '$e_q'
+                      AND lineage_seq = $seq AND lineage_actor = '$a_q';" ;;
+            *) sql="UPDATE nodes SET text = json_extract('$j', '\$.text'),
+                        status = json_extract('$j', '\$.status'),
+                        metadata = json_extract('$j', '\$.metadata'),
+                        alias = json_extract('$j', '\$.alias'),
+                        updated_at = json_extract('$j', '\$.updated_at'),
+                        lineage_seq = json_extract('$j', '\$.lineage_seq'),
+                        lineage_actor = json_extract('$j', '\$.lineage_actor')
+                    WHERE id = '$e_q' AND lineage_seq = $seq AND lineage_actor = '$a_q';" ;;
+        esac
+        # On stdin, not argv: a built statement never travels as one argument
+        # (wv-268810, test-sqlite-argv-bulk).
+        if ! got=$(printf '%s\nSELECT changes();\n' "$sql" | sqlite3 "$db" 2>&1); then
+            wv_load_gap "v1 fence could not restore $entity (wv-20c98c): $got"
+            continue
+        fi
+        [ "$got" = "0" ] || n=$((n + 1))
+    done <<< "$_V2_FENCE_ROWS"
+    if [ "$n" -gt 0 ]; then
+        echo -e "${YELLOW}⚠ The v1 replay re-applied $n write(s) the v2 replay refused; the kept value was put back (wv-20c98c).${NC}" >&2
+        wv_delta_reset "$db" || echo -e "${YELLOW}⚠ v1 fence: change tracker drain failed — next sync may re-emit these rows${NC}" >&2
+    fi
+    return 0
+}
+
 _delta_v2_replay() {
     local weave_dir="$1" db="$2"
     local v2_root="$weave_dir/deltas"
+    # The writes this replay refused as lost forks, one "<entity>\t<seq>\t<actor>"
+    # per line, for the v1 fence below (wv-20c98c).
+    _V2_LOST_FENCE=""
     [ -d "$v2_root" ] || return 0
 
     # mapfile, not a read loop (wv-12dce0): read takes a pipe one byte at a
     # time, ~3 s over 9k sidecar paths. find prints no empty path, so the
-    # list is the same.
+    # list is the same. A listing that cannot run is a hard v2 failure, never
+    # an empty catalog: read as empty, it skipped every operation and the load
+    # was acknowledged (wv-8ea297, BSD find has no -printf). Like every hard v2
+    # failure it is a load gap, and v1 applies unless strict (wv-e030f8).
     local -a v2_ops=()
-    mapfile -t v2_ops < <(find "$v2_root" -path '*/v2/*.json' -type f -printf '%f\t%p\n' 2>/dev/null \
-        | LC_ALL=C sort | cut -f2)
-    [ "${#v2_ops[@]}" -gt 0 ] || return 0
+    local v2_list
+    if ! v2_list=$(wv_delta_paths_by_name "$v2_root" -path '*/v2/*.json' -type f); then
+        echo -e "${YELLOW}⚠ could not list the v2 delta operations under $v2_root; none were replayed${NC}" >&2
+        wv_load_gap "v2 operation listing failed (wv-8ea297)"
+        [ "${WV_DELTA_V2_STRICT:-0}" = "1" ] && return 1
+        return 0
+    fi
+    [ -n "$v2_list" ] || return 0
+    mapfile -t v2_ops <<< "$v2_list"
 
     local replay_py="${WV_LIB_DIR:-$SCRIPT_DIR}/lib/wv-delta-v2-replay.py"
     [ -f "$replay_py" ] || replay_py="$SCRIPT_DIR/lib/wv-delta-v2-replay.py"
@@ -2180,6 +2281,12 @@ _delta_v2_replay() {
     cutover_seq=$(_causal_cutover_seq)
     [ -n "$cutover_seq" ] && args+=(--cutover-seq "$cutover_seq")
     [ "${WV_DELTA_V2_STRICT:-0}" = "1" ] && args+=(--strict)
+    # Scoped strict (wv-1446ed): a lineage seq, or "snapshot" for the operations
+    # newer than what the loaded snapshot already holds. Unset keeps strict whole,
+    # which aborts on any historical conflict in a real catalog.
+    if [ "${WV_DELTA_V2_STRICT:-0}" = "1" ] && [ -n "${WV_DELTA_V2_STRICT_SINCE:-}" ]; then
+        args+=(--strict-since "$WV_DELTA_V2_STRICT_SINCE")
+    fi
     # The operation list goes on stdin: it grows with the catalog, and as
     # arguments it exceeded the kernel's limit from long checkout paths, so the
     # replayer never started (rc=126, wv-a05dcd).
@@ -2223,6 +2330,23 @@ for r in d.get("results", []):
                 [ -n "$first_hard" ] || first_hard="$h_short ($h_reason)"
             done <<< "$hard"
         fi
+        # A strict abort names the conflicts that caused it (wv-1446ed), so a
+        # scoped run shows exactly the new convergence conflict.
+        local refused
+        refused=$(printf '%s\n' "$out" | tail -1 | python3 -c '
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+except Exception:
+    sys.exit(0)
+for r in d.get("results", []):
+    if r.get("strict_refused"):
+        print("%s %s" % (r.get("disposition"), r.get("path", "?")))
+' 2>/dev/null) || refused=""
+        if [ -n "$refused" ]; then
+            echo "  strict refused $(( $(printf '%s\n' "$refused" | wc -l) )) operation(s)${WV_DELTA_V2_STRICT_SINCE:+ at or after lineage ${WV_DELTA_V2_STRICT_SINCE}}:" >&2
+            sed -n '1,20s/^/    /p' <<< "$refused" >&2
+        fi
         wv_load_gap "v2 replay aborted (rc=$rc)${first_hard:+: $first_hard}"
         if [ "${WV_DELTA_V2_STRICT:-0}" = "1" ]; then
             return 1
@@ -2251,10 +2375,36 @@ for w in d.get("lost_writes", []):
     seq = (w.get("lineage") or [None])[0]
     print("%s %s: %s (lineage %s)" % (w.get("entity"), w.get("field"), shown, seq))
 ' 2>/dev/null || true)
+    _V2_LOST_FENCE=$(printf '%s\n' "$out" | tail -1 | python3 -c '
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+except Exception:
+    sys.exit(0)
+seen = set()
+for w in d.get("lost_writes", []):
+    lin = w.get("lineage") or []
+    if len(lin) != 2 or not w.get("entity"):
+        continue
+    key = (str(w["entity"]), str(lin[0]), str(lin[1]))
+    if key not in seen:
+        seen.add(key)
+        print("\t".join(key))
+' 2>/dev/null || true)
     if [ -n "$lost" ]; then
-        echo -e "${YELLOW}⚠ Delta v2 replay: $(printf '%s\n' "$lost" | wc -l) write(s) from another graph lost a conflict on the same field and were not applied:${NC}" >&2
+        echo -e "${YELLOW}⚠ Delta v2 replay: $(( $(printf '%s\n' "$lost" | wc -l) )) write(s) lost a conflict on the same field and were not applied:${NC}" >&2
         printf '%s\n' "$lost" | sed 's/^/    /' >&2
-        echo -e "${YELLOW}  The graph kept its own value. Re-apply a lost value with wv update if it should win; once the field is edited again this stops (wv-898c73).${NC}" >&2
+        echo -e "${YELLOW}  The graph keeps each field's current value; the v1 replay does not apply a lost write either (wv-20c98c). Re-apply a lost value with wv update if it should win; once the field is edited again this stops (wv-898c73).${NC}" >&2
+        # The losing side is told it lost (wv-20c98c): before, its own claim was
+        # gone while the warning read as though its value had been kept.
+        local _v2_me _v2_mine
+        _v2_me=$(resolve_agent_id 2>/dev/null) || _v2_me=""
+        if [ -n "$_v2_me" ]; then
+            _v2_mine=$(awk -F'\t' -v me="$_v2_me" '$3 == me { print $1 }' <<< "$_V2_LOST_FENCE" | sort -u | paste -sd, -)
+            if [ -n "$_v2_mine" ]; then
+                echo -e "${YELLOW}⚠ This checkout's own write lost on: ${_v2_mine} (actor ${_v2_me}). Another graph's value is kept; a claim this checkout made there is no longer held.${NC}" >&2
+            fi
+        fi
     fi
     # Replay fired the change-tracking triggers and touched node text/metadata;
     # clear the tracker and re-derive FTS exactly as the v1 replay path does.
@@ -2377,7 +2527,8 @@ _load_snapshot_db() {
 
 # _load_install_db <tmp_db> -- make an imported database the live one.
 _load_install_db() {
-    local tmp_db="$1" verdict=""
+    local tmp_db="$1" restore_err="" out="" rc=0
+    _WV_LOAD_INSTALL_WHY=""
     if [ ! -e "$WV_DB" ]; then
         mv "$tmp_db" "$WV_DB"
         return
@@ -2386,20 +2537,30 @@ _load_install_db() {
     # connections see the old database or the new one, never a mix.
     # The restore keeps the inode, so the schema stamp is cleared here rather
     # than left for db_ensure to notice.
-    if sqlite3 -cmd ".timeout 5000" "$WV_DB" ".restore '$tmp_db'" 2>/dev/null; then
-        rm -f "$tmp_db" "$WV_DB.ensured"
+    if restore_err=$(sqlite3 -cmd ".timeout 5000" "$WV_DB" ".restore '$tmp_db'" 2>&1 >/dev/null); then
+        db_remove_file "$tmp_db"; rm -f "$WV_DB.ensured"
         return 0
     fi
-    # A live file SQLite cannot even check is already lost to every reader, so
-    # no connection has a consistent image to protect: replace it outright.
-    # That is also how a load heals a corrupt hot zone. A healthy file that
-    # refused the restore (held locked past the timeout) is left alone.
-    verdict=$(sqlite3 -cmd ".timeout 5000" "$WV_DB" "PRAGMA quick_check;" 2>/dev/null) || verdict=""
-    if [ "${verdict%%$'\n'*}" != "ok" ]; then
+    # The live file is replaced outright only when SQLite says it is corrupt: a
+    # quick_check that ran and found damage, or a malformed / not-a-database
+    # error. That is how a load heals a corrupt hot zone. A check that could not
+    # run (locked, busy, unable to open) is unknown, not corrupt (wv-4d45e6):
+    # the file is left to its holder and the load refuses (wv-908f9e, wv-800cc9;
+    # without WAL a held lock blocks the check too, as on the macOS runner).
+    out=$(sqlite3 -cmd ".timeout 5000" "$WV_DB" "PRAGMA quick_check;" 2>&1) || rc=$?
+    case "$out" in
+        *malformed*|*"not a database"*|*corrupt*) rc=0; out="damaged" ;;
+    esac
+    if [ "$rc" -eq 0 ] && [ "${out%%$'\n'*}" != "ok" ]; then
         rm -f "$WV_DB" "$WV_DB-wal" "$WV_DB-shm"
         mv "$tmp_db" "$WV_DB"
         return 0
     fi
+    case "$restore_err$out" in
+        *locked*|*busy*|*BUSY*) _WV_LOAD_INSTALL_WHY="locked" ;;
+        "") _WV_LOAD_INSTALL_WHY="the restore was refused with no reason given" ;;
+        *) _WV_LOAD_INSTALL_WHY="${restore_err:-$out}"; _WV_LOAD_INSTALL_WHY="${_WV_LOAD_INSTALL_WHY%%$'\n'*}" ;;
+    esac
     return 1
 }
 
@@ -2491,7 +2652,14 @@ _load_v1_replay() {
             : > "$manifest"
             # Initial iteration order is by filename; the REPLAY order is set
             # below by parsed lineage (wv-5a2627), not this lexical epoch sort.
-            delta_files=$(find "$WEAVE_DIR/deltas" -name '*.sql' -printf '%f\t%p\n' 2>/dev/null | sort | cut -f2)
+            # A listing that cannot run is not an empty catalog (wv-8ea297):
+            # cmd_load fails the load on _WV_LOAD_LISTING_FAILED.
+            if ! delta_files=$(wv_delta_paths_by_name "$WEAVE_DIR/deltas" -name '*.sql'); then
+                echo -e "${RED}Error: could not list the v1 deltas under $WEAVE_DIR/deltas; none were replayed${NC}" >&2
+                wv_load_gap "v1 delta listing failed (wv-8ea297)"
+                _WV_LOAD_LISTING_FAILED=1
+                return 0
+            fi
             if [ -n "$delta_files" ]; then
                 local skipped=0 skipped_legacy=0 skipped_cutover=0 snapshot_max_epoch=0
                 # The replay clock: one definition, shared with wv hotzone
@@ -2739,6 +2907,9 @@ cmd_load() {
     # (scripts/lib/wv-load-receipt.sh). Any other argument is ignored, as before.
     local if_changed=false
     [ "${1:-}" != "--if-changed" ] || if_changed=true
+    # A rebuild without FTS5 would import state.sql's FTS tables as errors and
+    # swap in a graph every write then fails on (wv-649510).
+    db_require_fts5 || return 1
     # Snapshot of the graph as it was before the replace, for the dropped-node
     # diff at the end. Cleanup traps capture paths before these locals expire.
     local pre_load_db=""
@@ -2782,7 +2953,7 @@ cmd_load() {
     if [ -f "$WEAVE_DIR/state.sql" ]; then
         # Atomic load: import to temp DB first, validate, then replace
         local tmp_db=$(mktemp "$WV_HOT_ZONE/.brain.db.XXXXXX")
-        _wv_exit_trap "$(printf 'rm -f -- %q 2>/dev/null' "$tmp_db")"
+        _wv_exit_trap "$(printf 'db_remove_file %q' "$tmp_db")"
 
         # Import ignoring non-zero exit: sqlite3 exits 1 on benign runtime errors
         # (e.g. malformed JSON in a generated column during INSERT) even when all
@@ -2798,7 +2969,7 @@ cmd_load() {
         WV_LOAD_GAPS=()
         local _ack_digest_file _ack_digest_pid _ack_before=""
         _ack_digest_file=$(mktemp "$WV_HOT_ZONE/.load-digest.XXXXXX")
-        _wv_exit_trap "$(printf 'rm -f -- %q %q 2>/dev/null' "$tmp_db" "$_ack_digest_file")"
+        _wv_exit_trap "$(printf 'db_remove_file %q; rm -f -- %q 2>/dev/null' "$tmp_db" "$_ack_digest_file")"
         wv_load_catalog_digest "$WEAVE_DIR" > "$_ack_digest_file" 2>/dev/null &
         _ack_digest_pid="$!"
         strip_unistr < "$WEAVE_DIR/state.sql" | sqlite3 "$tmp_db" 2>/dev/null; true
@@ -2814,7 +2985,7 @@ cmd_load() {
                 # the life of that hot zone. The load is atomic by construction
                 # -- import to a temp database, validate, then replace -- and a
                 # missing graph table is exactly what validation is for.
-                rm -f "$tmp_db"
+                db_remove_file "$tmp_db"
                 _wv_exit_trap
                 echo -e "${RED}Error: edges table missing or corrupt in state.sql — refusing to load${NC}" >&2
                 echo -e "${YELLOW}  The existing database is untouched. A snapshot without a graph table${NC}" >&2
@@ -2862,15 +3033,20 @@ cmd_load() {
             # copy is on tmpfs. Removed unconditionally once the diff has run.
             if [ -e "$WV_DB" ]; then
                 pre_load_db=$(mktemp "$WV_HOT_ZONE/.preload.db.XXXXXX")
-                _load_snapshot_db "$pre_load_db" || { rm -f "$pre_load_db"; pre_load_db=""; }
+                _load_snapshot_db "$pre_load_db" || { db_remove_file "$pre_load_db"; pre_load_db=""; }
             fi
 
             # Validation passed, replace existing DB
             if ! _load_install_db "$tmp_db"; then
-                rm -f "$tmp_db" "$pre_load_db"
+                db_remove_file "$tmp_db" "$pre_load_db"
                 _wv_exit_trap
-                echo -e "${RED}Error: the live database stayed locked; it was not replaced${NC}" >&2
-                echo -e "${YELLOW}  Another wv process held it past the timeout. Retry wv load.${NC}" >&2
+                if [ "${_WV_LOAD_INSTALL_WHY:-locked}" = "locked" ]; then
+                    echo -e "${RED}Error: the live database stayed locked; it was not replaced${NC}" >&2
+                    echo -e "${YELLOW}  Another wv process held it past the timeout. Retry wv load.${NC}" >&2
+                else
+                    echo -e "${RED}Error: the live database could not be replaced or checked; it was left as it is${NC}" >&2
+                    echo -e "${YELLOW}  SQLite: ${_WV_LOAD_INSTALL_WHY}${NC}" >&2
+                fi
                 return 1
             fi
             _WV_DB_READY=""   # a new DB: db_ensure must migrate it again
@@ -2878,9 +3054,9 @@ cmd_load() {
             # snapshot: the migration and strict-v2-replay paths below both
             # return early, and without this the snapshot outlives them in the
             # hot zone.
-            _wv_exit_trap "$(printf 'rm -f -- %q 2>/dev/null' "$pre_load_db")"
+            _wv_exit_trap "$(printf 'db_remove_file %q' "$pre_load_db")"
         else
-            rm -f "$tmp_db"
+            db_remove_file "$tmp_db"
             _wv_exit_trap
             echo -e "${RED}Error: state.sql is corrupt, keeping existing database${NC}" >&2
             return 1
@@ -2947,12 +3123,35 @@ EOF
             || wv_load_gap "load attempt could not be recorded"
         if ! _delta_v2_replay "$WEAVE_DIR" "$WV_DB"; then
             echo -e "${RED}Error: Delta v2 replay or node search index rebuild failed${NC}" >&2
+            # Strict refused the catalog after the snapshot was installed: put
+            # back the graph this hot zone held before the load rather than
+            # leave the snapshot without its deltas (wv-1446ed).
+            if [ "${WV_DELTA_V2_STRICT:-0}" = "1" ] && [ -n "${pre_load_db:-}" ] && [ -s "$pre_load_db" ]; then
+                if _load_install_db "$pre_load_db"; then
+                    _WV_DB_READY=""
+                    echo -e "${YELLOW}  The hot zone holds the graph it held before this load; nothing from this catalog was installed.${NC}" >&2
+                else
+                    echo -e "${YELLOW}  The previous graph could not be put back: the hot zone holds the snapshot without its deltas. Run wv load without WV_DELTA_V2_STRICT to finish it.${NC}" >&2
+                fi
+            else
+                echo -e "${YELLOW}  The hot zone holds the snapshot without its deltas (no earlier graph to put back). Run wv load without WV_DELTA_V2_STRICT to finish it.${NC}" >&2
+            fi
             return 1
         fi
 
         # Delta replay — multi-agent merge: the v1 SQL back-catalog, after the
         # v2 dispatch above and before the tombstone reconcile below (wv-c92ac9).
+        # Fenced so it cannot apply a write the v2 replay refused (wv-20c98c).
+        # The phase reports a listing it could not run through a flag, not
+        # its status, so errexit inside it stays as it was (wv-8ea297).
+        _WV_LOAD_LISTING_FAILED=""
+        _v2_fence_snapshot "$WV_DB"
         _load_v1_replay
+        _v2_fence_restore "$WV_DB"
+        if [ -n "$_WV_LOAD_LISTING_FAILED" ]; then
+            echo -e "${YELLOW}  The hot zone holds the snapshot without its v1 deltas; run wv load again once the listing works.${NC}" >&2
+            return 1
+        fi
 
         # Enforce cross-machine deletion tombstones AFTER both delta blocks: the
         # v1 catalog may have resurrected a node/edge that a delete recorded a
@@ -2978,7 +3177,7 @@ EOF
         # was live, is gone, and nothing durable records why.
         if [ -n "${pre_load_db:-}" ]; then
             _load_report_dropped_nodes "$WV_DB" "$pre_load_db"
-            rm -f "$pre_load_db"
+            db_remove_file "$pre_load_db"
             pre_load_db=""
             _wv_exit_trap
         fi
@@ -3099,12 +3298,24 @@ cmd_clean_ghosts() {
         return 0
     fi
 
+    # Targets of ghost blocks edges: their status is recomputed below (wv-81338c).
+    local ghost_blocked
+    ghost_blocked=$(db_query "
+        SELECT DISTINCT target FROM edges
+        WHERE type='blocks' AND source NOT IN (SELECT id FROM nodes)
+        AND target IN (SELECT id FROM nodes);
+    ") || return 1
+
     # Delete ghost edges
     db_query "
         DELETE FROM edges
         WHERE source NOT IN (SELECT id FROM nodes)
         OR target NOT IN (SELECT id FROM nodes);
     " || return 1
+    if [ -n "$ghost_blocked" ]; then
+        # shellcheck disable=SC2086  # one ID per word
+        _recompute_blocked_targets $ghost_blocked >/dev/null || return 1
+    fi
 
     echo -e "${GREEN}✓${NC} Deleted $ghost_count ghost edge(s)"
 }
@@ -3713,7 +3924,16 @@ cmd_commit_refs() {
         # A write publishes its delta, not state.sql (wv-8595fb): the proof is
         # a delta this prune published that names every node it changed.
         local deltas_before="$workdir/deltas-before" deltas_new="$workdir/deltas-new"
-        find "$WEAVE_DIR/deltas" -name '*.sql' 2>/dev/null | sort > "$deltas_before"
+        # A walk that fails leaves no baseline, so the proof below could count
+        # every delta as this prune's: refuse before changing anything
+        # (wv-8ea297). No deltas directory yet is a real, empty baseline.
+        : > "$deltas_before"
+        if [ -d "$WEAVE_DIR/deltas" ] \
+            && ! (set -o pipefail; find "$WEAVE_DIR/deltas" -name '*.sql' | sort > "$deltas_before"); then
+            echo "wv commit-refs: could not list $WEAVE_DIR/deltas; nothing pruned" >&2
+            rm -rf "$workdir"
+            return 1
+        fi
 
         local node drops
         while IFS= read -r node; do
@@ -3735,7 +3955,10 @@ cmd_commit_refs() {
             # stdout is noise here; stderr is the only explanation the operator
             # gets for a persisted=false verdict, so it is deliberately kept.
             auto_sync_or_warn --force >/dev/null
-            find "$WEAVE_DIR/deltas" -name '*.sql' 2>/dev/null | sort | comm -13 "$deltas_before" - > "$deltas_new"
+            if ! (set -o pipefail; find "$WEAVE_DIR/deltas" -name '*.sql' | sort | comm -13 "$deltas_before" - > "$deltas_new"); then
+                echo "wv commit-refs: could not list $WEAVE_DIR/deltas after the sync; persistence unproved" >&2
+                : > "$deltas_new"
+            fi
             persisted=false
             if [ -s "$deltas_new" ]; then
                 persisted=true
@@ -3911,7 +4134,11 @@ cmd_compact() {
     # unreadable graph read as zero claims and let deletion proceed (wv-90083c).
     wv_require_graph || return 1
     local active_claims
-    active_claims=$(db_query "SELECT COUNT(*) FROM nodes WHERE status='active' AND json_extract(metadata, '\$.claimed_by') IS NOT NULL;" 2>/dev/null || echo "0")
+    # A count that cannot be read is not zero (wv-4ccc98): this gate guards a
+    # deletion, and a busy or broken database used to read as "no claims".
+    active_claims=$(db_query "SELECT COUNT(*) FROM nodes WHERE status='active' AND json_extract(metadata, '\$.claimed_by') IS NOT NULL;" 2>/dev/null) \
+        && [[ "$active_claims" =~ ^[0-9]+$ ]] \
+        || { echo -e "${RED}✗${NC} cannot count claimed nodes in $WV_DB; refusing (an unread count is not zero)." >&2; return 1; }
     if [ "$active_claims" -gt 0 ] && [ "$force" = true ]; then
         wv_policy_verdict compact_waits_for_claims allow yes --force "compacted while agents held claims"
     elif [ "$active_claims" -gt 0 ]; then
@@ -3939,8 +4166,16 @@ cmd_compact() {
     local cutoff=$(( now - older_than * 86400 ))
     local deleted=0
     local dry_list=()
+    local delta_list
+    # A walk that fails is an error, not "no delta files older than" a clean
+    # dry run would report (wv-8ea297).
+    if ! delta_list=$(set -o pipefail; find "$delta_root" -name '*.sql' | sort); then
+        echo -e "${RED}Error: could not list $delta_root; nothing compacted${NC}" >&2
+        return 1
+    fi
 
     while IFS= read -r delta; do
+        [ -n "$delta" ] || continue
         local delta_name delta_ts
         delta_name="${delta##*/}"
         delta_ts="${delta_name%%-*}"
@@ -3952,7 +4187,7 @@ cmd_compact() {
                 deleted=$(( deleted + 1 ))
             fi
         fi
-    done < <(find "$delta_root" -name '*.sql' 2>/dev/null | sort)
+    done <<< "$delta_list"
 
     if $dry_run; then
         if [ "${#dry_list[@]}" -eq 0 ]; then
@@ -4025,7 +4260,11 @@ cmd_cutover() {
 
     # Coordination gate — a claimed node may hold un-synced pre-cutover work.
     local active_claims
-    active_claims=$(db_query "SELECT COUNT(*) FROM nodes WHERE status='active' AND json_extract(metadata, '\$.claimed_by') IS NOT NULL;" 2>/dev/null || echo "0")
+    # A count that cannot be read is not zero (wv-4ccc98): this gate guards a
+    # deletion, and a busy or broken database used to read as "no claims".
+    active_claims=$(db_query "SELECT COUNT(*) FROM nodes WHERE status='active' AND json_extract(metadata, '\$.claimed_by') IS NOT NULL;" 2>/dev/null) \
+        && [[ "$active_claims" =~ ^[0-9]+$ ]] \
+        || { echo -e "${RED}✗${NC} cannot count claimed nodes in $WV_DB; refusing (an unread count is not zero)." >&2; return 1; }
     if [ "$active_claims" -gt 0 ] && [ "$force" = true ]; then
         wv_policy_verdict cutover_waits_for_claims allow yes --force "cut over while agents held claims"
     elif [ "$active_claims" -gt 0 ]; then
@@ -4071,7 +4310,7 @@ cmd_cutover() {
 # was written at least 90 days ago.
 _prune_tombstone_floor_seq() {
     local cutoff floor=0 day seq f
-    cutoff=$(date -u -d '90 days ago' +%Y-%m-%d 2>/dev/null) || cutoff=$(date -u -v-90d +%Y-%m-%d)
+    cutoff=$(wv_date_fmt -u $(( $(date +%s) - 90 * 86400 )) +%Y-%m-%d) || return 1
     [ -d "$WEAVE_DIR/deltas" ] || { echo 0; return 0; }
     for day in "$WEAVE_DIR"/deltas/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]; do
         [ -d "$day/v2" ] || continue
@@ -4113,7 +4352,10 @@ _prune_compact_tombstones() {
         return 1
     fi
     local floor
-    floor=$(_prune_tombstone_floor_seq)
+    floor=$(_prune_tombstone_floor_seq) && [[ "$floor" =~ ^[0-9]+$ ]] || {
+        echo -e "${RED}Error: cannot date the 90-day tombstone floor; nothing compacted${NC}" >&2
+        return 1
+    }
     local where="lineage_seq > 0 AND lineage_seq < $watermark AND lineage_seq <= $floor"
     local n
     n=$(db_query "SELECT count(*) FROM tombstones WHERE $where;") || return 1
@@ -4284,7 +4526,8 @@ cmd_prune() {
                 fi
             done <<< "$_with_issue"
             if [ "$_open_n" -gt 0 ]; then
-                candidates=$(awk -v ids="$_open_ids" 'BEGIN{n=split(ids,a,"\n"); for(i=1;i<=n;i++) if(a[i]!="") skip[a[i]]=1} {split($0,f,"|"); if(!(f[1] in skip)) print}' <<< "$candidates")
+                # ids through ENVIRON: BSD awk refuses a newline in a -v value (wv-27b2f5)
+                candidates=$(WV_AWK_IDS="$_open_ids" awk 'BEGIN{n=split(ENVIRON["WV_AWK_IDS"],a,"\n"); for(i=1;i<=n;i++) if(a[i]!="") skip[a[i]]=1} {split($0,f,"|"); if(!(f[1] in skip)) print}' <<< "$candidates")
                 kept="${kept:+$kept$'\n'}open or unverified GitHub issue: $_open_n"
             fi
         fi
@@ -4305,7 +4548,7 @@ cmd_prune() {
     local archive_file="$archive_dir/$(date +%Y-%m-%d).jsonl"
 
     local count
-    count=$(echo "$candidates" | wc -l)
+    count=$(( $(echo "$candidates" | wc -l) ))
 
     if [ "$dry_run" = true ]; then
         echo -e "${YELLOW}Would prune $count nodes:${NC}"
@@ -4337,6 +4580,13 @@ cmd_prune() {
     local connected_targets
     connected_targets=$(db_query "SELECT DISTINCT target FROM edges WHERE source IN ('${ids//,/\',\'}');" | tr '\n' ' ')
     affected_nodes="$affected_nodes $connected_sources $connected_targets"
+    # Nodes a pruned node blocks: their status is recomputed after the prune
+    # (wv-81338c). Pruned nodes are done, so this only clears a status that was
+    # already stale; the UPDATE runs after the non-propagating transaction on
+    # purpose, so the corrected status reaches every clone.
+    local prune_blocked
+    # shellcheck disable=SC2046  # one ID per word
+    prune_blocked=$(_blocks_targets_of $(echo "$candidates" | cut -d'|' -f1)) || return 1
 
     # No issue is closed here: a candidate with an open issue was kept above.
 
@@ -4390,6 +4640,13 @@ cmd_prune() {
     if ! db_query "$prune_sql"; then
         echo -e "${RED}Error: prune refused by the database; nothing pruned, no tombstones written (the archive at $archive_file lists what it would have removed)${NC}" >&2
         return 1
+    fi
+    if [ -n "$prune_blocked" ]; then
+        # shellcheck disable=SC2086  # one ID per word
+        _recompute_blocked_targets $prune_blocked >/dev/null || {
+            echo -e "${RED}Error: pruned, but could not recompute the status of: $prune_blocked${NC}" >&2
+            return 1
+        }
     fi
 
     # Re-dump state.sql so it no longer contains pruned nodes.
@@ -4562,7 +4819,7 @@ cmd_unarchive() {
     if [ -z "$record" ]; then
         echo -e "${RED}Error: node $node_id not found in archive${NC}" >&2
         echo "  Archive: $archive_dir" >&2
-        echo "  Available: $(ls "$archive_dir"/*.jsonl 2>/dev/null | wc -l) file(s)" >&2
+        echo "  Available: $(( $(ls "$archive_dir"/*.jsonl 2>/dev/null | wc -l) )) file(s)" >&2
         return 1
     fi
 
@@ -5028,7 +5285,7 @@ _refs_extract() {
         num=$(echo "$match" | grep -oE '[0-9]+')
         _refs_count=$((_refs_count + 1))
         _refs_data="${_refs_data}${_refs_count}|${match}|gh issue view ${num}|github_issue|0.6\n"
-    done < <(echo "$input" | grep -oP '(gh-[0-9]+|(?<![a-zA-Z0-9])#[0-9]+)' | sort -u | head -n "$max_refs")
+    done < <(echo "$input" | grep -oE '(^|[^a-zA-Z0-9])#[0-9]+|gh-[0-9]+' | grep -oE 'gh-[0-9]+|#[0-9]+' | sort -u | head -n "$max_refs")
 
     # 3. ADR/RFC references — confidence 0.6
     while IFS= read -r match; do
@@ -5525,7 +5782,7 @@ cmd_import() {
         fi
         
         # Generate new weave ID
-        local new_id=$(generate_id)
+        local new_id; new_id=$(generate_id) || return 1
         
         if [ "$dry_run" = true ]; then
             echo -e "${YELLOW}Would import:${NC} $id → $new_id: $text"
@@ -6008,15 +6265,10 @@ _trails_append() {
     echo -e "${GREEN}✓${NC} Trail entry appended to $id ($count total)"
 }
 
-# _trails_release_lock — drop whichever lock _trails_save acquired. Only one
-# mechanism is ever held, so exactly one branch applies.
+# _trails_release_lock <fd> — drop the lock _trails_save acquired: closing its
+# fd releases it, whichever wv_lock_fd mechanism took it.
 _trails_release_lock() {
-    local fd="$1" dir="$2"
-    if [ -n "$fd" ]; then
-        eval "exec ${fd}>&-" 2>/dev/null || true
-    elif [ -n "$dir" ]; then
-        rmdir "$dir" 2>/dev/null || true
-    fi
+    [ -z "${1:-}" ] || eval "exec ${1}>&-" 2>/dev/null || true
 }
 
 # _tr_flatten — collapse a free-form value to a single line for a generated row.
@@ -6086,41 +6338,30 @@ _tr_structure_ok() {
 }
 
 _trails_acquire_lock() {
-    # _trails_save owns the fd/directory bindings and releases them only after
-    # the whole read-modify-write, including validation and atomic publication.
-    local _tr_lock="${breadcrumb_file}.lock"
+    # _trails_save owns the fd and releases it only after the whole
+    # read-modify-write, including validation and atomic publication.
+    local _tr_lock="${breadcrumb_file}.lock" _tr_lrc=0
     local _tr_lock_wait="${WV_TRAILS_LOCK_WAIT:-120}"
     [[ "$_tr_lock_wait" =~ ^[0-9]+$ ]] && [ "$_tr_lock_wait" -gt 0 ] || _tr_lock_wait=120
-    # Exactly ONE mechanism is used, chosen by availability before any process
-    # participates. Falling back from a timed-out flock to a directory lock made
-    # the two independent: the waiter took the directory lock and wrote while the
-    # original flock holder was still live. A timeout is contention, not a licence
-    # to proceed, so it fails and the caller retries.
-    if command -v flock >/dev/null 2>&1; then
-        if ! exec {_tr_lock_fd}>"$_tr_lock" 2>/dev/null; then
-            echo -e "${RED}Error: cannot open trails lock $_tr_lock${NC}" >&2
-            return 1
-        fi
-        if ! flock -w "$_tr_lock_wait" "$_tr_lock_fd" 2>/dev/null; then
-            eval "exec ${_tr_lock_fd}>&-" 2>/dev/null || true
-            echo -e "${RED}Error: another trails save held the lock for more than ${_tr_lock_wait}s; nothing was written${NC}" >&2
-            return 1
-        fi
-    else
-        # No flock: a directory lock, never reclaimed on timeout. Removing a lock
-        # whose owner has not been proven dead evicts a live writer.
-        _tr_lock_dir="${_tr_lock}.d"
-        local _tr_spin=0 _tr_spin_max=$((_tr_lock_wait * 20))
-        while ! mkdir "$_tr_lock_dir" 2>/dev/null; do
-            _tr_spin=$((_tr_spin + 1))
-            if [ "$_tr_spin" -gt "$_tr_spin_max" ]; then
-                _tr_lock_dir=""
-                echo -e "${RED}Error: another trails save held the lock for more than ${_tr_lock_wait}s; nothing was written${NC}" >&2
-                echo -e "${YELLOW}  If no save is running, remove the stale lock: rmdir ${_tr_lock}.d${NC}" >&2
-                return 1
-            fi
-            sleep 0.05
-        done
+    # One mechanism on every host, wv_lock_fd (wv-lock.sh): flock(1), else
+    # python3 fcntl on the same fd, both flock(2), so every holder sees every
+    # other and a crashed save leaves no lock behind (wv-f38225; the mkdir lock
+    # it replaces needed a human to rmdir it). A timeout is contention, not a
+    # licence to proceed: it fails and the caller retries. The braces scope the
+    # 2>/dev/null to the open; on a bare exec it silenced stderr for good.
+    if ! { exec {_tr_lock_fd}>>"$_tr_lock"; } 2>/dev/null; then
+        _tr_lock_fd=""
+        echo -e "${RED}Error: cannot open trails lock $_tr_lock${NC}" >&2
+        return 1
+    fi
+    wv_lock_fd "$_tr_lock_fd" -x "$_tr_lock_wait" || _tr_lrc=$?
+    if [ "$_tr_lrc" -ne 0 ]; then
+        eval "exec ${_tr_lock_fd}>&-" 2>/dev/null || true
+        _tr_lock_fd=""
+        # 2: wv_lock_fd has said that no mechanism exists.
+        [ "$_tr_lrc" -eq 2 ] \
+            || echo -e "${RED}Error: another trails save held the lock for more than ${_tr_lock_wait}s; nothing was written${NC}" >&2
+        return 1
     fi
     return 0
 }
@@ -6139,7 +6380,7 @@ _trails_save() {
 
     # Serialise the whole read/build/write. Unlocked saves lost 19 of 20 notes;
     # a timed-out lock never permits an unlocked or independently locked write.
-    local _tr_lock_fd="" _tr_lock_dir=""
+    local _tr_lock_fd=""
     _trails_acquire_lock || return 1
 
     # ── Notes are append-only (Finding M) ────────────────────────────────────
@@ -6419,8 +6660,8 @@ _trails_save() {
     # Byte-exactness: the file must hold exactly the generated content. A short
     # write leaves fewer bytes than were generated, whatever status it reported.
     local _tr_expect
-    _tr_expect=$(printf '%s\n' "$_tr_body" | wc -c 2>/dev/null || echo -1)
-    _tr_bytes=$(wc -c < "$_tr_tmp" 2>/dev/null || echo 0)
+    _tr_expect=$(( $(printf '%s\n' "$_tr_body" | wc -c 2>/dev/null || echo -1) ))
+    _tr_bytes=$(( $(wc -c < "$_tr_tmp" 2>/dev/null || echo 0) ))
     if [ "${_tr_bytes:-0}" -ne "${_tr_expect:--1}" ]; then
         _tr_write_rc=1
     fi
@@ -6446,7 +6687,7 @@ _trails_save() {
     # Health left every other section unguarded.
     if [ "$_tr_write_rc" -ne 0 ] || [ ! -s "$_tr_tmp" ] || ! _tr_structure_ok "$_tr_tmp"; then
         rm -f "$_tr_tmp" 2>/dev/null || true
-        _trails_release_lock "${_tr_lock_fd:-}" "${_tr_lock_dir:-}"
+        _trails_release_lock "${_tr_lock_fd:-}"
         echo -e "${RED}Error: could not write $_tr_tmp; trails.md is unchanged${NC}" >&2
         return 1
     fi
@@ -6459,7 +6700,7 @@ _trails_save() {
     if [ -n "$prior_completions" ]; then
         if ! printf '\n%s\n' "$prior_completions" >> "$_tr_tmp" 2>/dev/null; then
             rm -f "$_tr_tmp" 2>/dev/null || true
-            _trails_release_lock "${_tr_lock_fd:-}" "${_tr_lock_dir:-}"
+            _trails_release_lock "${_tr_lock_fd:-}"
             echo -e "${RED}Error: could not preserve completion records; $breadcrumb_file is unchanged${NC}" >&2
             return 1
         fi
@@ -6470,7 +6711,7 @@ _trails_save() {
         _tr_got_c=$(grep -c '^## [0-9]\{4\}-' "$_tr_tmp" 2>/dev/null || true)
         if [ "${_tr_got_c:-0}" -lt "${_tr_want_c:-0}" ]; then
             rm -f "$_tr_tmp" 2>/dev/null || true
-            _trails_release_lock "${_tr_lock_fd:-}" "${_tr_lock_dir:-}"
+            _trails_release_lock "${_tr_lock_fd:-}"
             echo -e "${RED}Error: completion records were lost while saving; $breadcrumb_file is unchanged${NC}" >&2
             return 1
         fi
@@ -6478,11 +6719,11 @@ _trails_save() {
 
     if ! mv -f "$_tr_tmp" "$breadcrumb_file" 2>/dev/null; then
         rm -f "$_tr_tmp" 2>/dev/null || true
-        _trails_release_lock "${_tr_lock_fd:-}" "${_tr_lock_dir:-}"
+        _trails_release_lock "${_tr_lock_fd:-}"
         echo -e "${RED}Error: could not replace $breadcrumb_file; it is unchanged${NC}" >&2
         return 1
     fi
-    _trails_release_lock "${_tr_lock_fd:-}" "${_tr_lock_dir:-}"
+    _trails_release_lock "${_tr_lock_fd:-}"
 
     echo -e "${GREEN}✓${NC} Trails saved to .weave/trails.md"
 }
@@ -6686,7 +6927,7 @@ _plan_inject_learnings() {
         keywords=$(echo "$keywords" | sed 's/[(){}*:^~"]//g' | xargs)
         [ -z "$keywords" ] && continue
         local kw_count
-        kw_count=$(echo "$keywords" | wc -w)
+        kw_count=$(( $(echo "$keywords" | wc -w) ))
         [ "$kw_count" -lt 2 ] && continue
         local fts_query
         fts_query=$(echo "$keywords" | sed 's/ / OR /g')
@@ -6715,7 +6956,7 @@ _plan_inject_learnings() {
             new_meta="${new_meta//\'/\'\'}"
             db_query "UPDATE nodes SET metadata='$new_meta' WHERE id='${_task_ids[$i]}';" 2>/dev/null
             local match_count
-            match_count=$(echo "$learning_ids" | wc -l)
+            match_count=$(( $(echo "$learning_ids" | wc -l) ))
             learnings_count=$((learnings_count + match_count))
         fi
     done

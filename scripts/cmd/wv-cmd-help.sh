@@ -551,7 +551,7 @@ cmd_help_topic() {
             print_command_help "wv preflight <id>" "Return machine-readable blockers, contradictions, and readiness checks for a node."
             ;;
         recover)
-            print_command_help "wv recover [--auto] [--json] [--session]" "Resume interrupted ship/sync/delete flows or inspect orphaned active work for the current session."
+            print_command_help "wv recover [--auto] [--json] [--session] [--reproject [--event=NAME]]" "Resume interrupted ship/sync/delete flows or inspect orphaned active work for the current session. --reproject: when the committed .weave/ snapshot lags the operations committed with it (a rebase or merge kept another copy's), rebuild it (wv load, wv sync) and commit graph state alone; deferred with the reason while a gate holds the checkout, WV_AUTO_CHECKPOINT=0, an autostash holds .weave/ changes or files outside graph state are staged. The post-rewrite and post-merge hooks run it."
             ;;
         overview)
             print_command_help "wv overview [--json]" "Show a compact operational snapshot: counts, health indicators, breadcrumb, and top ready work."
@@ -755,9 +755,11 @@ stdin closed, so it cannot read the rest of the batch.
             ;;
         hotzone)
             print_command_help "wv hotzone list [--json]" "List all hot-zones (active graph DB directories) with status, node count, and owner."
-            print_command_help "wv hotzone db" "Print this repository's resolved brain.db path. Read the graph DB through it (DB=\$(wv hotzone db); sqlite3 -readonly \"\$DB\"): placement adopts the zone already holding this repository's database, else the /tmp zone (wv-b831e3), and sqlite3 on a guessed path creates an empty database there."
-            print_command_help "wv hotzone gc [--dry-run]" "Remove orphan hot-zone directories (no matching live repo). Skips dirs newer than 1h."
+            print_command_help "wv hotzone db" "Print this repository's resolved brain.db path. Read the graph DB through it (DB=\$(wv hotzone db); sqlite3 -cmd \"PRAGMA query_only=1\" \"file:\$DB?mode=rw\"; macOS sqlite3 cannot open a WAL database -readonly without its -shm, and mode=rw never creates one): placement adopts the zone already holding this repository's database, else the /tmp zone (wv-b831e3), and sqlite3 on a guessed path creates an empty database there."
+            print_command_help "wv hotzone gc [--dry-run]" "Quarantine hot-zone directories whose repository is known to be deleted (its parent directory is present and lists entries, or it was a temporary scratch repository): each moves by rename into <base>/.quarantine/ with a record of where it was, never deleted on the spot. A later gc purges a quarantined zone after WV_HOTZONE_QUARANTINE_DAYS (default 7) only while its owner is still gone and nothing has written to it. An owner that cannot be seen, as on an unmounted disk, or no owner recorded, is unknown and kept, with the reason (wv-4ccc98). Skips dirs newer than 1h."
+            print_command_help "wv hotzone restore <name|path>" "Move a quarantined hot-zone directory back to where gc found it; refuses when that path is occupied."
             print_command_help "wv hotzone diff <brain.db> <brain.db>" "Compare two copies of one repository's graph, read-only, over every table a sync keeps (nodes, edges, file attribution, tombstones): rows only in one, or differing. Run it before removing either copy of a repository found in two hot zones: syncing both does not merge them (wv-a73141). It needs no hot zone, so it runs even where placement is refused (wv-757de1). Exit 0 identical, 1 different, 2 unusable arguments."
+            print_command_help "wv hotzone migrate [--apply]" "Relocate the /tmp hot zone from its legacy layout (a real /tmp/weave-codex-<uid>, the neutral /tmp/weave-hotzone-<uid> its alias) to the neutral name, leaving the legacy name a fence symlink (wv-97d68a). A maintenance operation, run by hand in a quiet window and never automatically: it moves nothing while any process of yours uses either name or any wv on the host predates the neutral name, refuses two populated directories, and moves only by one same-filesystem rename. Without --apply it reports what it would do. Exit 0 done or nothing to do, 1 refused, 2 bad arguments."
             ;;
         *)
             echo "Unknown help topic: $topic" >&2
@@ -794,7 +796,7 @@ Commands:
   bulk-update       Update multiple nodes from JSON on stdin [--dry-run]
   work <id>         Claim node & set WV_ACTIVE for subagent context [--quiet]
   preflight <id>    Pre-action checks as JSON (blockers, contradictions, context load)
-  recover           Resume incomplete operations (ship/sync/delete) [--auto] [--json] [--session]
+  recover           Resume incomplete operations (ship/sync/delete) [--auto] [--json] [--session] [--reproject]
   bootstrap         Single-call JSON bootstrap context for agents [--json]
     bootstrap-agent   Agent bootstrap contract with command/provenance/readiness [--json]
     ship-agent        Agent-safe non-interactive close + sync wrapper [--json]
@@ -837,7 +839,7 @@ Commands:
   self-update       Refresh installed wv from the dev clone recorded at install time
   uninstall         Remove installed wv files (delegates to install.sh --uninstall)
   doctor            Installation + surface-contract checks (deps, hooks, ghost settings, matchers) [--json]
-  hotzone <sub>     Hot-zone DB directories (list, db, diff, gc) [--json] [--dry-run]
+  hotzone <sub>     Hot-zone DB directories (list, db, diff, gc, migrate) [--json] [--dry-run]
   context-policy    Context load policy (HIGH/MEDIUM/LOW) and reason [--json] [--refresh]
   selftest          Round-trip smoke test in isolated environment [--json]
   test-record <suite> Record a test-suite run for verification freshness (used by git hooks)

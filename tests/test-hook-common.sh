@@ -360,6 +360,7 @@ test_pre_action_resolves_installed_libs() {
     cp "$PROJECT_ROOT"/scripts/lib/wv-resolve-project.sh \
        "$PROJECT_ROOT"/scripts/lib/wv-validate.sh \
        "$PROJECT_ROOT"/scripts/lib/wv-config.sh \
+       "$PROJECT_ROOT"/scripts/lib/wv-python-floor.sh \
        "$PROJECT_ROOT"/scripts/lib/wv-hook-common.sh \
        "$PROJECT_ROOT"/scripts/lib/wv-resolve-runtime.sh \
        "$PROJECT_ROOT"/scripts/lib/wv-pre-tool-use.sh \
@@ -401,6 +402,7 @@ test_pre_action_falls_through_broken_library() {
     cp "$PROJECT_ROOT"/scripts/lib/wv-resolve-project.sh \
        "$PROJECT_ROOT"/scripts/lib/wv-validate.sh \
        "$PROJECT_ROOT"/scripts/lib/wv-config.sh \
+       "$PROJECT_ROOT"/scripts/lib/wv-python-floor.sh \
        "$PROJECT_ROOT"/scripts/lib/wv-hook-common.sh \
        "$PROJECT_ROOT"/scripts/lib/wv-resolve-runtime.sh \
        "$PROJECT_ROOT"/scripts/lib/wv-pre-tool-use.sh \

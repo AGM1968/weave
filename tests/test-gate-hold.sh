@@ -14,6 +14,9 @@ set -uo pipefail
 export WV_TEST_SUITE=1
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 LIB="$ROOT/scripts/lib/wv-gate-hold.sh"
+# wv_now: a validated clock; BSD date may print %N literally (wv-43082a).
+# shellcheck source=../scripts/lib/wv-resolve-runtime.sh
+. "$ROOT/scripts/lib/wv-resolve-runtime.sh"
 run=0 pass=0
 ok()  { run=$((run+1)); pass=$((pass+1)); echo "  ✓ $1"; }
 bad() { run=$((run+1)); echo "  ✗ $1"; [ -n "${2:-}" ] && echo "      $2"; }
@@ -60,9 +63,9 @@ drop() {
 # contend <env...> — a second gate's attempt; sets OUT, RC and MS.
 contend() {
     local t0 t1
-    t0=$(date +%s%N)
+    t0=$(wv_now ns)
     OUT=$(in_env "$@" -- "wv_gate_hold_acquire pre-commit 'the staged change'" 2>&1); RC=$?
-    t1=$(date +%s%N)
+    t1=$(wv_now ns)
     MS=$(( (t1 - t0) / 1000000 ))
 }
 idof() { in_env "$@" -- ". '$ROOT/scripts/lib/wv-resolve-runtime.sh'; resolve_agent_id" 2>/dev/null; }

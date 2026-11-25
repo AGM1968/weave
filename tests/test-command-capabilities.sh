@@ -326,8 +326,10 @@ for ref in ("#/$defs/a", "other.json#/x"):
     else:
         raise SystemExit(f"{ref}: accepted")
 PY
+# bounded, not timeout(1): GNU coreutils, absent on macOS, where the check
+# exited 127 without running (wv-412db3).
 check "a circular or non-local \$ref is refused, not followed" \
-  "timeout 10 python3 '$TMP/ref-probe.py' '$ROOT/scripts'"
+  ". '$ROOT/tests/lib/bounded.sh'; bounded 10 python3 '$TMP/ref-probe.py' '$ROOT/scripts'"
 
 echo ""
 echo "Results: $pass/$run passed"

@@ -29,6 +29,9 @@ TESTS_FAILED=0
 # Paths
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# wv_stat / wv_date_fmt: GNU and BSD behind one call (wv-resolve-runtime.sh, side-effect free).
+# shellcheck disable=SC1091  # resolved at run time
+source "$PROJECT_ROOT/scripts/lib/wv-resolve-runtime.sh"
 WV="$PROJECT_ROOT/scripts/wv"
 
 # wv_mutation_seq is the production mutation clock. The deletion tests below
@@ -541,10 +544,10 @@ test_context_cache_same_second_change() {
     "$WV" context "$a" --json >/dev/null 2>&1
     cache=$(find "$WV_HOT_ZONE/context_cache" -name "${a}-*.json" 2>/dev/null | sed -n 1p)
     s=$(date +%s)
-    touch -d "@$s" "$cache"
+    python3 -I -c 'import os, sys; t = float(sys.argv[1]); os.utime(sys.argv[2], (t, t))' "$s" "$cache"
     sqlite3 "$("$WV" hotzone --db)" "INSERT INTO edges(source,target,type,weight,created_at) VALUES('$b','$a','contradicts',1.0,CURRENT_TIMESTAMP);
                       UPDATE nodes SET updated_at = datetime($s, 'unixepoch') WHERE id = '$b';"
-    touch -d "@$s" "$cache"
+    python3 -I -c 'import os, sys; t = float(sys.argv[1]); os.utime(sys.argv[2], (t, t))' "$s" "$cache"
     assert_equals "1" "$("$WV" context "$a" --json 2>/dev/null | jq '.contradictions | length')" \
         "a contradiction added in the cache's own second appears in the pack"
 }
@@ -1026,9 +1029,9 @@ test_untracked_same_second_edit_rescans() {
     assert_equals "CC=2" "$before" "baseline complexity of the untracked file is recorded"
 
     local mtime
-    mtime=$(stat -c %Y src/new.py)
+    mtime=$(wv_stat mtime src/new.py)  # GNU/BSD stat (wv-372560)
     _write_high_cc src/new.py
-    touch -d "@$mtime" src/new.py
+    python3 -I -c 'import os, sys; t = float(sys.argv[1]); os.utime(sys.argv[2], (t, t))' "$mtime" src/new.py  # touch -d is GNU-only (wv-f6b909)
     "$WV" quality scan >/dev/null 2>&1 || true
     local after state="stale"
     after=$("$WV" quality functions src/new.py 2>&1 | grep -oE 'CC=[0-9]+' | sed -n 1p || true)

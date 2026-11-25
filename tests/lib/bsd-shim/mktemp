@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+: "${WV_BSD_SHIM_REAL:=${0%/*}/../real}"  # env -i drops the export; this stand-in sits in bin/ beside real/ (wv-43082a)
+# BSD mktemp stand-in (wv-f8e26d): with no template, macOS mktemp still
+# creates a file when TMPDIR is not a usable directory, where GNU refuses
+# (Mac run 45298580101: 'wv config set' under TMPDIR=<file>/tmp succeeded).
+# The run did not record where the Mac wrote it; the stand-in uses /tmp.
+# A template argument, -t or -p behaves as GNU does here.
+for a in "$@"; do
+    case "$a" in
+        -t|-p|--tmpdir*) exec "$WV_BSD_SHIM_REAL/mktemp" "$@" ;;
+        -*) ;;
+        *) exec "$WV_BSD_SHIM_REAL/mktemp" "$@" ;;
+    esac
+done
+if [ -n "${TMPDIR:-}" ] && [ ! -d "$TMPDIR" ]; then
+    exec env -u TMPDIR "$WV_BSD_SHIM_REAL/mktemp" "$@"
+fi
+exec "$WV_BSD_SHIM_REAL/mktemp" "$@"

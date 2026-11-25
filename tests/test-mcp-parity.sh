@@ -132,6 +132,9 @@ weave_index --overlap
 # --- gate plumbing: the test-map router the hooks call (wv-da768b) ---
 weave_impact --suites
 weave_impact --unmatched
+# --- git-hook plumbing: post-rewrite/post-merge re-projection commits graph state; MCP stays off git transport (wv-6729a0) ---
+weave_recover --reproject
+weave_recover --event
 # --- EXPOSE tier 1: exposed 2026-06-12 (wv-4a1de6) — lines deleted ---
 # --- EXPOSE tier 2: exposed/reclassified 2026-06-12 (wv-8e217e) ---
 # weave_search.type, weave_code_search.filter, weave_impact.files exposed;
@@ -169,11 +172,15 @@ MCP_ENV=(env -u WV_CALL_LOG -u WV_MCP_CALL_LOG -u WV_PROJECT_ROOT
 (cd "$FIX" && "${MCP_ENV[@]}" "$WV" init >/dev/null 2>&1 \
     && "${MCP_ENV[@]}" "$WV" add "mcp parity fixture node" --standalone --force >/dev/null 2>&1) \
     || { fail "fixture graph created" "wv init/add failed in $FIX"; echo "Results: $TESTS_PASSED/$TESTS_RUN passed"; exit 1; }
-mcp_server() { (cd "$FIX" && "${MCP_ENV[@]}" timeout 20 node "$MCP_DIST" --scope=all 2>/dev/null); }
+# bounded, not timeout(1): GNU coreutils, absent on macOS, where the server
+# never started (wv-f8e26d). bounded execs env, env execs node.
+# shellcheck source=tests/lib/bounded.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/bounded.sh"
+mcp_server() { (cd "$FIX" && bounded 20 "${MCP_ENV[@]}" node "$MCP_DIST" --scope=all 2>/dev/null); }
 
 # The server must resolve the checkout's wv, not an installed copy.
 startup=$(printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"parity-test","version":"0"}}}' \
-    | (cd "$FIX" && "${MCP_ENV[@]}" WV_MCP_STARTUP_REPORT=1 timeout 20 node "$MCP_DIST" --scope=all 2>&1 >/dev/null) \
+    | (cd "$FIX" && bounded 20 "${MCP_ENV[@]}" WV_MCP_STARTUP_REPORT=1 node "$MCP_DIST" --scope=all 2>&1 >/dev/null) \
     | grep -m1 '"event":"weave_mcp_startup"' || true)
 if [ "$(jq -r '.wv_path // empty' <<< "$startup" 2>/dev/null)" = "$WV" ]; then
     pass "the server resolves the checkout's wv ($WV)"

@@ -80,7 +80,7 @@ unset WV_CLOCK_TEST_FILE
 
 echo "hook_duration_ms (wall readings held by callers)"
 check "a 0 start is unmeasured" "0" "$(hook_duration_ms 0)"
-check "a start in the future is clamped to 0" "0" "$(hook_duration_ms $(( $(date +%s%N) + 60000000000 )))"
+check "a start in the future is clamped to 0" "0" "$(hook_duration_ms $(( $(wv_now ns) + 60000000000 )))"  # BSD date prints %N literally (wv-99f296)
 check "a non-numeric start is unmeasured" "0" "$(hook_duration_ms 17N)"
 
 echo "Results: $pass/$run passed"

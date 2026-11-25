@@ -309,6 +309,14 @@ cmd_unlink() {
 
     db_query "DELETE FROM edges WHERE source='$from' AND target='$to' AND type='$edge_type';" || return 1
 
+    # The target's stored status is derived from its open blockers: recompute
+    # it, as wv done does for a closing blocker (wv-81338c).
+    if [ "$edge_type" = "blocks" ]; then
+        local _unblocked
+        _unblocked=$(_recompute_blocked_targets "$to") || return 1
+        [ -n "$_unblocked" ] && echo -e "${GREEN}✓${NC} Unblocked: $_unblocked" >&2
+    fi
+
     # Evict context cache for both nodes
     invalidate_context_cache "$from" "$to"
     # Publish the change, as every mutating command does (wv-851fb4).
@@ -451,7 +459,7 @@ cmd_resolve() {
 
             # Create new merged node
             local merged_text="Merged: $(db_query "SELECT text FROM nodes WHERE id='$node1';" | head -1) + $(db_query "SELECT text FROM nodes WHERE id='$node2';" | head -1)"
-            local new_id=$(generate_id)
+            local new_id; new_id=$(generate_id) || return 1
 
             db_query "INSERT INTO nodes (id, text, status, metadata, created_at) VALUES ('$new_id', '$merged_text', 'todo', '{\"node_kind\":\"task\",\"type\":\"task\"}', CURRENT_TIMESTAMP);"
 
@@ -963,7 +971,7 @@ cmd_context() {
     if [ -f "$cache_file" ]; then
         # Get cache timestamp
         local cache_time
-        cache_time=$(stat -c %Y "$cache_file" 2>/dev/null || stat -f %m "$cache_file" 2>/dev/null)
+        cache_time=$(wv_stat mtime "$cache_file")
 
         # Get latest edge change time affecting this node
         local edge_time
@@ -1629,8 +1637,8 @@ cmd_tree() {
 # Bare suite paths under a `[heavy]` section mark the push tier (wv-862ac0):
 # routing is unchanged, but each suite is emitted with "tier":"heavy" or
 # "light", and the pre-commit gate leaves heavy suites to the pre-push gate.
-# Reads .weave/test-times.json for estimated suite cost.
-# Outputs JSON: [{"name":"test-X.sh","last_cost_s":N,"tier":"light|heavy",
+# Prices each suite with _suite_cost_estimates, the gate's own estimate.
+# Outputs JSON: [{"name":"test-X.sh","last_cost_s":N|null,"tier":"light|heavy",
 # "declared":true|false}, ...]. declared: a map row, pattern, [default] or
 # [scanners] entry selected it, so the suite is an obligation; false: only the
 # naming heuristic or a changed suite's own run did (wv-fb861c).
@@ -1672,6 +1680,29 @@ _impact_map_at_rev() {
 # The revisions whose maps route (wv impact --map-rev); empty: the working tree.
 _IMPACT_MAP_REVS=()
 
+# _suite_cost_estimates — {"<suite path>": seconds} for every suite this
+# repository has measured: the median of its recent runs in the durable suite
+# log (wv analyze suites: recent_p50_ms, wv-8138ec, else p50_ms; wv-ffda33),
+# whole seconds rounded up, so a sub-second suite is 1, not unmeasured. The one
+# definition of a suite's expected duration: wv impact --suites prices with
+# it, and both gates, preflight's quick set and the pool's launch order read
+# that price (gate_pool_estimates, wv-gate-pool.sh; wv-870f67).
+# It replaced .weave/test-times.json, which only a serial run-all wrote, so
+# impact priced most suites at 0. A suite with no measured run is absent, and
+# callers price it null: unknown, never 0 and never quick (wv-4d45e6). An
+# unreadable log leaves every suite unknown, with a warning.
+_suite_cost_estimates() {
+    local hist
+    if ! hist=$(cmd_analyze_suites --json 2>/dev/null) \
+        || ! jq -ce '.suites | type == "array"' <<< "$hist" >/dev/null 2>&1; then
+        echo "wv: could not read the suite history; every suite is priced as unmeasured" >&2
+        echo '{}'
+        return 0
+    fi
+    jq -c '[.suites[] | {key: .suite, value: (((.recent_p50_ms // 0) as $r | if $r > 0 then $r else (.p50_ms // 0) end) / 1000 | ceil)}
+            | select(.value > 0)] | from_entries' <<< "$hist"
+}
+
 _impact_suites_for_files() {
     local _routes_only=false _with_unmatched=false
     if [ "${1:-}" = "--routes" ]; then _routes_only=true; shift; fi
@@ -1683,10 +1714,6 @@ _impact_suites_for_files() {
     fi
 
     local map_conf="${WEAVE_DIR}/test-map.conf"
-    local times_json="${WEAVE_DIR}/test-times.json"
-
-    local times_data='{}'
-    [ -f "$times_json" ] && times_data=$(cat "$times_json" 2>/dev/null || echo '{}')
 
     # The maps that route: the working-tree file, or each named revision's.
     local -a _map_texts=() _map_labels=()
@@ -1879,14 +1906,11 @@ _impact_suites_for_files() {
     done
     [ "$_routes_only" = true ] && return 0
 
-    # Emit JSON with cost. name = full suite path; cost lookup uses basename
-    # (test-times.json is keyed by basename from serial-mode timing writes).
+    # Emit JSON, priced after the loop in one pass (name = full suite path).
     local out='['
     local first=true
     local suite suite_esc
     for suite in "${!_seen[@]}"; do
-        local bname; bname=$(basename "$suite")
-        local cost; cost=$(printf '%s' "$times_data" | jq -r --arg n "$bname" '.[$n] // 0' 2>/dev/null || echo 0)
         local tier=light declared=false
         [ "${_heavy_maps[$suite]:-0}" -eq "$_nmaps" ] && tier=heavy
         [ -n "${_declared[$suite]+x}" ] && declared=true
@@ -1894,10 +1918,17 @@ _impact_suites_for_files() {
         # status 0, a suite no gate can run (wv-3e6d45, wv-cf48a9).
         suite_esc=$(wv_json_escape "$suite") || return 1
         [ "$first" = "true" ] || out+=','
-        out+=$(printf '{"name":"%s","last_cost_s":%s,"tier":"%s","declared":%s}' "$suite_esc" "$cost" "$tier" "$declared")
+        out+=$(printf '{"name":"%s","last_cost_s":null,"tier":"%s","declared":%s}' "$suite_esc" "$tier" "$declared")
         first=false
     done
     out+=']'
+    if [ "$first" = false ]; then
+        local _est
+        _est=$(_suite_cost_estimates)
+        # One estimate per measured suite, growing with the catalogue: a file,
+        # not argv, where E2BIG would fail the selection (wv-200d36).
+        out=$(jq -c --slurpfile e <(printf '%s' "$_est") 'map(.last_cost_s = ($e[0][.name] // null))' <<< "$out") || return 1
+    fi
     if [ "$_with_unmatched" != true ]; then
         echo "$out"
         return 0
@@ -2331,8 +2362,14 @@ cmd_impact() {
     n_imp=$(printf '%s' "$walk_json" | jq '.impacted|length')
     n_unbl=$(printf '%s' "$unblocked_json" | jq 'length')
     n_suit=$(printf '%s' "$suites_json" | jq 'length')
-    total_s=$(printf '%s' "$suites_json" | jq '[.[].last_cost_s]|add//0')
-    local summary="${n_imp} impacted, ${n_unbl} unblocked, ${n_suit} suites (~${total_s}s)"
+    # An unmeasured suite (null) is not counted as free: the total says how
+    # many it leaves out (wv-870f67).
+    local n_unmeasured
+    total_s=$(printf '%s' "$suites_json" | jq '[.[].last_cost_s | numbers] | add // 0')
+    n_unmeasured=$(printf '%s' "$suites_json" | jq '[.[] | select(.last_cost_s | type != "number")] | length')
+    local summary="${n_imp} impacted, ${n_unbl} unblocked, ${n_suit} suites (~${total_s}s"
+    [ "$n_unmeasured" -eq 0 ] || summary+=" measured, ${n_unmeasured} not yet measured"
+    summary+=")"
 
     if [ "$output_format" = "json" ]; then
         # Payloads through files, not argv: an --argjson string over
@@ -2395,7 +2432,7 @@ cmd_impact() {
         if [ "$n_suit" -gt 0 ]; then
             echo ""
             echo "── Affected suites ──────────────────────────────────────────────"
-            printf '%s' "$suites_json" | jq -r '.[] | "  \(.name)  (~\(.last_cost_s)s)"'
+            printf '%s' "$suites_json" | jq -r '.[] | "  \(.name)  (\(if .last_cost_s then "~\(.last_cost_s)s" else "not yet measured" end))"'
         fi
         echo ""
         echo -e "${CYAN}${summary}${NC}"

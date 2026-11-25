@@ -14,6 +14,8 @@
 #     base's, and unions them (F5, wv-fe8007).
 #   - git publishes only the tree the gate judged: the reference-transaction
 #     hook refuses a commit whose index changed after admission (R1, wv-5f9d1c).
+# shellcheck source=tests/lib/sed-inplace.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/sed-inplace.sh"  # sed -i is GNU-only (wv-076a98)
 set -uo pipefail
 export WV_TEST_SUITE=1
 export WV_CALL_SOURCE=test
@@ -321,7 +323,7 @@ rm -f .git/hooks/pre-commit
 suites() { wv impact --suites --files="$1" "${@:2}" 2>/dev/null | jq -r 'map(.name) | sort | join(" ")'; }
 tiers() { wv impact --suites --files="$1" "${@:2}" 2>/dev/null | jq -r 'map("\(.name)=\(.tier)") | sort | join(" ")'; }
 runs() { wc -l < "$MARK/$1" 2>/dev/null | tr -d ' ' || true; }
-unmap() { sed -i '/^src\/a\.sh = /d' .weave/test-map.conf; }
+unmap() { sed_inplace '/^src\/a\.sh = /d' .weave/test-map.conf; }
 remap() { git checkout -q HEAD -- .weave/test-map.conf; }
 check "(control) HEAD's map routes src/a.sh to the probe" "tests/test-probe.sh" "$(suites src/a.sh --map-rev=HEAD)"
 unmap
@@ -374,7 +376,7 @@ check "...before any suite ran" "" "$(runs probe)"
 git rm -q --cached .weave/routes.conf; rm -f .weave/routes.conf; remap; reset
 
 echo "R3: a selected suite that is absent is not a passed one (wv-fb861c)"
-dropsuite() { git rm -q tests/test-probe.sh; sed -i '/test-probe\.sh/d' .weave/test-map.conf; git add .weave/test-map.conf; }
+dropsuite() { git rm -q tests/test-probe.sh; sed_inplace '/test-probe\.sh/d' .weave/test-map.conf; git add .weave/test-map.conf; }
 restore() { git reset -q; git checkout -q HEAD -- .weave tests src; rm -f .weave/test-map-retired.conf.new; reset; }
 dropsuite; precommit
 check "deleting a suite HEAD's map still routes to refuses the commit" "1" "$RC"
@@ -475,6 +477,21 @@ headtree=$(git rev-parse 'HEAD^{tree}')
 check "prepared, judged tree matches: passes, record kept for the commit step" "0 kept" "$(rt prepared "$headtree" now)"
 check "prepared, another tree: aborts" "1 kept" "$(rt prepared 4b825dc642cb6eb9a060e54bf8d69288fbee4904 now)"
 check "committed: the record is consumed" "0 gone" "$(rt committed "$headtree" now)"
+# Newer git (2.56.1 seen; not 2.47.3) runs the hook in a "preparing" state
+# before "prepared". The hook consumed the record there, so at "prepared" it
+# found none and every commit passed unchecked (wv-412db3): the record now
+# ends only in a terminal state.
+check "preparing (newer git): passes, record kept for prepared" "0 kept" "$(rt preparing "$headtree" now)"
+check "preparing then prepared with another tree: still aborts" "1 kept" \
+    "$( ( dir=$(git rev-parse --git-path weave-gate); mkdir -p "$dir"; me=$BASHPID
+          st=$(ps -o lstart= -p "$me" | sed 's/^ *//; s/ *$//')
+          printf 'tree=%s\nstart=%s\n' 4b825dc642cb6eb9a060e54bf8d69288fbee4904 "$st" > "$dir/admitted-$me"
+          line=$(printf '%s %s refs/heads/main\n' "$(git rev-parse HEAD~1)" "$(git rev-parse HEAD)")
+          bash "$HOOKS/reference-transaction-weave.sh" preparing <<< "$line" >/dev/null 2>&1
+          bash "$HOOKS/reference-transaction-weave.sh" prepared <<< "$line" >/dev/null 2>&1; rc=$?
+          [ -f "$dir/admitted-$me" ] && kept=kept || kept=gone; rm -f "$dir/admitted-$me"; echo "$rc $kept" ) )"
+check "aborted: the record is consumed" "0 gone" "$(rt aborted "$headtree" now)"
+check "a state git may add later: passes, record kept" "0 kept" "$(rt some-future-state "$headtree" now)"
 check "a record from an earlier process with this pid is dropped, not applied" "0 gone" \
     "$(rt prepared 4b825dc642cb6eb9a060e54bf8d69288fbee4904 'Thu Jan  1 00:00:00 1970')"
 rm -f .git/hooks/reference-transaction .git/hooks/pre-commit

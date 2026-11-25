@@ -228,6 +228,44 @@ assert_json_field "$json_output" ".edges.total" "1" "health counts 1 edge"
 assert_json_field "$json_output" ".edges.blocking" "1" "health counts 1 blocking edge"
 
 # ============================================================================
+# Test: health reports blocked nodes with no open blocker (wv-3259b3)
+# ============================================================================
+echo ""
+echo "Testing: health reports blocked nodes with no open blocker"
+
+reset_db
+
+sb_id() {  # sb_id <wv add output> -> the id on its "✓ wv-…:" line (never a duplicate match)
+    [[ "$1" =~ (^|$'\n')✓\ (wv-[a-f0-9]+): ]] && printf '%s\n' "${BASH_REMATCH[2]}"
+}
+sb_blocker=$(sb_id "$($WV add "Stale fixture: blocker closed out of band" --force 2>&1)")
+sb_stale=$(sb_id "$($WV add "Stale fixture: node whose blocker closed" --force 2>&1)")
+sb_open_blocker=$(sb_id "$($WV add "Stale fixture: blocker still open" --force 2>&1)")
+sb_live=$(sb_id "$($WV add "Stale fixture: node with an open blocker" --force 2>&1)")
+sb_hand=$(sb_id "$($WV add "Stale fixture: blocked by hand with no edge" --status=blocked --force 2>&1)")
+$WV block "$sb_stale" --by="$sb_blocker" >/dev/null 2>&1
+$WV block "$sb_live" --by="$sb_open_blocker" >/dev/null 2>&1
+# A replay from an older client or a direct write closes the blocker without
+# the unblock cascade: the state the finding describes.
+sqlite3 "$WV_DB" "UPDATE nodes SET status='done' WHERE id='$sb_blocker';"
+
+json_output=$($WV health --json 2>/dev/null)
+assert_json_field "$json_output" ".issues.stale_blocked" "2" "health counts both blocked nodes with no open blocker"
+assert_json_field "$json_output" ".issues.stale_blocked_ids | sort | join(\",\")" \
+    "$(printf '%s\n' "$sb_stale" "$sb_hand" | sort | paste -sd, -)" "health lists the stale-blocked ids, not the one with an open blocker"
+assert_json_field "$json_output" ".issues.stale_blocked_ids | index(\"$sb_live\")" "null" "a node blocked by an open blocker is not stale"
+output=$($WV health 2>&1)
+assert_contains "$output" "2 node(s) blocked with no open blocker" "health text names the stale-blocked count"
+assert_contains "$output" "$sb_stale" "health text names the stale-blocked node"
+
+$WV health --fix >/dev/null 2>&1
+assert_equals "todo" "$($WV show "$sb_stale" --json 2>/dev/null | jq -r '.status')" "health --fix returns a node whose blocker is done to todo"
+assert_equals "blocked" "$($WV show "$sb_hand" --json 2>/dev/null | jq -r '.status')" "health --fix leaves a blocked status set by hand on an edgeless node"
+assert_equals "blocked" "$($WV show "$sb_live" --json 2>/dev/null | jq -r '.status')" "health --fix leaves a node with an open blocker blocked"
+json_output=$($WV health --json 2>/dev/null)
+assert_json_field "$json_output" ".issues.stale_blocked" "1" "after --fix only the hand-set blocked node is reported"
+
+# ============================================================================
 # Test: health excludes intentional standalones from orphan debt
 # ============================================================================
 echo ""

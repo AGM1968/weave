@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Weave Installer — Install wv CLI to user-level location
 #
 # Usage:
@@ -12,6 +12,69 @@
 #
 # Remote install:
 #   curl -sSL https://raw.githubusercontent.com/AGM1968/weave/main/install.sh | bash
+# wv bash guard (wv-7257a8): bash >= 4 or a clear refusal. Identical in every executed entry point; master: scripts/lib/wv-bash-guard.sh.
+_wv_bash_guard() {
+    if [ -n "${WV_TEST_BASH_TOO_OLD:-}" ] && [ "${WV_TEST_MODE:-}" != 1 ]; then echo "wv: WV_TEST_BASH_TOO_OLD needs WV_TEST_MODE=1; ignoring it." >&2; fi
+    if [ "${BASH_VERSINFO[0]:-0}" -ge 4 ] && ! { [ "${WV_TEST_MODE:-}" = 1 ] && [ "${WV_TEST_BASH_TOO_OLD:-}" = 1 ]; }; then
+        unset WV_BASH_REEXEC
+        return 0
+    fi
+    local b
+    if [ -z "${WV_BASH_REEXEC:-}" ] && [ -f "$0" ]; then
+        for b in ${WV_BASH:-} /opt/homebrew/bin/bash /usr/local/bin/bash /usr/bin/bash /bin/bash; do
+            # shellcheck disable=SC2016  # the child bash expands it
+            if [ -x "$b" ] && [ "$("$b" -c 'echo "${BASH_VERSINFO[0]}"' 2>/dev/null)" -ge 4 ] 2>/dev/null; then
+                WV_BASH_REEXEC=1 WV_TEST_BASH_TOO_OLD='' exec "$b" "$0" "$@"
+            fi
+        done
+    fi
+    echo "wv: $0 needs bash 4 or newer but is running under bash ${BASH_VERSION:-unknown}." >&2
+    echo "    On macOS /bin/bash is 3.2: install a newer one (brew install bash) or set WV_BASH to it." >&2
+    exit 1
+}
+_wv_bash_guard "$@"
+# end wv bash guard
+# wv python floor (wv-892318): python3 >= 3.11 for every python3 this process starts. Identical in every entry point that runs python3 itself; master: scripts/lib/wv-python-floor.sh (wv-config.sh sources it for scripts/wv and the pre-commit hook).
+# python3 on PATH if it meets the floor, else the first that does of
+# WV_PYTHON, python3.14..python3.11, Homebrew's, linked as python3 in a shim dir
+# put first on PATH; none is a refusal. A warm hit forks nothing: the location
+# comes from bash's command hash, the verdict from WV_PYTHON_FLOOR_OK or a cache
+# file newer than the interpreter (a memo: losing it costs one probe).
+_wv_python_floor() {
+    local p="" key c k="" r="" cand d
+    hash python3 2>/dev/null && p=${BASH_CMDS[python3]:-}
+    [ -n "$p" ] && [ "${WV_PYTHON_FLOOR_OK:-}" = "$p" ] && return 0
+    key="$p|${WV_PYTHON:-}"
+    c="${XDG_CACHE_HOME:-${HOME:-/nonexistent}/.cache}/weave/python-floor"
+    if [ -n "$p" ] && [ -f "$c" ] && [ "$c" -nt "$p" ]; then
+        { IFS= read -r k && IFS= read -r r; } < "$c" 2>/dev/null || r=""
+        [ "$k" = "$key" ] && [ -x "$r" ] && [ "$c" -nt "$r" ] || r=""
+    fi
+    if [ -z "$r" ]; then
+        for cand in "$p" ${WV_PYTHON:-} python3.14 python3.13 python3.12 python3.11 /opt/homebrew/bin/python3 /usr/local/bin/python3; do
+            case "$cand" in "") continue ;; /*) ;; *) cand=$(type -P "$cand" 2>/dev/null) || continue ;; esac
+            if [ -x "$cand" ] && "$cand" -c 'import sys; sys.exit(sys.version_info < (3, 11))' >/dev/null 2>&1; then
+                r=$cand; break
+            fi
+        done
+        if [ -z "$r" ]; then
+            echo "wv: $0 needs python 3.11 or newer; python3 on PATH is ${p:-missing}." >&2
+            echo "    Install one (macOS: brew install python) or set WV_PYTHON to it." >&2
+            exit 1
+        fi
+        { mkdir -p "${c%/*}" && printf '%s\n%s\n' "$key" "$r" > "$c"; } 2>/dev/null || true
+    fi
+    if [ "$r" = "$p" ]; then export WV_PYTHON_FLOOR_OK="$p"; return 0; fi
+    d="${c%/*}/pybin/${r//\//_}"
+    if ! [ "$d/python3" -ef "$r" ]; then
+        { mkdir -p "$d" && ln -s "$r" "$d/python3.$$" && mv -f "$d/python3.$$" "$d/python3"; } 2>/dev/null \
+            || { d=$(mktemp -d "${TMPDIR:-/tmp}/wv-pybin.XXXXXX") && ln -s "$r" "$d/python3"; } \
+            || { echo "wv: $0 cannot put python $r first on PATH; set PATH so python3 is 3.11 or newer." >&2; exit 1; }
+    fi
+    export PATH="$d:$PATH" WV_PYTHON_FLOOR_OK="$d/python3"
+    hash -r
+}
+# end wv python floor
 
 set -e
 
@@ -31,6 +94,19 @@ MANIFEST="$CONFIG_DIR/manifest.txt"
 # Dependency Checking
 # ═══════════════════════════════════════════════════════════════════════════
 
+# check_sqlite_fts5 -- FTS5 is required (wv-649510): the search index and its
+# sync triggers are part of the schema, and a build without it leaves every
+# write failing. Fails, naming the sqlite3 and the remedy, when the sqlite3 on
+# PATH cannot create an FTS5 table; a missing sqlite3 is check_deps' report.
+check_sqlite_fts5() {
+    command -v sqlite3 &>/dev/null || return 0
+    sqlite3 :memory: "CREATE VIRTUAL TABLE wv_fts5_probe USING fts5(a);" &>/dev/null && return 0
+    echo -e "  ${RED}✗${NC} sqlite3 at $(command -v sqlite3) has no FTS5 module (required)"
+    echo -e "    Put a sqlite3 built with FTS5 first on PATH: on macOS /usr/bin/sqlite3 has it;"
+    echo -e "    on Linux the distribution sqlite3 package has it."
+    return 1
+}
+
 check_deps() {
     echo -e "${CYAN}━━━ Dependency Check ━━━${NC}"
     local missing=0
@@ -45,7 +121,8 @@ check_deps() {
             missing=1
         fi
     done
-    
+    check_sqlite_fts5 || missing=1
+
     # Optional
     if command -v gh &>/dev/null; then
         local ver=$(gh --version 2>&1 | head -1)
@@ -669,6 +746,7 @@ if [ -f "./scripts/wv" ]; then
     install_file ./scripts/lib/wv-gate-lanes.sh "$LIB_DIR/lib/wv-gate-lanes.sh"
     install_file ./scripts/lib/wv-gate-hold.sh "$LIB_DIR/lib/wv-gate-hold.sh"
     install_file ./scripts/lib/wv-clock.sh "$LIB_DIR/lib/wv-clock.sh"
+    install_file ./scripts/lib/wv-test-ratchet.sh "$LIB_DIR/lib/wv-test-ratchet.sh"
     install_file ./scripts/lib/wv-repository-class.sh "$LIB_DIR/lib/wv-repository-class.sh"
     install_file ./scripts/lib/wv-git-hook-signature.sh "$LIB_DIR/lib/wv-git-hook-signature.sh"
     install_file ./scripts/lib/wv-runtime-ignores.sh "$LIB_DIR/lib/wv-runtime-ignores.sh"
@@ -685,6 +763,10 @@ if [ -f "./scripts/wv" ]; then
     install_file ./scripts/lib/wv-resolve-project.sh "$LIB_DIR/lib/wv-resolve-project.sh"
     install_file ./scripts/lib/wv-resolve-runtime.sh "$LIB_DIR/lib/wv-resolve-runtime.sh"
     install_file ./scripts/lib/wv-graph-diff.sh "$LIB_DIR/lib/wv-graph-diff.sh"
+    install_file ./scripts/lib/wv-hotzone-migrate.sh "$LIB_DIR/lib/wv-hotzone-migrate.sh"
+    install_file ./scripts/lib/wv-bash-guard.sh "$LIB_DIR/lib/wv-bash-guard.sh"
+    install_file ./scripts/lib/wv-python-floor.sh "$LIB_DIR/lib/wv-python-floor.sh"
+    install_file ./scripts/lib/wv-lock.sh "$LIB_DIR/lib/wv-lock.sh"
     install_file ./scripts/lib/VERSION "$LIB_DIR/lib/VERSION"
 
     # Install provenance. VERSION alone cannot answer "which fixes does this
@@ -827,6 +909,7 @@ if [ -f "./scripts/wv" ]; then
     install_file ./scripts/hooks/prepare-commit-msg-weave.sh "$LIB_DIR/hooks/prepare-commit-msg-weave.sh"
     install_file ./scripts/hooks/pre-push-weave.sh "$LIB_DIR/hooks/pre-push-weave.sh"
     install_file ./scripts/hooks/reference-transaction-weave.sh "$LIB_DIR/hooks/reference-transaction-weave.sh"
+    install_file ./scripts/hooks/reproject-weave.sh "$LIB_DIR/hooks/reproject-weave.sh"
 
     # Refresh THIS repository's git hooks too, when installing from inside one.
     #
@@ -853,6 +936,9 @@ if [ -f "./scripts/wv" ]; then
         install_git_hook_from_repo ./scripts/hooks/prepare-commit-msg-weave.sh "Weave: append Weave-ID trailers" "prepare-commit-msg"
         install_git_hook_from_repo ./scripts/hooks/pre-push-weave.sh "Weave pre-push" "pre-push"
         install_git_hook_from_repo ./scripts/hooks/reference-transaction-weave.sh "Weave reference-transaction" "reference-transaction"
+        # Re-projects .weave/ after a rebase or merge kept another copy's snapshot (wv-6729a0).
+        install_git_hook_from_repo ./scripts/hooks/reproject-weave.sh "Weave re-projection" "post-rewrite"
+        install_git_hook_from_repo ./scripts/hooks/reproject-weave.sh "Weave re-projection" "post-merge"
         # The source checkout keeps a Weave graph too, and only wv-init-repo
         # registered its merge drivers, which this checkout never runs
         # (wv-f0b143). Git config is shared by every linked worktree.
@@ -885,6 +971,7 @@ if [ -f "./scripts/wv" ]; then
     install_copy ./scripts/lib/wv-resolve-runtime.sh "$CONFIG_DIR/lib/wv-resolve-runtime.sh"
     install_copy ./scripts/lib/wv-validate.sh "$CONFIG_DIR/lib/wv-validate.sh"
     install_copy ./scripts/lib/wv-config.sh "$CONFIG_DIR/lib/wv-config.sh"
+    install_copy ./scripts/lib/wv-python-floor.sh "$CONFIG_DIR/lib/wv-python-floor.sh"  # wv-config.sh sources it
     install_copy ./scripts/lib/wv-workflow-classes.gen.sh "$CONFIG_DIR/lib/wv-workflow-classes.gen.sh"
     install_copy ./scripts/lib/wv-violation-vocabulary.gen.sh "$CONFIG_DIR/lib/wv-violation-vocabulary.gen.sh"
     install_copy ./scripts/lib/wv-hook-common.sh "$CONFIG_DIR/lib/wv-hook-common.sh"
@@ -983,6 +1070,7 @@ else
     download_file "$REPO/scripts/lib/wv-gate-lanes.sh" "$LIB_DIR/lib/wv-gate-lanes.sh"
     download_file "$REPO/scripts/lib/wv-gate-hold.sh" "$LIB_DIR/lib/wv-gate-hold.sh"
     download_file "$REPO/scripts/lib/wv-clock.sh" "$LIB_DIR/lib/wv-clock.sh"
+    download_file "$REPO/scripts/lib/wv-test-ratchet.sh" "$LIB_DIR/lib/wv-test-ratchet.sh"
     download_file "$REPO/scripts/lib/wv-repository-class.sh" "$LIB_DIR/lib/wv-repository-class.sh"
     download_file "$REPO/scripts/lib/wv-git-hook-signature.sh" "$LIB_DIR/lib/wv-git-hook-signature.sh"
     download_file "$REPO/scripts/lib/wv-runtime-ignores.sh" "$LIB_DIR/lib/wv-runtime-ignores.sh"
@@ -999,6 +1087,10 @@ else
     download_file "$REPO/scripts/lib/wv-resolve-project.sh" "$LIB_DIR/lib/wv-resolve-project.sh"
     download_file "$REPO/scripts/lib/wv-resolve-runtime.sh" "$LIB_DIR/lib/wv-resolve-runtime.sh"
     download_file "$REPO/scripts/lib/wv-graph-diff.sh" "$LIB_DIR/lib/wv-graph-diff.sh"
+    download_file "$REPO/scripts/lib/wv-hotzone-migrate.sh" "$LIB_DIR/lib/wv-hotzone-migrate.sh"
+    download_file "$REPO/scripts/lib/wv-bash-guard.sh" "$LIB_DIR/lib/wv-bash-guard.sh"
+    download_file "$REPO/scripts/lib/wv-python-floor.sh" "$LIB_DIR/lib/wv-python-floor.sh"
+    download_file "$REPO/scripts/lib/wv-lock.sh" "$LIB_DIR/lib/wv-lock.sh"
     download_file "$REPO/scripts/lib/VERSION" "$LIB_DIR/lib/VERSION"
     # A remote install has no source checkout, but it must still record WHAT it
     # installed -- otherwise doctor's "not recorded" warning can never be
@@ -1045,6 +1137,7 @@ else
     download_file "$REPO/scripts/hooks/prepare-commit-msg-weave.sh" "$LIB_DIR/hooks/prepare-commit-msg-weave.sh"
     download_file "$REPO/scripts/hooks/pre-push-weave.sh" "$LIB_DIR/hooks/pre-push-weave.sh"
     download_file "$REPO/scripts/hooks/reference-transaction-weave.sh" "$LIB_DIR/hooks/reference-transaction-weave.sh"
+    download_file "$REPO/scripts/hooks/reproject-weave.sh" "$LIB_DIR/hooks/reproject-weave.sh"
     # Python sync package (auto-discover modules from GitHub API)
     mkdir -p "$LIB_DIR/weave_gh"
     local py_modules
@@ -1158,6 +1251,7 @@ else
     curl -sSL "$REPO/scripts/lib/wv-resolve-runtime.sh" -o "$CONFIG_DIR/lib/wv-resolve-runtime.sh"
     curl -sSL "$REPO/scripts/lib/wv-validate.sh" -o "$CONFIG_DIR/lib/wv-validate.sh"
     curl -sSL "$REPO/scripts/lib/wv-config.sh" -o "$CONFIG_DIR/lib/wv-config.sh"
+    curl -sSL "$REPO/scripts/lib/wv-python-floor.sh" -o "$CONFIG_DIR/lib/wv-python-floor.sh"  # wv-config.sh sources it
     # Must land before wv-hook-common.sh sources it; absent here, hooks silently disable classification.
     curl -sSL "$REPO/scripts/lib/wv-workflow-classes.gen.sh" -o "$CONFIG_DIR/lib/wv-workflow-classes.gen.sh"
     curl -sSL "$REPO/scripts/lib/wv-hook-common.sh" -o "$CONFIG_DIR/lib/wv-hook-common.sh"
@@ -1359,7 +1453,7 @@ fi
 
 # Create init command for target repos
 cat > "$INSTALL_DIR/wv-init-repo" << 'INITEOF'
-#!/bin/bash
+#!/usr/bin/env bash
 # Initialize or update Weave in a target repository
 #
 # Usage:
@@ -1369,6 +1463,70 @@ cat > "$INSTALL_DIR/wv-init-repo" << 'INITEOF'
 #   wv-init-repo --agent=codex   # Codex setup contract
 #   wv-init-repo --update        # Update managed files (hooks, skills, agents)
 #   wv-init-repo --force         # Overwrite ALL files including user-customized
+# wv bash guard (wv-7257a8): bash >= 4 or a clear refusal. Identical in every executed entry point; master: scripts/lib/wv-bash-guard.sh.
+_wv_bash_guard() {
+    if [ -n "${WV_TEST_BASH_TOO_OLD:-}" ] && [ "${WV_TEST_MODE:-}" != 1 ]; then echo "wv: WV_TEST_BASH_TOO_OLD needs WV_TEST_MODE=1; ignoring it." >&2; fi
+    if [ "${BASH_VERSINFO[0]:-0}" -ge 4 ] && ! { [ "${WV_TEST_MODE:-}" = 1 ] && [ "${WV_TEST_BASH_TOO_OLD:-}" = 1 ]; }; then
+        unset WV_BASH_REEXEC
+        return 0
+    fi
+    local b
+    if [ -z "${WV_BASH_REEXEC:-}" ] && [ -f "$0" ]; then
+        for b in ${WV_BASH:-} /opt/homebrew/bin/bash /usr/local/bin/bash /usr/bin/bash /bin/bash; do
+            # shellcheck disable=SC2016  # the child bash expands it
+            if [ -x "$b" ] && [ "$("$b" -c 'echo "${BASH_VERSINFO[0]}"' 2>/dev/null)" -ge 4 ] 2>/dev/null; then
+                WV_BASH_REEXEC=1 WV_TEST_BASH_TOO_OLD='' exec "$b" "$0" "$@"
+            fi
+        done
+    fi
+    echo "wv: $0 needs bash 4 or newer but is running under bash ${BASH_VERSION:-unknown}." >&2
+    echo "    On macOS /bin/bash is 3.2: install a newer one (brew install bash) or set WV_BASH to it." >&2
+    exit 1
+}
+_wv_bash_guard "$@"
+# end wv bash guard
+# wv python floor (wv-892318): python3 >= 3.11 for every python3 this process starts. Identical in every entry point that runs python3 itself; master: scripts/lib/wv-python-floor.sh (wv-config.sh sources it for scripts/wv and the pre-commit hook).
+# python3 on PATH if it meets the floor, else the first that does of
+# WV_PYTHON, python3.14..python3.11, Homebrew's, linked as python3 in a shim dir
+# put first on PATH; none is a refusal. A warm hit forks nothing: the location
+# comes from bash's command hash, the verdict from WV_PYTHON_FLOOR_OK or a cache
+# file newer than the interpreter (a memo: losing it costs one probe).
+_wv_python_floor() {
+    local p="" key c k="" r="" cand d
+    hash python3 2>/dev/null && p=${BASH_CMDS[python3]:-}
+    [ -n "$p" ] && [ "${WV_PYTHON_FLOOR_OK:-}" = "$p" ] && return 0
+    key="$p|${WV_PYTHON:-}"
+    c="${XDG_CACHE_HOME:-${HOME:-/nonexistent}/.cache}/weave/python-floor"
+    if [ -n "$p" ] && [ -f "$c" ] && [ "$c" -nt "$p" ]; then
+        { IFS= read -r k && IFS= read -r r; } < "$c" 2>/dev/null || r=""
+        [ "$k" = "$key" ] && [ -x "$r" ] && [ "$c" -nt "$r" ] || r=""
+    fi
+    if [ -z "$r" ]; then
+        for cand in "$p" ${WV_PYTHON:-} python3.14 python3.13 python3.12 python3.11 /opt/homebrew/bin/python3 /usr/local/bin/python3; do
+            case "$cand" in "") continue ;; /*) ;; *) cand=$(type -P "$cand" 2>/dev/null) || continue ;; esac
+            if [ -x "$cand" ] && "$cand" -c 'import sys; sys.exit(sys.version_info < (3, 11))' >/dev/null 2>&1; then
+                r=$cand; break
+            fi
+        done
+        if [ -z "$r" ]; then
+            echo "wv: $0 needs python 3.11 or newer; python3 on PATH is ${p:-missing}." >&2
+            echo "    Install one (macOS: brew install python) or set WV_PYTHON to it." >&2
+            exit 1
+        fi
+        { mkdir -p "${c%/*}" && printf '%s\n%s\n' "$key" "$r" > "$c"; } 2>/dev/null || true
+    fi
+    if [ "$r" = "$p" ]; then export WV_PYTHON_FLOOR_OK="$p"; return 0; fi
+    d="${c%/*}/pybin/${r//\//_}"
+    if ! [ "$d/python3" -ef "$r" ]; then
+        { mkdir -p "$d" && ln -s "$r" "$d/python3.$$" && mv -f "$d/python3.$$" "$d/python3"; } 2>/dev/null \
+            || { d=$(mktemp -d "${TMPDIR:-/tmp}/wv-pybin.XXXXXX") && ln -s "$r" "$d/python3"; } \
+            || { echo "wv: $0 cannot put python $r first on PATH; set PATH so python3 is 3.11 or newer." >&2; exit 1; }
+    fi
+    export PATH="$d:$PATH" WV_PYTHON_FLOOR_OK="$d/python3"
+    hash -r
+}
+# end wv python floor
+_wv_python_floor
 set -e
 
 GREEN='\033[0;32m'
@@ -1380,6 +1538,7 @@ AGENT_ARG="claude"
 UPDATE_MODE=0
 FORCE_MODE=0
 CODEX_MCP_SCOPE=""
+CODEX_BIN_ARG=""
 CODEX_HOOKS=0
 REPOSITORY_CLASS_ARG=""
 ACKNOWLEDGE_UPSTREAM_FORK=0
@@ -1391,13 +1550,14 @@ for arg in "$@"; do
         --codex-hooks) CODEX_HOOKS=1 ;;
         --codex-mcp) CODEX_MCP_SCOPE="lite" ;;
         --codex-mcp=lite|--codex-mcp=inspect|--codex-mcp=full) CODEX_MCP_SCOPE="${arg#--codex-mcp=}" ;;
+        --codex-bin=*) CODEX_BIN_ARG="${arg#--codex-bin=}" ;;
         --repository-class=*) REPOSITORY_CLASS_ARG="${arg#--repository-class=}" ;;
         --acknowledge-upstream-fork) ACKNOWLEDGE_UPSTREAM_FORK=1 ;;
         --help|-h)
-            echo "Usage: wv-init-repo [--agent=claude|copilot|codex|all] [--update] [--force] [--repository-class=owned|vendored-upstream] [--acknowledge-upstream-fork] [--codex-hooks] [--codex-mcp[=lite|inspect|full]]"
+            echo "Usage: wv-init-repo [--agent=claude|copilot|codex|all] [--update] [--force] [--repository-class=owned|vendored-upstream] [--acknowledge-upstream-fork] [--codex-hooks] [--codex-mcp[=lite|inspect|full]] [--codex-bin=PATH]"
             echo ""
             echo "  claude   (default) Claude Code hooks, skills, settings.local.json"
-            echo "  copilot  VS Code Copilot MCP config (.vscode/mcp.json + legacy .mcp.json) + copilot-instructions.md"
+            echo "  copilot  VS Code Copilot MCP config (.vscode/mcp.json) + copilot-instructions.md"
             echo "  codex    Codex setup contract (.codex/weave.json) and the neutral skills in .agents/skills"
             echo "           (Codex and Amp load them with no prompt; pi asks for folder trust); AGENTS.md remains universal"
             echo "  all      Claude Code, VS Code Copilot, and Codex"
@@ -1405,13 +1565,16 @@ for arg in "$@"; do
             echo ""
             echo "  --update  Update managed files (hooks, skills, agents, copilot-instructions)"
             echo "            Preserves user-customized files (CLAUDE.md, settings.local.json, MCP config)"
-            echo "  --force   Like --update but also rewrites MCP config files (.vscode/mcp.json, .mcp.json)"
+            echo "  --force   Like --update but also rewrites the MCP config file (.vscode/mcp.json)"
+            echo "            --update and --force remove a Weave-written VS Code-shaped root .mcp.json"
             echo "  --repository-class=CLASS  Persist clone-local owned or vendored-upstream classification"
             echo "  --acknowledge-upstream-fork  Required to classify an unresolved or upstream repo as owned"
             echo "  --codex-hooks  Generate project lifecycle hooks for explicit review and trust"
             echo "  --codex-mcp  Register weave-lite in Codex global config (local/read-mostly scope)"
             echo "  --codex-mcp=inspect  Register read-only weave-inspect instead"
             echo "  --codex-mcp=full     Register full weave server explicitly"
+            echo "  --codex-bin=PATH     The codex binary to register with, when it is not on PATH"
+            echo "                       (default: PATH, then the VS Code extension's bin/, then nvm)"
             echo ""
             echo "  Comma-separated: --agent=claude,copilot,codex"
             exit 0
@@ -1483,7 +1646,27 @@ _wv_localize_agent_block() {
 }
 
 CONFIG_DIR="${WV_CONFIG_DIR:-$HOME/.config/weave}"
-MCP_SERVER="${WV_LIB_DIR:-$HOME/.local/lib/weave}/mcp/dist/index.js"
+# The installed library, resolved here once: wv does not export WV_LIB_DIR to
+# this script, so reading it bare found nothing (wv-d3c35c).
+INIT_LIB_DIR="${WV_LIB_DIR:-$HOME/.local/lib/weave}"
+MCP_SERVER="$INIT_LIB_DIR/mcp/dist/index.js"
+
+# _find_codex_bin -- the codex binary --codex-mcp registers with: --codex-bin,
+# else PATH, else the newest VS Code extension's bin/ (openai.chatgpt), else
+# nvm, where a codex outside PATH lives (wv-d3c35c). Prints it; 1 when none.
+_find_codex_bin() {
+    local c
+    if [ -n "$CODEX_BIN_ARG" ]; then
+        printf '%s' "$CODEX_BIN_ARG"; return 0
+    fi
+    command -v codex 2>/dev/null && return 0
+    while IFS= read -r c; do
+        [ -x "$c" ] && { printf '%s' "$c"; return 0; }
+    done < <(ls -d "$HOME"/.vscode*/extensions/openai.chatgpt-*/bin/*/codex \
+                   "$HOME"/.vscode*/extensions/openai.chatgpt-*/bin/codex \
+                   "$HOME"/.nvm/versions/node/*/bin/codex 2>/dev/null | sort -r -V)
+    return 1
+}
 WV_BIN_DIR=$(cd "$(dirname "$0")" && pwd)
 WV_BIN="$WV_BIN_DIR/wv"
 
@@ -1501,19 +1684,19 @@ _refresh_memory_projection() {
         echo -e "  ${YELLOW}⚠${NC} ${file#"$REPO_ROOT"/} memory index not rendered - run: wv memory render --agent=$projection"
     fi
 }
-REPO_CLASS_LIB="${WV_LIB_DIR:-$HOME/.local/lib/weave}/lib/wv-repository-class.sh"
+REPO_CLASS_LIB="$INIT_LIB_DIR/lib/wv-repository-class.sh"
 [ -f "$REPO_CLASS_LIB" ] || { echo "wv-init-repo: repository classification helper missing: $REPO_CLASS_LIB" >&2; exit 1; }
 # shellcheck source=scripts/lib/wv-repository-class.sh
 source "$REPO_CLASS_LIB"
-HOOK_SIGNATURE_LIB="${WV_LIB_DIR:-$HOME/.local/lib/weave}/lib/wv-git-hook-signature.sh"
+HOOK_SIGNATURE_LIB="$INIT_LIB_DIR/lib/wv-git-hook-signature.sh"
 [ -f "$HOOK_SIGNATURE_LIB" ] || { echo "wv-init-repo: hook signature helper missing: $HOOK_SIGNATURE_LIB" >&2; exit 1; }
 # shellcheck source=scripts/lib/wv-git-hook-signature.sh
 source "$HOOK_SIGNATURE_LIB"
-RUNTIME_IGNORES_LIB="${WV_LIB_DIR:-$HOME/.local/lib/weave}/lib/wv-runtime-ignores.sh"
+RUNTIME_IGNORES_LIB="$INIT_LIB_DIR/lib/wv-runtime-ignores.sh"
 [ -f "$RUNTIME_IGNORES_LIB" ] || { echo "wv-init-repo: runtime ignore list missing: $RUNTIME_IGNORES_LIB" >&2; exit 1; }
 # shellcheck source=scripts/lib/wv-runtime-ignores.sh
 source "$RUNTIME_IGNORES_LIB"
-SKILL_RETIREMENT_LIB="${WV_LIB_DIR:-$HOME/.local/lib/weave}/lib/wv-skill-retirement.sh"
+SKILL_RETIREMENT_LIB="$INIT_LIB_DIR/lib/wv-skill-retirement.sh"
 [ -f "$SKILL_RETIREMENT_LIB" ] || { echo "wv-init-repo: retired-skill list missing: $SKILL_RETIREMENT_LIB" >&2; exit 1; }
 # shellcheck source=scripts/lib/wv-skill-retirement.sh
 source "$SKILL_RETIREMENT_LIB"
@@ -1725,7 +1908,7 @@ if [ -f "$_PATTERN_SRC_MANIFEST" ]; then
             exit 1
         }
     done
-    if ! PYTHONPATH="${WV_LIB_DIR:-$HOME/.local/lib/weave}" python3 - "$_PATTERN_SRC" <<'PY'
+    if ! PYTHONPATH="$INIT_LIB_DIR" python3 - "$_PATTERN_SRC" <<'PY'
 import sys
 from pathlib import Path
 from weave_quality.prose_rules import validate_pattern_rule
@@ -1895,8 +2078,10 @@ cat << 'RUNTIMECONTENTEOF'
 
 In sandbox agent shells (Codex/Copilot/Claude Code), Weave uses a persistent
 `/tmp/weave-hotzone-*` hot zone because `/dev/shm` is not stable across tool invocations.
-During the rename transition that name is an alias of the legacy `/tmp/weave-codex-*`
-directory, which stays the physical one; `wv doctor` reports which is physical.
+A fresh zone is a real `/tmp/weave-hotzone-*` directory with the legacy `/tmp/weave-codex-*`
+name a symlink to it. A host still holding the earlier layout (the legacy directory real, the
+neutral name its alias) keeps working; `wv hotzone migrate` relocates it in a quiet window, and
+`wv doctor` reports which name is physical.
 <!-- END WEAVE RUNTIME CONTENT -->
 RUNTIMECONTENTEOF
 }
@@ -1921,7 +2106,9 @@ elif ! grep -qF -- "$RUNTIME_MD_MARKER_BEGIN" "$RUNTIME_MD"; then
 elif ([ "$UPDATE_MODE" = "1" ] || [ "$FORCE_MODE" = "1" ]) && ! grep -qF -- "$RUNTIME_MD_CONTENT_BEGIN" "$RUNTIME_MD"; then
     # Has context block but no content block — inject content block after context block
     _tmp_runtime=$(mktemp)
-    awk -v content="$(_runtime_content_block)" '
+    # Through ENVIRON: BSD awk refuses a newline in a -v value (wv-27b2f5).
+    WV_AWK_CONTENT="$(_runtime_content_block)" awk '
+        BEGIN { content = ENVIRON["WV_AWK_CONTENT"] }
         /END WEAVE RUNTIME CONTEXT/ { print; print ""; print content; next }
         { print }
     ' "$RUNTIME_MD" > "$_tmp_runtime"
@@ -1991,7 +2178,7 @@ fi
 # a hook was added (e.g. post-commit-weave.sh) installs the .git/hooks/ copy from
 # the LIB_DIR fallback but never gets the vendored source otherwise, leaving a
 # permanent source/installed asymmetry (wv-2adeef).
-_LIB_HOOKS="${WV_LIB_DIR:-$HOME/.local/lib/weave}/hooks"
+_LIB_HOOKS="$INIT_LIB_DIR/hooks"
 if [ -d "$REPO_ROOT/scripts/hooks" ] && [ -d "$_LIB_HOOKS" ]; then
     _updated_vendor=0
     # A vendored copy of a retired hook source goes too (wv-56c823), when it
@@ -2001,7 +2188,7 @@ if [ -d "$REPO_ROOT/scripts/hooks" ] && [ -d "$_LIB_HOOKS" ]; then
         rm -f "$REPO_ROOT/scripts/hooks/post-commit-weave.sh"
         echo -e "  ${GREEN}✓${NC} scripts/hooks/post-commit-weave.sh (retired, removed)"
     fi
-    for _hf in pre-commit-weave.sh prepare-commit-msg-weave.sh pre-push-weave.sh reference-transaction-weave.sh; do
+    for _hf in pre-commit-weave.sh prepare-commit-msg-weave.sh pre-push-weave.sh reference-transaction-weave.sh reproject-weave.sh; do
         [ -f "$_LIB_HOOKS/$_hf" ] || continue
         if [ ! -f "$REPO_ROOT/scripts/hooks/$_hf" ]; then
             cp "$_LIB_HOOKS/$_hf" "$REPO_ROOT/scripts/hooks/$_hf"
@@ -2049,6 +2236,11 @@ install_git_hook_from_repo "./scripts/hooks/pre-push-weave.sh" "Weave pre-push" 
 # judged, wv-5f9d1c; passes every other ref update untouched)
 install_git_hook_from_repo "./scripts/hooks/reference-transaction-weave.sh" "Weave reference-transaction" "reference-transaction"
 
+# Git hooks: post-rewrite and post-merge (re-project .weave/ after a rebase or
+# merge kept another copy's snapshot, wv-6729a0; ask the graph, never refuse)
+install_git_hook_from_repo "./scripts/hooks/reproject-weave.sh" "Weave re-projection" "post-rewrite"
+install_git_hook_from_repo "./scripts/hooks/reproject-weave.sh" "Weave re-projection" "post-merge"
+
 # .gitattributes: merge strategy + diff suppression for Weave state files
 # Uses BEGIN/END markers (like Makefile template) for reliable idempotent updates
 GITATTR="$REPO_ROOT/.gitattributes"
@@ -2084,7 +2276,9 @@ if [ -f "$GITATTR" ]; then
     if grep -qF -- "$ATTR_MARKER_BEGIN" "$GITATTR"; then
         # Markers present — replace between them + strip orphaned weave comments
         tmpattr=$(mktemp)
-        awk -v begin="$ATTR_MARKER_BEGIN" -v end="$ATTR_MARKER_END" -v block="$ATTR_BLOCK" '
+        # block through ENVIRON: BSD awk refuses a newline in a -v value (wv-27b2f5)
+        WV_AWK_BLOCK="$ATTR_BLOCK" awk -v begin="$ATTR_MARKER_BEGIN" -v end="$ATTR_MARKER_END" '
+            BEGIN { block = ENVIRON["WV_AWK_BLOCK"] }
             $0 == begin { print block; skip=1; next }
             skip && $0 == end { skip=0; next }
             skip { next }
@@ -2095,9 +2289,7 @@ if [ -f "$GITATTR" ]; then
             /^# Requires:.*merge/ { next }
             /^# Weave:/ { next }
             { print }
-        ' "$GITATTR" > "$tmpattr"
-        # Remove trailing blank lines
-        sed -i -e :a -e '/^\n*$/{$d;N;ba' -e '}' "$tmpattr"
+        ' "$GITATTR" | sed -e :a -e '/^\n*$/{$d;N;ba' -e '}' > "$tmpattr"  # and drop trailing blank lines (no sed -i: GNU-only, wv-076a98)
         mv "$tmpattr" "$GITATTR"
         echo -e "  ${GREEN}✓${NC} .gitattributes (updated)"
     else
@@ -2113,9 +2305,7 @@ if [ -f "$GITATTR" ]; then
             /^# Requires:.*merge/ { next }
             /^# Weave:/ { next }
             { print }
-        ' "$GITATTR" > "$tmpattr"
-        # Remove trailing blank lines
-        sed -i -e :a -e '/^\n*$/{$d;N;ba' -e '}' "$tmpattr"
+        ' "$GITATTR" | sed -e :a -e '/^\n*$/{$d;N;ba' -e '}' > "$tmpattr"  # and drop trailing blank lines (no sed -i: GNU-only, wv-076a98)
         { echo ""; echo "$ATTR_BLOCK"; } >> "$tmpattr"
         mv "$tmpattr" "$GITATTR"
         echo -e "  ${GREEN}✓${NC} .gitattributes (upgraded to managed block)"
@@ -2129,7 +2319,7 @@ fi
 # (state.sql and the snapshots), theirs (delta files) and wv-trails, the union
 # of both sides' notes and completion records (wv-8595fb). One definition with
 # install.sh and wv doctor (wv-git-hook-signature.sh, wv-f0b143).
-_TRAILS_DRIVER="${WV_LIB_DIR:-$HOME/.local/lib/weave}/merge-trails.py"
+_TRAILS_DRIVER="$INIT_LIB_DIR/merge-trails.py"
 if wv_register_merge_drivers . "$_TRAILS_DRIVER" 2>/dev/null; then
     echo -e "  ${GREEN}✓${NC} git merge drivers configured (ours, theirs, wv-trails)"
 elif [ ! -f "$_TRAILS_DRIVER" ]; then
@@ -2439,7 +2629,7 @@ SETTINGSEOF
                 # Insert new weave section
                 cat "$CONFIG_DIR/Makefile.template" >> "$_tmp_mk"
                 # Keep everything after END marker (includes consumer lint-file if already outside block)
-                sed -n '/# ── END WEAVE TARGETS ──/,${/# ── END WEAVE TARGETS ──/d;p}' "$REPO_ROOT/Makefile" >> "$_tmp_mk"
+                sed -n '/# ── END WEAVE TARGETS ──/,${/# ── END WEAVE TARGETS ──/d;p;}' "$REPO_ROOT/Makefile" >> "$_tmp_mk"  # p;} : BSD sed needs the ; (wv-076a98)
                 # Migration: if lint-file was inside old block (now gone), append stub below
                 if ! grep -q '^lint-file:' "$_tmp_mk"; then
                     _lint_file_stub >> "$_tmp_mk"
@@ -2508,7 +2698,10 @@ SETTINGSEOF
     # or from wv-init-repo itself.  On --update, sync stale hooks from the
     # installed source so `wv doctor` hook drift passes without a manual cp.
     CLAUDE_HOOKS_DIR="$REPO_ROOT/.claude/hooks"
-    INSTALLED_HOOKS_DIR="$HOME/.config/weave/hooks"
+    INSTALLED_HOOKS_DIR="$CONFIG_DIR/hooks"
+    # A retired hook is no longer installed, so the sync below never touches
+    # it; remove Weave's unedited copy, keep an edited one (wv-96b61e).
+    [ -d "$CLAUDE_HOOKS_DIR" ] && wv_retire_hook_copies "$CLAUDE_HOOKS_DIR" "$CONFIG_DIR/skill-provenance.txt"
     if [ -d "$CLAUDE_HOOKS_DIR" ] && [ -d "$INSTALLED_HOOKS_DIR" ]; then
         _hooks_updated=0
         _hooks_skipped=0
@@ -2516,9 +2709,9 @@ SETTINGSEOF
             [ -f "$src" ] || continue
             fname=$(basename "$src")
             dst="$CLAUDE_HOOKS_DIR/$fname"
-            if [ ! -f "$dst" ] || \
-               [ "$(md5sum "$src" 2>/dev/null | awk '{print $1}')" != \
-                 "$(md5sum "$dst" 2>/dev/null | awk '{print $1}')" ]; then
+            # cmp, not md5sum digests: a Mac without md5sum compared two empty
+            # strings and never refreshed a hook (wv-7d7d41).
+            if [ ! -f "$dst" ] || ! cmp -s -- "$src" "$dst"; then
                 cp "$src" "$dst"
                 _hooks_updated=$((_hooks_updated + 1))
             else
@@ -2603,65 +2796,40 @@ MCPEOF
                 echo -e "  ${YELLOW}⊘${NC} .vscode/mcp.json (user file, use --force to overwrite)"
         fi
 
-        # ── .mcp.json (legacy root MCP config; user file) ──
-    if [ ! -f "$REPO_ROOT/.mcp.json" ] || [ "$FORCE_MODE" = "1" ]; then
-        cat > "$REPO_ROOT/.mcp.json" << MCPEOF
-{
-    "servers": {
-        "weave": {
-            "command": "node",
-            "args": ["$MCP_SERVER_JSON"],
-            "env": {
-                "WV_PATH": "$WV_BIN_JSON",
-                "WV_PROJECT_ROOT": "\${workspaceFolder}",
-                "WV_AGENT_ID": "copilot-\${workspaceFolderBasename}"
-            }
-        },
-        "weave-session": {
-            "command": "node",
-            "args": ["$MCP_SERVER_JSON", "--scope=session"],
-            "env": {
-                "WV_PATH": "$WV_BIN_JSON",
-                "WV_PROJECT_ROOT": "\${workspaceFolder}",
-                "WV_AGENT_ID": "copilot-\${workspaceFolderBasename}"
-            }
-        },
-        "weave-lite": {
-            "command": "node",
-            "args": ["$MCP_SERVER_JSON", "--scope=lite"],
-            "env": {
-                "WV_PATH": "$WV_BIN_JSON",
-                "WV_PROJECT_ROOT": "\${workspaceFolder}",
-                "WV_AGENT_ID": "copilot-\${workspaceFolderBasename}"
-            }
-        },
-        "weave-inspect": {
-            "command": "node",
-            "args": ["$MCP_SERVER_JSON", "--scope=inspect"],
-            "env": {
-                "WV_PATH": "$WV_BIN_JSON",
-                "WV_PROJECT_ROOT": "\${workspaceFolder}",
-                "WV_AGENT_ID": "copilot-\${workspaceFolderBasename}"
-            }
-        }
-    }
-}
-MCPEOF
-        echo -e "  ${GREEN}✓${NC} .mcp.json"
         if [ ! -f "$MCP_SERVER" ]; then
             echo -e "  ${YELLOW}⊘${NC} MCP server not found at $MCP_SERVER"
             echo -e "    Run: install.sh --with-mcp"
         fi
-    else
-        echo -e "  ${YELLOW}⊘${NC} .mcp.json (user file, use --force to overwrite)"
-    fi
+
+        # ── root .mcp.json: not a VS Code surface (wv-d1ef4b) ──
+        # The root .mcp.json belongs to Claude Code, which reads only the
+        # "mcpServers" shape and rejects the VS Code "servers" shape this
+        # adapter used to write there. VS Code reads .vscode/mcp.json, written
+        # above, so the copilot adapter no longer writes the root file. On
+        # --update/--force a copy Weave wrote (only a "servers" key, only Weave
+        # server names, every identity copilot-*) is removed; any other root
+        # .mcp.json is the user's and is left alone.
+        _ROOT_MCP="$REPO_ROOT/.mcp.json"
+        if [ -f "$_ROOT_MCP" ] && { [ "$UPDATE_MODE" = "1" ] || [ "$FORCE_MODE" = "1" ]; }; then
+            if jq -e '
+                (keys == ["servers"])
+                and ((.servers | keys) - ["weave","weave-session","weave-lite","weave-inspect"] == [])
+                and ((.servers | length) > 0)
+                and ([.servers[] | (.env.WV_AGENT_ID // "") | startswith("copilot-")] | all)
+            ' "$_ROOT_MCP" >/dev/null 2>&1; then
+                rm -f "$_ROOT_MCP"
+                echo -e "  ${GREEN}✓${NC} .mcp.json (removed legacy VS Code-shaped copy; VS Code reads .vscode/mcp.json)"
+            fi
+        fi
 
     # ── .vscode/settings.json — strip ghost setting on --update ──
     _VSCODE_SETTINGS="$REPO_ROOT/.vscode/settings.json"
     if [ "$UPDATE_MODE" = "1" ] && [ -f "$_VSCODE_SETTINGS" ]; then
         if grep -q '"chat.hooks.enabled"' "$_VSCODE_SETTINGS" 2>/dev/null; then
             # Remove the ghost setting line (and trailing comma if present)
-            sed -i '/"chat\.hooks\.enabled"/d' "$_VSCODE_SETTINGS"
+            # not sed -i: BSD sed takes the next argument as a backup suffix (wv-076a98)
+            _vs_tmp=$(mktemp) && sed '/"chat\.hooks\.enabled"/d' "$_VSCODE_SETTINGS" > "$_vs_tmp" \
+                && cat "$_vs_tmp" > "$_VSCODE_SETTINGS"; rm -f "$_vs_tmp"
             # Clean up empty JSON object or trailing commas
             if python3 -c "import json,sys; d=json.load(open('$_VSCODE_SETTINGS')); json.dump(d,open('$_VSCODE_SETTINGS','w'),indent=2)" 2>/dev/null; then
                 echo -e "  ${GREEN}✓${NC} .vscode/settings.json (stripped ghost setting chat.hooks.enabled)"
@@ -2876,6 +3044,20 @@ if [ "$AGENT" = "codex" ]; then
 
     _CODEX_DIR="$REPO_ROOT/.codex"
     _CODEX_CONTRACT="$_CODEX_DIR/weave.json"
+    # Which wv the contract and hooks name (wv-dce969): the source checkout
+    # tests its own CLI, a consumer has no scripts/wv and runs the installed
+    # one. Hooks run without the login PATH, so a consumer's is the absolute
+    # $HOME/.local/bin/wv, expanded when the hook runs. Same test as the
+    # shell fallback in .weave/runtime.md and the VS Code hooks.
+    if [ -x "$REPO_ROOT/scripts/wv" ] && [ -f "$REPO_ROOT/scripts/lib/wv-config.sh" ]; then
+        _CODEX_WV='./scripts/wv' _CODEX_PREFER_LOCAL=true
+        _CODEX_HOOK_WV='"$(git rev-parse --show-toplevel)/scripts/wv"'
+    else
+        # shellcheck disable=SC2016  # $HOME is written literally, expanded by the reader
+        _CODEX_WV='$HOME/.local/bin/wv' _CODEX_PREFER_LOCAL=false
+        # shellcheck disable=SC2016
+        _CODEX_HOOK_WV='"$HOME/.local/bin/wv"'
+    fi
     CODEX_HOOKS_ENABLED="$CODEX_HOOKS"
     [ ! -f "$_CODEX_DIR/hooks.json" ] || CODEX_HOOKS_ENABLED=1
 
@@ -2885,61 +3067,61 @@ if [ "$AGENT" = "codex" ]; then
 {
   "schema": "weave.codex.v1",
   "bootstrap": {
-    "command": "./scripts/wv bootstrap-agent --json",
+    "command": "${_CODEX_WV} bootstrap-agent --json",
     "fallback": "\$HOME/.local/bin/wv bootstrap-agent --json"
   },
   "doctor": {
-    "command": "./scripts/wv doctor --agent --json",
+    "command": "${_CODEX_WV} doctor --agent --json",
     "fallback": "\$HOME/.local/bin/wv doctor --agent --json"
   },
   "runtime": {
     "hot_zone": "shared",
     "expected_prefix": "/tmp/weave-hotzone-\${uid}",
-    "prefer_repo_local_wv": true
+    "prefer_repo_local_wv": $_CODEX_PREFER_LOCAL
   },
   "hooks": {
     "enabled": $CODEX_HOOKS_ENABLED,
     "config": ".codex/hooks.json",
     "trust_command": "/hooks",
     "requires_review": true,
-    "dispatcher": "./scripts/wv hook dispatch"
+    "dispatcher": "${_CODEX_WV} hook dispatch"
   },
   "workflow": {
     "universal_instructions": "AGENTS.md",
     "no_edits_without_active_node": true,
-    "noninteractive_close": "./scripts/wv ship-agent"
+    "noninteractive_close": "${_CODEX_WV} ship-agent"
   },
   "memory": {
     "authority": "weave-graph",
     "lifecycle_field": "metadata.mem_status",
     "policy": "codex-local memory is evidence; weave graph is authority",
     "capture": {
-      "command": "./scripts/wv remember --json",
+      "command": "${_CODEX_WV} remember --json",
       "fallback": "\$HOME/.local/bin/wv remember --json"
     },
     "recall": {
-      "command": "./scripts/wv memory recall --agent=all --json",
+      "command": "${_CODEX_WV} memory recall --agent=all --json",
       "fallback": "\$HOME/.local/bin/wv memory recall --agent=all --json"
     },
     "scan": {
-      "command": "./scripts/wv memory scan --source=codex --json",
+      "command": "${_CODEX_WV} memory scan --source=codex --json",
       "fallback": "\$HOME/.local/bin/wv memory scan --source=codex --json"
     },
     "import": {
-      "command": "./scripts/wv memory import --source=codex --json",
+      "command": "${_CODEX_WV} memory import --source=codex --json",
       "fallback": "\$HOME/.local/bin/wv memory import --source=codex --json"
     },
     "crystallize": {
-      "command": "./scripts/wv memory crystallize --json",
+      "command": "${_CODEX_WV} memory crystallize --json",
       "fallback": "\$HOME/.local/bin/wv memory crystallize --json"
     }
   },
   "commands": {
-    "claim": "./scripts/wv work <id>",
-    "record_edit": "./scripts/wv touch <id> --files=<path>",
-    "close": "./scripts/wv ship-agent <id> --learning-file=<path> --verification-method=<cmd> --verification-evidence-file=<path> --json",
-    "local_sync": "./scripts/wv sync --mode=fast --node=<id>",
-    "github_sync": "./scripts/wv sync --gh --mode=fast --node=<id>",
+    "claim": "${_CODEX_WV} work <id>",
+    "record_edit": "${_CODEX_WV} touch <id> --files=<path>",
+    "close": "${_CODEX_WV} ship-agent <id> --learning-file=<path> --verification-method=<cmd> --verification-evidence-file=<path> --json",
+    "local_sync": "${_CODEX_WV} sync --mode=fast --node=<id>",
+    "github_sync": "${_CODEX_WV} sync --gh --mode=fast --node=<id>",
     "push": "git push"
   },
   "mcp": {
@@ -2950,8 +3132,8 @@ if [ "$AGENT" = "codex" ]; then
     "network_policy": "Use CLI for GitHub sync, git push, and other privileged/network operations."
   },
   "github_sync": {
-    "local_first": "./scripts/wv sync",
-    "external_network": "./scripts/wv sync --gh",
+    "local_first": "${_CODEX_WV} sync",
+    "external_network": "${_CODEX_WV} sync --gh",
     "requires_sandbox_approval": true,
     "failure_policy": "local .weave sync remains valid; rerun external_network with network/SSH approval"
   }
@@ -3031,6 +3213,18 @@ CODEXEOF
   }
 }
 CODEXHOOKSEOF
+        # A consumer's hooks call the installed wv (wv-dce969): every command
+        # above names the source checkout's scripts/wv, which a consumer lacks,
+        # and a hook entry has no fallback.
+        if [ "$_CODEX_PREFER_LOCAL" = "false" ]; then
+            local _hooks_tmp
+            _hooks_tmp=$(mktemp "$_CODEX_DIR/.hooks.XXXXXX") || return 1
+            # shellcheck disable=SC2016  # $(git ...) is the literal prefix being replaced
+            jq --arg old '"$(git rev-parse --show-toplevel)/scripts/wv"' --arg new "$_CODEX_HOOK_WV" \
+                '(.hooks[][].hooks[].command) |= (if startswith($old) then $new + .[($old | length):] else . end)' \
+                "$_CODEX_DIR/hooks.json" > "$_hooks_tmp" && mv "$_hooks_tmp" "$_CODEX_DIR/hooks.json" \
+                || { rm -f "$_hooks_tmp" "$_CODEX_DIR/hooks.json"; return 1; }
+        fi
     }
 
     if [ ! -f "$_CODEX_CONTRACT" ] || [ "$UPDATE_MODE" = "1" ] || [ "$FORCE_MODE" = "1" ] || [ "$CODEX_HOOKS" = "1" ]; then
@@ -3051,10 +3245,26 @@ CODEXHOOKSEOF
         echo -e "  ${YELLOW}⊘${NC} .codex/weave.json (already exists, use --update to refresh)"
     fi
 
+    # The contract names AGENTS.md as the universal instructions (wv-dce969):
+    # with no root AGENTS.md, Codex got no project instructions at all. Written
+    # once from the shipped template when none exists, never over a user's file
+    # (AGENTS.md is user-owned in a consumer, 04feaa432); its WEAVE PROCEDURES
+    # block is then the one project-procedures refreshes.
+    if [ ! -e "$REPO_ROOT/AGENTS.md" ]; then
+        if [ -f "$CONFIG_DIR/AGENTS.md.template" ] && cp "$CONFIG_DIR/AGENTS.md.template" "$REPO_ROOT/AGENTS.md"; then
+            echo -e "  ${GREEN}✓${NC} AGENTS.md (universal instructions the Codex contract names; edit freely)"
+        else
+            echo -e "  ${YELLOW}⚠${NC} AGENTS.md not written: no template at $CONFIG_DIR/AGENTS.md.template - run ./install.sh, or write one; .codex/weave.json names it" >&2
+        fi
+    fi
+
     if [ "$CODEX_HOOKS" = "1" ]; then
-        _write_codex_hooks
-        echo -e "  ${GREEN}✓${NC} .codex/hooks.json"
-        echo "  Review and trust these project hooks with /hooks before expecting enforcement."
+        if _write_codex_hooks; then
+            echo -e "  ${GREEN}✓${NC} .codex/hooks.json"
+            echo "  Review and trust these project hooks with /hooks before expecting enforcement."
+        else
+            echo -e "  ${RED}✗${NC} .codex/hooks.json: could not point the hooks at the installed wv; they would call a missing scripts/wv - not trusted, re-run with --codex-hooks" >&2
+        fi
     else
         echo -e "  ${YELLOW}⊘${NC} codex hooks: skipped (use --codex-hooks to generate for review)"
     fi
@@ -3064,10 +3274,12 @@ CODEXHOOKSEOF
     # the narrow lite scope and require an explicit full-scope opt-in.
     if [ -z "$CODEX_MCP_SCOPE" ]; then
         echo -e "  ${YELLOW}⊘${NC} codex mcp: skipped (use --codex-mcp to register weave-lite)"
-    elif command -v codex >/dev/null 2>&1; then
+    elif [ -n "${CODEX_BIN_ARG:-}" ] && [ ! -x "$CODEX_BIN_ARG" ]; then
+        echo -e "  ${YELLOW}⊘${NC} codex mcp: --codex-bin=$CODEX_BIN_ARG is not an executable file"
+    elif _codex=$(_find_codex_bin); then
         _mcp_server=""
-        if [ -f "$WV_LIB_DIR/mcp/dist/index.js" ]; then
-            _mcp_server="$WV_LIB_DIR/mcp/dist/index.js"
+        if [ -f "$MCP_SERVER" ]; then
+            _mcp_server="$MCP_SERVER"
         elif [ -f "$REPO_ROOT/mcp/dist/index.js" ]; then
             _mcp_server="$REPO_ROOT/mcp/dist/index.js"
         fi
@@ -3081,21 +3293,24 @@ CODEXHOOKSEOF
                 _codex_mcp_name="weave"
                 _codex_mcp_scope="all"
             fi
-            if [ "$_codex_mcp_name" != "weave" ] && codex mcp list 2>/dev/null | grep -q '^weave[[:space:]]'; then
-                codex mcp remove weave >/dev/null 2>&1 \
+            if [ "$_codex_mcp_name" != "weave" ] && "$_codex" mcp list 2>/dev/null | grep -q '^weave[[:space:]]'; then
+                "$_codex" mcp remove weave >/dev/null 2>&1 \
                     && echo -e "  ${GREEN}✓${NC} codex mcp: removed stale full weave registration"
             fi
-            codex mcp add "$_codex_mcp_name" \
+            "$_codex" mcp add "$_codex_mcp_name" \
                 --env "WV_PATH=$WV_BIN" \
                 --env "WV_PROJECT_DIR=$REPO_ROOT" \
                 -- node "$_mcp_server" "--scope=$_codex_mcp_scope" 2>/dev/null \
                 && echo -e "  ${GREEN}✓${NC} codex mcp: $_codex_mcp_name registered (--scope=$_codex_mcp_scope)" \
                 || echo -e "  ${YELLOW}⊘${NC} codex mcp add $_codex_mcp_name skipped (already registered or error)"
         else
-            echo -e "  ${YELLOW}⊘${NC} codex mcp: MCP server not built — run 'npm run build' in mcp/ first"
+            # Name the path looked in; a consumer has no mcp/ of its own (wv-d3c35c).
+            _mcp_where="$MCP_SERVER"
+            [ -d "$REPO_ROOT/mcp" ] && _mcp_where="$_mcp_where or $REPO_ROOT/mcp/dist/index.js"
+            echo -e "  ${YELLOW}⊘${NC} codex mcp: MCP server not built (looked for $_mcp_where) — install it: re-run the Weave install with --with-mcp"
         fi
     else
-        echo -e "  ${YELLOW}⊘${NC} codex mcp: codex command not found"
+        echo -e "  ${YELLOW}⊘${NC} codex mcp: codex not found on PATH, in a VS Code extension's bin/ or under nvm — name it with --codex-bin=PATH"
     fi
 fi
 
@@ -3127,11 +3342,26 @@ elif [ -f "$_gp_propose" ] && [ ! -e "$REPO_ROOT/.weave/gate-provision.json" ]; 
     rm -f "$_gp_notes"
 fi
 
-# Procedure bodies live in the installed config; this projects only the adapter
-# requested by init-repo. AGENTS.md stays user-owned: only a WEAVE PROCEDURES
-# block the file already carries is refreshed, never created (wv-6ef83b).
+# Procedure bodies live in the installed config; this projects the adapter
+# requested by init-repo and, on --update, refreshes every adapter surface the
+# repository already carries, adopting none (wv-82bd03). AGENTS.md stays
+# user-owned: only a WEAVE PROCEDURES block the file already carries is
+# refreshed, never created (wv-6ef83b).
 if [ -x "$CONFIG_DIR/project-procedures.sh" ]; then
-    "$CONFIG_DIR/project-procedures.sh" --repo="$REPO_ROOT" --agent="$AGENT_ARG"
+    _pp_present=()
+    [ "$UPDATE_MODE" = "1" ] && _pp_present=(--present)
+    "$CONFIG_DIR/project-procedures.sh" --repo="$REPO_ROOT" --agent="$AGENT_ARG" ${_pp_present[@]+"${_pp_present[@]}"}
+fi
+
+# A surface written for the whole team that the repository's ignore rules hide
+# never reaches git status, so it silently stays on this machine (wv-f2a6a3).
+_wv_hidden=$(wv_ignored_shared_surfaces "$REPO_ROOT")
+if [ -n "$_wv_hidden" ]; then
+    echo -e "  ${YELLOW}⚠${NC} written for the team but hidden from git by this repository's ignore rules:"
+    while IFS=$'\t' read -r _wv_h_path _wv_h_rule; do
+        echo "      $_wv_h_path  (rule $_wv_h_rule)"
+    done <<< "$_wv_hidden"
+    echo "      git will not carry them to anyone else: add a !<path> exception to the ignore file, or git add -f them"
 fi
 
 # ── Summary ──
@@ -3189,7 +3419,6 @@ for _a in "${AGENTS[@]}"; do
         echo "  CLAUDE.md        — agent instructions"
     elif [ "$_a" = "copilot" ]; then
         echo "  .vscode/mcp.json — VS Code workspace MCP config"
-        echo "  .mcp.json — Copilot MCP config (legacy/root)"
         echo "  .github/copilot-instructions.md — Minimal stub (workflow via weave_guide)"
         echo "  .github/hooks/ — VS Code native hook location"
     elif [ "$_a" = "codex" ]; then
@@ -3222,7 +3451,7 @@ echo "$INSTALL_DIR/wv-init-repo" >> "$MANIFEST"
 # Capture the install source dir at install time so wv-update can find it later
 _WV_SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cat > "$INSTALL_DIR/wv-update" << UPDATEEOF
-#!/bin/bash
+#!/usr/bin/env bash
 # Re-run the Weave installer to update all components
 set -e
 echo "Updating Weave..."
@@ -3246,15 +3475,38 @@ UPDATEEOF
 chmod +x "$INSTALL_DIR/wv-update"
 echo "$INSTALL_DIR/wv-update" >> "$MANIFEST"
 
-# MCP server (optional)
+# MCP server (optional, but once asked for or already installed a rebuild that
+# does not happen is a failure: a skipped rebuild left a consumer on an rc.10
+# server under an rc.18 CLI for every upgrade, reported only as a red line
+# mid-output (wv-4cdc07). The summary names it and the install exits 1.
+_mcp_failed=""
 if [ "$WITH_MCP" = "1" ]; then
     echo ""
     echo -e "${CYAN}━━━ MCP Server ━━━${NC}"
-    if ! command -v node &>/dev/null; then
+    # npm beside the node found: nvm puts both in one bin directory and a
+    # non-interactive shell often has only node on PATH.
+    local node_bin npm_bin=""
+    node_bin=$(command -v node 2>/dev/null || true)
+    npm_bin=$(command -v npm 2>/dev/null || true)
+    # Beside the node on PATH, then beside the binary it links to (a node
+    # symlinked onto PATH from an nvm directory keeps its npm there).
+    if [ -z "$npm_bin" ] && [ -n "$node_bin" ]; then
+        local node_dir
+        for node_dir in "$(dirname "$node_bin")" "$(dirname "$(readlink -f "$node_bin" 2>/dev/null || echo "$node_bin")")"; do
+            if [ -x "$node_dir/npm" ]; then
+                npm_bin="$node_dir/npm"
+                echo "Using npm beside node: $npm_bin"
+                break
+            fi
+        done
+    fi
+    if [ -z "$node_bin" ]; then
         echo -e "${RED}✗ node not found — MCP server requires Node.js${NC}"
         echo "  Install Node.js 18+ and re-run with --with-mcp"
-    elif ! command -v npm &>/dev/null; then
-        echo -e "${RED}✗ npm not found — MCP server requires npm${NC}"
+        _mcp_failed="node not found, so the MCP server was not rebuilt"
+    elif [ -z "$npm_bin" ]; then
+        echo -e "${RED}✗ npm not found on PATH or beside $node_bin — MCP server requires npm${NC}"
+        _mcp_failed="npm not found on PATH or beside $node_bin, so the MCP server was not rebuilt"
     else
         local mcp_dir="$LIB_DIR/mcp"
         mkdir -p "$mcp_dir"
@@ -3264,16 +3516,17 @@ if [ "$WITH_MCP" = "1" ]; then
             # vitest (SERVER_PATH) and the .mcp.json repo fallback read it — a
             # stale checkout dist shipped an old server to dev (wv-0cd7f8).
             if [ -d "./mcp/node_modules" ]; then
-                (cd ./mcp && npm run build --silent 2>&1 | tail -1) || true
+                (cd ./mcp && "$npm_bin" run build --silent 2>&1 | tail -1) || true
             fi
             cp ./mcp/package.json ./mcp/tsconfig.json "$mcp_dir/" 2>/dev/null || true
             cp -r ./mcp/src "$mcp_dir/" 2>/dev/null || true
-            (cd "$mcp_dir" && npm install --production=false --silent 2>&1 | tail -1 && npm run build --silent 2>&1) && {
+            (cd "$mcp_dir" && "$npm_bin" install --production=false --silent 2>&1 | tail -1 && "$npm_bin" run build --silent 2>&1) && {
                 echo -e "${GREEN}✓ MCP server built${NC}"
                 echo -e "${YELLOW}  ↻ Restart your Claude session for MCP changes to take effect${NC}"
                 echo "$mcp_dir" >> "$MANIFEST"
             } || {
                 echo -e "${RED}✗ MCP server build failed${NC}"
+                _mcp_failed="the MCP server build failed"
             }
         else
             echo "Downloading MCP server from GitHub..."
@@ -3282,12 +3535,13 @@ if [ "$WITH_MCP" = "1" ]; then
             curl -sSL "$mcp_repo/tsconfig.json" -o "$mcp_dir/tsconfig.json"
             mkdir -p "$mcp_dir/src"
             curl -sSL "$mcp_repo/src/index.ts" -o "$mcp_dir/src/index.ts"
-            (cd "$mcp_dir" && npm install --production=false --silent 2>&1 | tail -1 && npm run build --silent 2>&1) && {
+            (cd "$mcp_dir" && "$npm_bin" install --production=false --silent 2>&1 | tail -1 && "$npm_bin" run build --silent 2>&1) && {
                 echo -e "${GREEN}✓ MCP server built${NC}"
                 echo -e "${YELLOW}  ↻ Restart your Claude session for MCP changes to take effect${NC}"
                 echo "$mcp_dir" >> "$MANIFEST"
             } || {
                 echo -e "${RED}✗ MCP server build failed${NC}"
+                _mcp_failed="the MCP server build failed"
             }
         fi
         if [ -f "$mcp_dir/dist/index.js" ]; then
@@ -3379,8 +3633,14 @@ echo "  wv-test       — Isolated test runner"
 echo "  (wv-runtime retired — use python -m weave_runtime from standalone repo)"
 echo "  wv init-repo  — Initialize Weave in a new repo"
 echo "  wv-update     — Update Weave to latest version"
-[ "$WITH_MCP" = "1" ] && [ -f "$LIB_DIR/mcp/dist/index.js" ] && \
+[ "$WITH_MCP" = "1" ] && [ -z "$_mcp_failed" ] && [ -f "$LIB_DIR/mcp/dist/index.js" ] && \
     echo "  weave-mcp     — MCP server ($LIB_DIR/mcp/dist/index.js)"
+if [ -n "$_mcp_failed" ]; then
+    echo ""
+    echo -e "${RED}✗ Install incomplete: $_mcp_failed.${NC}"
+    echo "  Any MCP server already installed is the previous build; wv mcp-status reports its version."
+    echo "  Fix the cause and re-run ./install.sh --with-mcp, or pass --no-mcp to install without it."
+fi
 echo ""
 echo "To set up a new repo:"
 echo "  cd /path/to/your/repo"
@@ -3400,6 +3660,7 @@ if [ "$VERIFY" = "1" ]; then
         exit 1
     fi
 fi
+[ -z "$_mcp_failed" ] || return 1
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -3452,7 +3713,7 @@ fi
 case "${action:-install}" in
     uninstall)  do_uninstall; exit 0 ;;
     upgrade)    do_upgrade; exit 0 ;;
-    check-deps) check_deps; exit 0 ;;
+    check-deps) check_deps; exit $? ;;
     help)
         echo "Weave Installer"
         echo ""
@@ -3472,5 +3733,7 @@ case "${action:-install}" in
         echo "  --check-deps       Check required dependencies"
         echo "  --help             Show this help"
         ;;
-    install)    do_install ;;
+    # The python floor after the refusals that must write nothing (wv-892318):
+    # its memo lives under HOME.
+    install)    check_sqlite_fts5 || exit 1; _wv_python_floor; do_install ;;
 esac

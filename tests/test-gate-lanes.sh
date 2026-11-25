@@ -18,6 +18,7 @@
 # plan keeps those and retires this mechanism (wv-7e8216, wv-518c6c).
 export WV_TEST_SUITE=1
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/lib/bounded.sh"  # timeout(1) is GNU-only; macOS has none (wv-412db3)
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 run=0; pass=0
 # shellcheck source=tests/fixtures/gate-lanes/setup.sh
@@ -183,6 +184,47 @@ check "...because its lane reran the suite rather than reusing HEAD's result" "2
 has "...in that library's lane" "$OUT" "the candidate version of scripts/lib/wv-config.sh does not admit"
 git reset -q --hard HEAD~1; rm -f "$MARK/probe"
 
+echo "the first refusing lane stops the others (wv-744cb2)"
+reset_all
+cat > tests/test-probe.sh <<PROBE_EOF
+#!/bin/sh
+echo run >> "$MARK/probe"
+[ -z "\${FIXTURE_BREAK:-}" ] || exit 1
+if [ -n "\${FIXTURE_SLOW:-}" ]; then
+    sleep "\$FIXTURE_SLOW" & echo "\$!" > "$MARK/slow.pid"; wait
+    echo done >> "$MARK/slow-done"
+fi
+exit 0
+PROBE_EOF
+commit_nohook "probe refuses FIXTURE_BREAK and sleeps FIXTURE_SLOW"
+_gl_two_lanes() {
+    printf '\nexport FIXTURE_BREAK=1\n' >> scripts/lib/wv-config.sh
+    printf '\nexport FIXTURE_SLOW=%s\n' "$1" >> scripts/lib/wv-gate-pool.sh
+    git add scripts/lib/wv-config.sh scripts/lib/wv-gate-pool.sh
+    rm -f "$MARK/slow.pid" "$MARK/slow-done"
+}
+_gl_two_lanes 60
+OUT=$(WV_GATE_LANE_JOBS=2 ./.git/hooks/pre-commit 2>&1); RC=$?
+check "a commit whose one lane refuses is refused" "1" "$RC"
+has "...by that lane" "$OUT" "the candidate version of scripts/lib/wv-config.sh does not admit"
+has "...stopping the slow lane, which judged nothing" "$OUT" \
+    "candidate lane scripts/lib/wv-gate-pool.sh: not judged, stopped after scripts/lib/wv-config.sh refused"
+has "...and saying so in the lanes' total" "$OUT" "candidate lanes: 0 of 2 admitted, 1 stopped"
+check "...before its 60s suite finished" "true" "$(tail -1 "$WV_GATE_LOG" | jq -r '.lanes_ms < 50000')"
+_gl_alive=0; _gl_pid=$(cat "$MARK/slow.pid" 2>/dev/null)
+[ -z "$_gl_pid" ] || ! kill -0 "$_gl_pid" 2>/dev/null || _gl_alive=1
+check "...whose suite is reaped, not left running" "0 no" "$_gl_alive $([ -f "$MARK/slow-done" ] && echo yes || echo no)"
+check "...and the gate record marks it stopped, with no exit" "scripts/lib/wv-gate-pool.sh true null" \
+    "$(tail -1 "$WV_GATE_LOG" | jq -r '.lanes[] | select(.stopped) | "\(.path) \(.stopped) \(.rc)"')"
+git reset -q; git checkout -q -- scripts
+_gl_two_lanes 2
+OUT=$(WV_GATE_LANE_JOBS=2 WV_GATE_KEEP_GOING=1 ./.git/hooks/pre-commit 2>&1); RC=$?
+check "WV_GATE_KEEP_GOING=1 still refuses" "1" "$RC"
+has "...after judging every lane" "$OUT" "candidate lanes: 1 of 2 admitted in"
+check "...letting the slow lane finish" "yes" "$([ -f "$MARK/slow-done" ] && echo yes || echo no)"
+hasnt "...and stopping none" "$OUT" "not judged, stopped"
+git reset -q --hard HEAD~1; rm -f "$MARK/probe" "$MARK/slow.pid" "$MARK/slow-done"
+
 # The router is not invoking: suite selection runs fresh in every lane, from
 # the lane's copy; only suite results are reused, keyed by suite and inputs.
 reset_all
@@ -219,7 +261,7 @@ check "...each timed on its own line" "3" "$(grep -cE "candidate lane scripts/li
 # (wv-d7af8d) or a fixed share of it (wv-428a92): every lane names the same 4
 # slots, and the gate record says which scheduler ran them.
 check "...sharing the bound: all three lanes draw on the same 4 slots" "4 4 4" \
-    "$(grep -oE "candidate lane scripts/lib/[a-z-]+\.sh: reused HEAD's suite results from [0-9]+" <<< "$OUT" | grep -oE '[0-9]+$' | paste -sd ' ')"
+    "$(grep -oE "candidate lane scripts/lib/[a-z-]+\.sh: reused HEAD's suite results from [0-9]+" <<< "$OUT" | grep -oE '[0-9]+$' | paste -sd ' ' -)"
 check "...and the gate record names the shared-slot scheduler for each lane" "shared-slots shared-slots shared-slots" \
     "$(tail -1 "$WV_GATE_LOG" | jq -r '[.lanes[].scheduler] | join(" ")')"
 
@@ -278,7 +320,7 @@ HUNG_CANDIDATE
 into_hook "$T/hung-candidate"
 # The outer guard also covers baseline linting/setup before the lane starts.
 # It must not compete with the eight-second deadline under test.
-OUT=$(WV_GATE_LANE_TIMEOUT=8 timeout -k 2 90 ./.git/hooks/pre-commit 2>&1); RC=$?
+OUT=$(WV_GATE_LANE_TIMEOUT=8 bounded 90 ./.git/hooks/pre-commit 2>&1); RC=$?
 check "a hung candidate refuses, not the outer safety deadline" "1" "$RC"
 has "...naming the candidate and timeout" "$OUT" "TIMEOUT candidate lane scripts/hooks/pre-commit-weave.sh"
 has "...with the failed timeout status" "$OUT" "boundary rule 4, exit 124"

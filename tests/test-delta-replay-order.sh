@@ -88,5 +88,72 @@ rm -rf "$WV_HOT_ZONE"; mkdir -p "$WV_HOT_ZONE"
 present "$N" && ok "round-trip: a normally-synced node survives reload" \
     || bad "round-trip: node lost after reload"
 
+# ── a delta listing that cannot run fails the load (wv-8ea297) ────────────────
+# BSD find has no -printf: cmd_load read the refusal as "no deltas", loaded
+# state.sql alone and reported success. A find that fails only for one phase's
+# walk shows that phase refuses, whatever the cause of the failure.
+REAL_FIND=$(command -v find)
+failing_find() { # dir pattern -> a find that fails when an argument is <pattern>
+    mkdir -p "$1"
+    printf '#!/bin/sh\nfor a in "$@"; do [ "$a" = "%s" ] && { echo "find: refused (test)" >&2; exit 1; }; done\nexec %s "$@"\n' \
+        "$2" "$REAL_FIND" > "$1/find"
+    chmod +x "$1/find"
+}
+failing_find "$TEST_DIR/no-v1" '*.sql'
+failing_find "$TEST_DIR/no-v2" '*/v2/*.json'
+# v1 is the compatibility authority (wv-e030f8): its listing failing fails the
+# load. A v2 listing failure is a hard v2 failure: strict fails the load, and
+# otherwise v1 applies and the load is not acknowledged, naming the cause.
+for mode in v1 v2-strict; do
+    phase=${mode%%-*}
+    rm -rf "$WV_HOT_ZONE"; mkdir -p "$WV_HOT_ZONE"
+    rc=0; err=$(PATH="$TEST_DIR/no-$phase:$PATH" WV_DELTA_V2_STRICT=$([ "$mode" = v2-strict ] && echo 1 || echo 0) \
+        "$WV" load 2>&1 >/dev/null) || rc=$?
+    [ "$rc" -ne 0 ] && ok "$mode: a load whose delta listing fails exits non-zero" \
+        || bad "$mode: a load whose delta listing fails reported success"
+    grep -qF -- "could not list the $phase" <<<"$err" && ok "$mode: ...naming the listing" \
+        || bad "$mode: ...without naming the listing: $err"
+done
+rm -rf "$WV_HOT_ZONE"; mkdir -p "$WV_HOT_ZONE"
+rc=0; err=$(PATH="$TEST_DIR/no-v2:$PATH" "$WV" load 2>&1 >/dev/null) || rc=$?
+{ grep -q "could not list the v2" <<<"$err" && grep -q "not acknowledged" <<<"$err"; } \
+    && ok "v2, not strict: v1 applies and the load is not acknowledged, naming the listing" \
+    || bad "v2, not strict: the failed listing was not reported as a gap (rc=$rc): $err"
+present "$N" && ok "v2, not strict: ...and v1 still brought the node in" \
+    || bad "v2, not strict: v1 did not apply after the v2 listing failed"
+rm -rf "$WV_HOT_ZONE"; mkdir -p "$WV_HOT_ZONE"
+"$WV" load >/dev/null 2>&1
+present "$N" && ok "a load with a working listing brings the deltas back" \
+    || bad "the load after the refusals lost $N"
+
+# The same class elsewhere: a walk that fails is never a clean result.
+rc=0; err=$(PATH="$TEST_DIR/no-v1:$PATH" "$WV" compact --dry-run 2>&1) || rc=$?
+{ [ "$rc" -ne 0 ] && grep -q 'could not list' <<<"$err"; } \
+    && ok "compact: a failed walk is an error, not 'no delta files older than'" \
+    || bad "compact: a failed walk reported (rc=$rc): $err"
+out=$(PATH="$TEST_DIR/no-v2:$PATH" "$WV" doctor 2>&1 || true)
+grep -q 'could not list the v2 operations' <<<"$out" \
+    && ok "doctor: a failed v2 walk is a failed check, not a clean catalog" \
+    || bad "doctor: a failed v2 walk went unreported"
+locked="$TEST_DIR/unreadable"; mkdir -p "$locked/inner"; chmod 000 "$locked"
+if [ -r "$locked" ]; then
+    ok "hot-zone migrate: (skipped, running as root: an unreadable dir cannot be made)"
+elif (source "$REPO_ROOT/scripts/lib/wv-hotzone-migrate.sh"; _hzm_is_empty "$locked"); then
+    bad "hot-zone migrate: a directory it cannot list reads as empty"
+else
+    ok "hot-zone migrate: a directory it cannot list is not empty"
+fi
+chmod 700 "$locked"
+
+# ── no GNU-only find form returns (wv-8ea297) ─────────────────────────────────
+# -printf, -fprintf and -perm /mode fail on BSD find. The one allowed use is a
+# probed fast path that falls back when the probe fails, marked on its line.
+gnu_find=$(cd "$REPO_ROOT" && grep -rnE -- 'find .*(-pr[i]ntf|-fpr[i]ntf|-perm[[:space:]]+/)' \
+        scripts install.sh tests --include='*.sh' --include='wv' 2>/dev/null \
+    | grep -vE '^[^:]+:[0-9]+:[[:space:]]*#' \
+    | grep -v 'printf-probed (wv-8ea297)' || true)
+[ -z "$gnu_find" ] && ok "no unprobed GNU-only find form in scripts/, install.sh or tests/" \
+    || bad "GNU-only find forms: $gnu_find"
+
 echo "Results: $pass/$run passed"
 [ "$pass" -eq "$run" ]

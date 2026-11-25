@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # wv — Weave CLI: In-memory graph for AI coding agents
 # Fast, ephemeral task/context tracking via SQLite in tmpfs
 # See: docs/WEAVE.md
@@ -20,6 +20,28 @@
 #   cmd/wv-cmd-gate.sh — config, test-record, test-status (the commands the commit gate runs)
 #   cmd/wv-cmd-quality.sh — quality
 #   cmd/wv-cmd-findings.sh — findings
+# wv bash guard (wv-7257a8): bash >= 4 or a clear refusal. Identical in every executed entry point; master: scripts/lib/wv-bash-guard.sh.
+_wv_bash_guard() {
+    if [ -n "${WV_TEST_BASH_TOO_OLD:-}" ] && [ "${WV_TEST_MODE:-}" != 1 ]; then echo "wv: WV_TEST_BASH_TOO_OLD needs WV_TEST_MODE=1; ignoring it." >&2; fi
+    if [ "${BASH_VERSINFO[0]:-0}" -ge 4 ] && ! { [ "${WV_TEST_MODE:-}" = 1 ] && [ "${WV_TEST_BASH_TOO_OLD:-}" = 1 ]; }; then
+        unset WV_BASH_REEXEC
+        return 0
+    fi
+    local b
+    if [ -z "${WV_BASH_REEXEC:-}" ] && [ -f "$0" ]; then
+        for b in ${WV_BASH:-} /opt/homebrew/bin/bash /usr/local/bin/bash /usr/bin/bash /bin/bash; do
+            # shellcheck disable=SC2016  # the child bash expands it
+            if [ -x "$b" ] && [ "$("$b" -c 'echo "${BASH_VERSINFO[0]}"' 2>/dev/null)" -ge 4 ] 2>/dev/null; then
+                WV_BASH_REEXEC=1 WV_TEST_BASH_TOO_OLD='' exec "$b" "$0" "$@"
+            fi
+        done
+    fi
+    echo "wv: $0 needs bash 4 or newer but is running under bash ${BASH_VERSION:-unknown}." >&2
+    echo "    On macOS /bin/bash is 3.2: install a newer one (brew install bash) or set WV_BASH to it." >&2
+    exit 1
+}
+_wv_bash_guard "$@"
+# end wv bash guard
 
 set -euo pipefail
 
@@ -94,6 +116,8 @@ source "$WV_LIB_DIR/lib/wv-command-capabilities.sh"
 source "$WV_LIB_DIR/lib/wv-policy-rules.sh"
 # wv-graph-diff.sh: the durable table list and wv hotzone diff, no dependencies.
 source "$WV_LIB_DIR/lib/wv-graph-diff.sh"
+# wv-lock.sh: the one file-lock helper (flock(1), else python3 fcntl, else refuse).
+source "$WV_LIB_DIR/lib/wv-lock.sh"
 # wv hotzone diff runs before placement is resolved (wv-757de1): it is how a
 # repository whose database sits in two hot zones compares the copies, and
 # wv-config.sh refuses every command in exactly that state. It reads two
@@ -102,6 +126,16 @@ source "$WV_LIB_DIR/lib/wv-graph-diff.sh"
 if [ "${1:-}" = "hotzone" ] && [ "${2:-}" = "diff" ]; then
     shift 2
     wv_graph_diff "$@"
+    exit $?
+fi
+# wv hotzone migrate (wv-97d68a) runs here for the same reason: it relocates
+# the /tmp zone itself, needs no repository or database, and must hold no file
+# in the zone it moves; wv-config.sh would open one.
+if [ "${1:-}" = "hotzone" ] && [ "${2:-}" = "migrate" ]; then
+    shift 2
+    source "$WV_LIB_DIR/lib/wv-resolve-runtime.sh"
+    source "$WV_LIB_DIR/lib/wv-hotzone-migrate.sh"
+    wv_hotzone_migrate "$@"
     exit $?
 fi
 source "$WV_LIB_DIR/lib/wv-config.sh"
@@ -392,8 +426,9 @@ _wv_resolve_call_source() {
 # whose ancestor already holds the zone (WV_ZONE_LOCK_HELD) takes nothing.
 # hook takes nothing: it dispatches wv children that lock for themselves, and
 # session start's load is one of them. Waits up to WV_ZONE_LOCK_TIMEOUT seconds
-# (default 300), then fails loudly. No flock (macOS without util-linux) or no
-# zone directory yet: no lock, as before.
+# (default 300), then fails loudly. The lock comes from wv_lock_fd (flock(1),
+# else python3 fcntl on the fd); with neither, the command refuses rather than
+# write unlocked (wv-7faa60). No zone directory yet: nothing to lock.
 _wv_zone_lock() {
     local cmd="$1" mode=-s lockfile fd
     [ "$cmd" != "hook" ] || return 0
@@ -401,15 +436,17 @@ _wv_zone_lock() {
         load|init) mode=-x ;;
         *) _wv_cap_invalidate "$cmd" "" || return 0 ;;
     esac
-    command -v flock >/dev/null 2>&1 || return 0
     [ -n "${WV_HOT_ZONE:-}" ] && [ -d "$WV_HOT_ZONE" ] || return 0
     lockfile="$WV_HOT_ZONE/.write.lock"
     [ "${WV_ZONE_LOCK_HELD:-}" != "$lockfile" ] || return 0
     # Braced: on a bare exec, 2>/dev/null would silence this process's stderr
     # for the rest of the call.
     { exec {fd}>>"$lockfile"; } 2>/dev/null || return 0
-    if ! flock "$mode" -w "${WV_ZONE_LOCK_TIMEOUT:-300}" "$fd"; then
+    local lrc=0
+    wv_lock_fd "$fd" "$mode" "${WV_ZONE_LOCK_TIMEOUT:-300}" || lrc=$?
+    if [ "$lrc" -ne 0 ]; then
         exec {fd}>&-
+        [ "$lrc" -ne 2 ] || { echo "wv: $cmd did not run: the hot-zone write lock cannot be taken." >&2; return 1; }
         if [ "$mode" = -x ]; then
             echo "wv: the hot zone is in use by another wv process (${WV_ZONE_LOCK_TIMEOUT:-300}s); $cmd did not run. Retry once it finishes." >&2
             return 75
@@ -528,7 +565,7 @@ if [[ -n "${WV_CALL_LOG:-}" ]] || wv_attempt_journal_enabled; then
         if command -v uuidgen >/dev/null 2>&1; then
             uuidgen
         else
-            printf 'wv-%s-%s-%s' "$(date +%s%N)" "$$" "$RANDOM"
+            printf 'wv-%s-%s-%s' "$(wv_now ns || date +%s)" "$$" "$RANDOM"
         fi
     }
     _wv_byte_length() {
@@ -605,8 +642,7 @@ if [[ -n "${WV_CALL_LOG:-}" ]] || wv_attempt_journal_enabled; then
         if [ -n "$cache" ] && [ -r "$cache" ]; then
             read -r cached_signature cached_digest cached_count < "$cache" 2>/dev/null || true
             if [ -n "${cached_signature:-}" ] && [ -n "${cached_digest:-}" ] && [[ "${cached_count:-}" =~ ^[0-9]+$ ]]; then
-                signature=$(LC_ALL=C find -P "$root" -type f -not -path '*/.staging-*' -printf '%P\t%s\t%T@\n' 2>/dev/null \
-                    | LC_ALL=C sort | sha256sum) || return 1
+                signature=$(set -o pipefail; wv_delta_file_listing "$root" | sha256sum) || return 1
                 signature="${signature%% *}"
                 if [ "$signature" = "$cached_signature" ]; then
                     printf 'delta_catalog_frontier\tpresent\t%s\t%s\n' "$cached_count" "$cached_digest"
@@ -614,12 +650,19 @@ if [[ -n "${WV_CALL_LOG:-}" ]] || wv_attempt_journal_enabled; then
                 fi
             fi
         fi
-        listing=$(LC_ALL=C find -P "$root" -type f -not -path '*/.staging-*' -printf '%P\t%s\t%T@\n' 2>/dev/null | LC_ALL=C sort) || return 1
+        # No find -printf (GNU-only, wv-8ea297); a walk that fails is a
+        # refusal, never an empty catalog hashed as real.
+        listing=$(wv_delta_file_listing "$root") || return 1
         count=$(printf '%s\n' "$listing" | grep -c . || true)
         signature=$(sha256sum <<<"$listing") || return 1
         signature="${signature%% *}"
-        digest=$( (cd "$root" && LC_ALL=C find -P . -type f -not -path '*/.staging-*' -printf '%P\0' 2>/dev/null | LC_ALL=C sort -z | xargs -0 -r sha256sum) \
-            | awk '{printf "%s\t%s\n", $2, $1}' | LC_ALL=C sort | sha256sum) || return 1
+        # The leading ./ is dropped in awk so the digest is the one the old
+        # %P walk produced: an identity, not a format, so it must not move.
+        # xargs runs a binary, not the sha256sum function (wv-7d7d41)
+        _wv_hash_cmd sha256 || return 1
+        digest=$(set -o pipefail
+            (cd "$root" && LC_ALL=C find -P . -type f -not -path '*/.staging-*' -print0 | LC_ALL=C sort -z | xargs -0 -r "${_WV_HASH_CMD[@]}") \
+            | awk '{ p = $2; sub(/^\.\//, "", p); printf "%s\t%s\n", p, $1 }' | LC_ALL=C sort | sha256sum) || return 1
         digest="${digest%% *}"
         if [ -n "$cache" ]; then
             { printf '%s %s %s\n' "$signature" "$digest" "$count" > "$cache.$$" \
@@ -634,10 +677,18 @@ if [[ -n "${WV_CALL_LOG:-}" ]] || wv_attempt_journal_enabled; then
     # a copy that restores an old mtime still moves ctime.
     _wv_identity_db_key() {
         local wal_size key
-        wal_size=$(stat -c %s -- "$WV_DB-wal" 2>/dev/null || echo 0)
+        wal_size=$(wv_stat size "$WV_DB-wal" || echo 0)
         [ "$wal_size" = 0 ] || return 1
-        key=$(stat -c '%d:%i %s %.9Y %.9Z' -- "$WV_DB" 2>/dev/null) || return 1
-        printf '%s\n' "${key//./}"
+        if key=$(stat -c '%d:%i %s %.9Y %.9Z' -- "$WV_DB" 2>/dev/null) \
+                && [[ "$key" =~ ^[0-9]+:[0-9]+\ [0-9]+\ [0-9]+\.[0-9]{9}\ [0-9]+\.[0-9]{9}$ ]]; then
+            printf '%s\n' "${key//./}"
+            return 0
+        fi
+        # BSD stat gives whole seconds (wv-372560): ctime is rounded up, so the
+        # racy-write check below stays on the side of not caching.
+        key=$(stat -f '%d:%i %z %m %c' -- "$WV_DB" 2>/dev/null) \
+            && [[ "$key" =~ ^([0-9]+:[0-9]+\ [0-9]+)\ ([0-9]+)\ ([0-9]+)$ ]] || return 1
+        printf '%s %s000000000 %s000000000\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "$(( BASH_REMATCH[3] + 1 ))"
     }
     # graph_rows digest: a 4 MB dump and hash of every row on a 1700-node graph,
     # about 160 ms, paid twice per call, which made a logged wv call cost about
@@ -656,7 +707,7 @@ if [[ -n "${WV_CALL_LOG:-}" ]] || wv_attempt_journal_enabled; then
         # Same rule as the delta-catalog cache: this repository's hot zone only.
         cache=""
         [ -n "${WV_HOT_ZONE:-}" ] && [ -d "$WV_HOT_ZONE" ] && cache="$WV_HOT_ZONE/graph-rows-digest"
-        started=$(date +%s%N)
+        wv_now ns started || return 1
         if key=$(_wv_identity_db_key) && [ -r "$cache" ]; then
             IFS=$'\t' read -r cached_db cached_key cached_rows < "$cache" 2>/dev/null || true
             if [ "${cached_db:-}" = "$WV_DB" ] && [ "${cached_key:-}" = "$key" ] \
@@ -665,7 +716,7 @@ if [[ -n "${WV_CALL_LOG:-}" ]] || wv_attempt_journal_enabled; then
                 return 0
             fi
         fi
-        snapshot=$(sqlite3 -readonly "$WV_DB" 2>/dev/null <<'SQL'
+        snapshot=$(sqlite3 -cmd "PRAGMA query_only=1" "file:$WV_DB?mode=rw" 2>/dev/null <<'SQL'
 BEGIN;
 SELECT json_array('node', id, text, status, json(metadata), alias, created_at, updated_at,
                   lineage_actor, lineage_seq)
@@ -696,7 +747,7 @@ SQL
         local weave_dir="${WEAVE_DIR:-}"
         if [[ -z "${WV_DB:-}" || ! -f "$WV_DB" ]] \
             || ! command -v sqlite3 >/dev/null 2>&1 \
-            || ! command -v sha256sum >/dev/null 2>&1; then
+            || ! _wv_hash_cmd sha256; then
             _wv_unavailable_json "WV_DB not resolvable or causal identity tools unavailable"
             return 0
         fi
@@ -937,12 +988,12 @@ SQL
         if read -r _u _ 2>/dev/null < /proc/uptime && [[ "$_u" =~ ^([0-9]+)\.([0-9]{2})$ ]]; then
             printf -v "$1" '%s' "$(( 10#${BASH_REMATCH[1]} * 1000 + 10#${BASH_REMATCH[2]} * 10 ))"
         else
-            printf -v "$1" '%s' "$(date +%s%3N)"
+            wv_now ms "$1" || printf -v "$1" '%s' 0
         fi
     }
     _wv_ts_start=0
     _wv_mono_ms _wv_ts_start
-    _wv_ts_epoch=$(date +%s.%6N)
+    wv_now us _wv_ts_epoch || _wv_ts_epoch="$(date +%s).000000"
     _wv_argv=$(_wv_argv_json "$@")
     # One frontier walk for a call that cannot write (wv-1b2a92, judge panel
     # docs/findings/judge-identity-walk-2026-11-01: all three judges agree). The
@@ -965,7 +1016,7 @@ SQL
     # tools the identity is "unavailable" and a walk would be wasted.
     if [ -n "$_wv_read_only" ] && [ -n "${WEAVE_DIR:-}" ] && [ -d "$WEAVE_DIR" ] \
         && [ -n "${WV_DB:-}" ] && [ -f "$WV_DB" ] \
-        && command -v sqlite3 >/dev/null 2>&1 && command -v sha256sum >/dev/null 2>&1; then
+        && command -v sqlite3 >/dev/null 2>&1 && _wv_hash_cmd sha256; then
         _WV_FRONTIER_LINE=$(_wv_identity_delta_frontier_line "$WEAVE_DIR/deltas") || unset _WV_FRONTIER_LINE
     fi
     _wv_graph_before=$(_wv_causal_identity_json)
@@ -1001,7 +1052,7 @@ SQL
         case "$max" in ''|*[!0-9]*) return 0 ;; esac
         [ "$max" -gt 0 ] || return 0
         local size
-        size=$(stat -c %s "$WV_CALL_LOG" 2>/dev/null) || return 0
+        size=$(wv_stat size "$WV_CALL_LOG") || return 0
         [ "$size" -gt "$max" ] || return 0
         mv -f "$WV_CALL_LOG" "$WV_CALL_LOG.1" 2>/dev/null || return 0
     }
@@ -1064,11 +1115,17 @@ SQL
         [ -n "${_wv_parent_call_id:-}" ] &&
             _wv_parent_json="\"$(_wv_json_escape "$_wv_parent_call_id")\""
         [[ -n "${WV_CALL_LOG:-}" ]] && _wv_rotate_call_log
+        # A gate pool's tag (WV_GATE_POOL_TAG) marks the rows its suites write,
+        # so its call-log guard judges only its own (wv-4cbc3a); absent outside
+        # a gate, so ordinary rows keep their shape.
+        _wv_gate_pool_json=""
+        [ -n "${WV_GATE_POOL_TAG:-}" ] &&
+            _wv_gate_pool_json=",\"gate_pool\":\"$(_wv_json_escape "$WV_GATE_POOL_TAG")\""
         [[ -n "${WV_CALL_LOG:-}" ]] &&
         # Braced group: stderr is silenced before the >> open is attempted, so an
         # unwritable log path (read-only FS, missing dir) cannot leak bash errors.
-        { printf '{"ts":%s,"cmd":"wv %s","stdout_bytes":%d,"stderr_bytes":%d,"elapsed_ms":%d,"source":"%s","call_id":"%s","parent_call_id":%s,"workflow_id":"%s","trace_id":"%s","repo_root":"%s","exit_status":%d,"argv":%s,"graph_identity_before":%s,"graph_identity_after":%s,"policy_revision":%s}\n' \
-            "$_wv_ts_epoch" "$(_wv_json_escape "$_wv_cmd")" "$_wv_stdout_bytes" "$_wv_stderr_bytes" "$_wv_elapsed" "$(_wv_json_escape "$_wv_source")" "$(_wv_json_escape "$_wv_call_id")" "$_wv_parent_json" "$(_wv_json_escape "$_wv_workflow_id")" "$(_wv_json_escape "$_wv_trace_id")" "$(_wv_json_escape "$_wv_repo_root")" "$_wv_exit" "$_wv_argv" "$_wv_graph_before" "$_wv_graph_after" "$_wv_policy_revision" \
+        { printf '{"ts":%s,"cmd":"wv %s","stdout_bytes":%d,"stderr_bytes":%d,"elapsed_ms":%d,"source":"%s","call_id":"%s","parent_call_id":%s,"workflow_id":"%s","trace_id":"%s","repo_root":"%s","exit_status":%d,"argv":%s,"graph_identity_before":%s,"graph_identity_after":%s,"policy_revision":%s%s}\n' \
+            "$_wv_ts_epoch" "$(_wv_json_escape "$_wv_cmd")" "$_wv_stdout_bytes" "$_wv_stderr_bytes" "$_wv_elapsed" "$(_wv_json_escape "$_wv_source")" "$(_wv_json_escape "$_wv_call_id")" "$_wv_parent_json" "$(_wv_json_escape "$_wv_workflow_id")" "$(_wv_json_escape "$_wv_trace_id")" "$(_wv_json_escape "$_wv_repo_root")" "$_wv_exit" "$_wv_argv" "$_wv_graph_before" "$_wv_graph_after" "$_wv_policy_revision" "$_wv_gate_pool_json" \
             >> "$WV_CALL_LOG"; } 2>/dev/null || true
         return "$rc"
     }

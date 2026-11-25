@@ -118,7 +118,19 @@ cmd_init() {
     # Guard against reinitializing over existing data
     if [ -f "$WV_DB" ]; then
         local count
-        count=$(sqlite3 -cmd ".timeout 5000" "$WV_DB" "SELECT COUNT(*) FROM nodes;" 2>/dev/null || echo "0")
+        # Unreadable is not empty (wv-4ccc98): a busy or damaged database
+        # read as 0 nodes and was initialised over.
+        if ! count=$(sqlite3 -cmd ".timeout 5000" "$WV_DB" "SELECT COUNT(*) FROM nodes;" 2>/dev/null) \
+            || ! [[ "$count" =~ ^[0-9]+$ ]]; then
+            if [ -s "$WV_DB" ]; then
+                wv_policy_verdict init_preserves_existing_graph deny yes "" \
+                    "the existing database could not be read, so it may hold a graph"
+                echo -e "${RED}Error: cannot read the existing database $WV_DB to check it is empty.${NC}" >&2
+                echo "Use 'wv load' to rebuild it from .weave/, or move it aside and retry; 'wv init --force' destroys it." >&2
+                return 1
+            fi
+            count=0
+        fi
         if [ "$count" -gt 0 ]; then
             wv_policy_verdict init_preserves_existing_graph deny yes "" \
                 "initialising over a graph holding nodes destroys it"
@@ -175,6 +187,57 @@ _do_unblock_cascade() {
             );
         "
     fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# _blocks_targets_of — Targets of the blocks edges leaving the given nodes
+# Args: node IDs. Prints one target ID per line. Call it BEFORE the edges go:
+# _recompute_blocked_targets needs these IDs and the edges no longer name them.
+# ═══════════════════════════════════════════════════════════════════════════
+
+_blocks_targets_of() {
+    [ $# -gt 0 ] || return 0
+    local in_list="" one
+    for one in "$@"; do
+        [ -n "$one" ] || continue
+        in_list+="${in_list:+,}'$(sql_escape "$one")'"
+    done
+    [ -n "$in_list" ] || return 0
+    db_query "SELECT DISTINCT target FROM edges WHERE type='blocks' AND source IN ($in_list);"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# _recompute_blocked_targets — Unblock the given nodes once no open blocker is left
+# The target-keyed counterpart of _do_unblock_cascade, for every path that
+# removes a blocks edge or a blocker node (wv unlink, wv delete, wv prune,
+# wv clean-ghosts; wv-81338c). _do_unblock_cascade's targeted mode finds its
+# targets through the blocker's edges, which these paths have already deleted.
+# Only nodes that held a blocks edge are passed in, so a status the user set
+# by hand on an edgeless node is never touched.
+# Args: node IDs (the former targets). Prints the IDs it moved to todo.
+# ═══════════════════════════════════════════════════════════════════════════
+
+_recompute_blocked_targets() {
+    [ $# -gt 0 ] || return 0
+    local in_list="" one
+    for one in "$@"; do
+        [ -n "$one" ] || continue
+        in_list+="${in_list:+,}'$(sql_escape "$one")'"
+    done
+    [ -n "$in_list" ] || return 0
+    db_query "
+        UPDATE nodes SET status='todo', updated_at=CURRENT_TIMESTAMP
+        WHERE status='blocked'
+        AND id IN ($in_list)
+        AND NOT EXISTS (
+            SELECT 1 FROM edges e
+            JOIN nodes blocker ON e.source = blocker.id
+            WHERE e.target = nodes.id
+            AND e.type = 'blocks'
+            AND blocker.status != 'done'
+        )
+        RETURNING id;
+    "
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -666,7 +729,7 @@ cmd_add() {
         id="$reconstruct_id"
     else
         wv_policy_verdict reconstruct_never_overwrites allow no "" "a new id, nothing to overwrite"
-        id=$(generate_id)
+        id=$(generate_id) || return 1
     fi
     local original_text="$text"
     local original_metadata="$metadata"
@@ -939,8 +1002,19 @@ _memory_render_codex_json() {
         printf '%s\n' '{"schema":"weave.codex.v1"}' > "$path"
     fi
     tmp=$(mktemp "$target_dir/.weave-memory.XXXXXX")
+    # The wv a command names follows the repository (wv-dce969), as install.sh
+    # writes it: the source checkout's own scripts/wv, or a consumer's installed
+    # binary. Rendering ./scripts/wv into a consumer reverted init-repo's
+    # choice on every sync.
+    local repo_root codex_wv
+    # shellcheck disable=SC2016  # $HOME is written literally, expanded by the reader
+    codex_wv='$HOME/.local/bin/wv'
+    repo_root=$(cd "$target_dir/.." 2>/dev/null && pwd) || repo_root=""
+    if [ -n "$repo_root" ] && [ -x "$repo_root/scripts/wv" ] && [ -f "$repo_root/scripts/lib/wv-config.sh" ]; then
+        codex_wv='./scripts/wv'
+    fi
     # Entries grow with the graph's memories: --slurpfile, not argv (wv-200d36).
-    if ! jq --slurpfile entries <(printf '%s' "$entries") '
+    if ! jq --arg wv "$codex_wv" --slurpfile entries <(printf '%s' "$entries") '
         $entries[0] as $entries
         | . + {
             memory: {
@@ -948,23 +1022,23 @@ _memory_render_codex_json() {
                 lifecycle_field: "metadata.mem_status",
                 policy: "codex-local memory is evidence; weave graph is authority",
                 recall: {
-                    command: "./scripts/wv memory recall --agent=all --json",
+                    command: ($wv + " memory recall --agent=all --json"),
                     fallback: "$HOME/.local/bin/wv memory recall --agent=all --json"
                 },
                 capture: {
-                    command: "./scripts/wv remember --json",
+                    command: ($wv + " remember --json"),
                     fallback: "$HOME/.local/bin/wv remember --json"
                 },
                 scan: {
-                    command: "./scripts/wv memory scan --source=codex --json",
+                    command: ($wv + " memory scan --source=codex --json"),
                     fallback: "$HOME/.local/bin/wv memory scan --source=codex --json"
                 },
                 import: {
-                    command: "./scripts/wv memory import --source=codex --json",
+                    command: ($wv + " memory import --source=codex --json"),
                     fallback: "$HOME/.local/bin/wv memory import --source=codex --json"
                 },
                 crystallize: {
-                    command: "./scripts/wv memory crystallize --json",
+                    command: ($wv + " memory crystallize --json"),
                     fallback: "$HOME/.local/bin/wv memory crystallize --json"
                 },
                 entries: $entries
@@ -1350,7 +1424,7 @@ _memory_import_claude_dir() {
             continue
         fi
         earlier=$(_memory_earlier_imports "$file")
-        id=$(generate_id)
+        id=$(generate_id) || return 1
         metadata=$(jq -nc \
             --arg repo_root "$repo_root" \
             --arg source_path "$file" \
@@ -1420,7 +1494,7 @@ _memory_import_codex() {
         fi
         # A thread whose output Codex rewrote: same row path and thread.
         earlier=$(_memory_earlier_imports "$source_path" "$source_session")
-        id=$(generate_id)
+        id=$(generate_id) || return 1
         metadata=$(jq -nc \
             --arg repo_root "$repo_root" \
             --arg source_path "$source_path" \
@@ -1660,7 +1734,7 @@ _memory_crystallize_finding() {
     # (wv-b3d2b6).
     id=$(_memory_contradiction_finding "$cand" "$other" open)
     if [ -n "$id" ]; then echo "$id"; return 0; fi
-    id=$(generate_id)
+    id=$(generate_id) || return 1
     metadata=$(jq -nc --arg cand "$cand" --arg other "$other" \
         '{
             type: "finding",
@@ -1821,7 +1895,7 @@ cmd_remember() {
     fi
 
     local id metadata text_sql metadata_sql now
-    id=$(generate_id)
+    id=$(generate_id) || return 1
     now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     metadata=$(jq -nc \
         --arg kind "$kind" \
@@ -2988,8 +3062,8 @@ _done_can_prompt_overlap() { # predicate
 _done_polarity() {
     local text="$1"
     local pos neg
-    pos=$(echo "$text" | grep -oiE '\b(use|prefer|enable|require|always|must|should|adopt|keep|do)\b' | wc -l)
-    neg=$(echo "$text" | grep -oiE '\b(avoid|never|disable|forbid|don.?t|do not|must not|should not|cannot|stop|drop|remove|deprecate)\b' | wc -l)
+    pos=$(( $(echo "$text" | grep -oiE '\b(use|prefer|enable|require|always|must|should|adopt|keep|do)\b' | wc -l) ))
+    neg=$(( $(echo "$text" | grep -oiE '\b(avoid|never|disable|forbid|don.?t|do not|must not|should not|cannot|stop|drop|remove|deprecate)\b' | wc -l) ))
     if [ "$pos" -gt "$neg" ]; then echo 1
     elif [ "$neg" -gt "$pos" ]; then echo -1
     else echo 0
@@ -3721,7 +3795,7 @@ _done_build_scope() {
             scope_json=$(jq -c --arg p "$scope_path" '. + [$p] | unique' <<< "$scope_json")
         done
         [ "$(jq 'length' <<< "$scope_json")" -gt 0 ] || { echo -e "${RED}Error: --completion-files cannot be empty${NC}" >&2; return 1; }
-        scope_object=$(jq -cn --slurpfile files <(printf '%s' "$scope_json") --arg set_at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" --arg attempt_id "$(date +%s%N)-$$-$RANDOM" '{files:$files[0],set_at:$set_at,attempt_id:$attempt_id}')
+        scope_object=$(jq -cn --slurpfile files <(printf '%s' "$scope_json") --arg set_at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" --arg attempt_id "$(wv_now ns)-$$-$RANDOM" '{files:$files[0],set_at:$set_at,attempt_id:$attempt_id}')
         scope_esc=$(sql_escape "$scope_object")
     fi
     return 0
@@ -3826,7 +3900,7 @@ _done_apply_learning_and_tools() {
     # Store learning in metadata if provided
     if [ -n "$learning" ]; then
         # Strip ANSI escape codes (color sequences leak from terminal output)
-        learning=$(printf '%s' "$learning" | sed 's/\x1b\[[0-9;]*[a-zA-Z]//g')
+        learning=$(printf '%s' "$learning" | LC_ALL=C sed $'s/\e\\[[0-9;]*[a-zA-Z]//g')
         _done_store_learning "$id" "$learning" "$acknowledge_overlap" "$no_overlap_check" \
             "$decision" "$pattern" "$pitfall"
         if [ "$_done_pending_close" = true ]; then
@@ -4463,7 +4537,7 @@ _work_retires_sweep() {
         if [ -z "$hits" ]; then
             echo -e "${CYAN}Retires $entry: no references to '$name' in tests/ install.sh templates/ scripts/${NC}" >&2
         else
-            echo -e "${CYAN}Retires $entry: $(printf '%s\n' "$hits" | wc -l) reference(s) to '$name' - review each before editing:${NC}" >&2
+            echo -e "${CYAN}Retires $entry: $(( $(printf '%s\n' "$hits" | wc -l) )) reference(s) to '$name' - review each before editing:${NC}" >&2
             printf '%s\n' "$hits" >&2
         fi
     done
@@ -4632,7 +4706,7 @@ cmd_work() {
             WHERE id = '$id';" 2>/dev/null || true
         if [ -n "${WV_CALL_LOG:-}" ]; then
             printf '{"ts":%s,"cmd":"wv work","event":"reopen_done_node","node_id":"%s","source":"shell"}\n' \
-                "$(date +%s.%6N)" "$id" >> "$WV_CALL_LOG" 2>/dev/null || true
+                "$(wv_now us)" "$id" >> "$WV_CALL_LOG" 2>/dev/null || true
         fi
     fi
 
@@ -5297,7 +5371,7 @@ _render_trails() {
     if [ -n "$at" ] && [ -f "$snapshot" ]; then
         local start_ts entry_ts
         IFS=$'\t' read -r start_ts _ < "$snapshot"
-        entry_ts=$(date -d "$at" +%s 2>/dev/null || echo "")
+        entry_ts=$(wv_date_epoch "$at" || echo "")
         if [ -n "$entry_ts" ] && [[ "$start_ts" =~ ^[0-9]+$ ]] && [ "$entry_ts" -lt "$start_ts" ]; then
             stale="  ${YELLOW}⚠ stale — verify${NC}"
         fi
@@ -5338,7 +5412,7 @@ _node_close_time() {
         jq -nc '{closed_at: null, reason: "not a git repository: no committed graph history to derive it from"}'
         return 0
     }
-    rel=$(realpath --relative-to="$root" "$WEAVE_DIR/nodes.jsonl" 2>/dev/null) || rel=".weave/nodes.jsonl"
+    rel=$(wv_relpath "$root" "$WEAVE_DIR/nodes.jsonl") || rel=".weave/nodes.jsonl"
     local last="" first_seen=""
     while IFS= read -r commit; do
         [ -n "$commit" ] || continue
@@ -6374,7 +6448,7 @@ cmd_quick() {
         return 1
     fi
 
-    local id=$(generate_id)
+    local id; id=$(generate_id) || return 1
 
     # Step 1: Create node as ACTIVE and CLAIMED by this actor, so the
     # pre-commit hook admits the commit: since 7eff88740 it admits a commit
@@ -6903,7 +6977,7 @@ cmd_delete() {
         wv_policy_verdict delete_preserves_children allow yes --force "deleted a node with children, orphaning them"
     elif [ -n "$children" ]; then
         local child_count
-        child_count=$(echo "$children" | wc -l)
+        child_count=$(( $(echo "$children" | wc -l) ))
         wv_policy_verdict delete_preserves_children deny yes "" "deleting a node with children orphans them"
         echo -e "${RED}Error: node $id has $child_count child node(s):${NC}" >&2
         echo "$children" | while read -r child_id; do
@@ -6972,6 +7046,9 @@ cmd_delete() {
     local connected
     connected=$(db_query "SELECT DISTINCT source FROM edges WHERE target='$id' UNION SELECT DISTINCT target FROM edges WHERE source='$id';" | tr '\n' ' ')
     affected_nodes="$affected_nodes $connected"
+    # Nodes this one blocks: their status is recomputed once it is gone (wv-81338c).
+    local _del_blocked
+    _del_blocked=$(_blocks_targets_of "$id") || return 1
 
     # Capture lineage BEFORE the DELETEs so the deletion tombstones carry the
     # highest lineage each row held (wv-0d5e07).
@@ -6991,6 +7068,13 @@ cmd_delete() {
         COMMIT;"; then
         echo -e "${RED}Error: could not delete node $id${NC}" >&2
         return 1
+    fi
+    if [ -n "$_del_blocked" ]; then
+        # shellcheck disable=SC2086  # one ID per word
+        _recompute_blocked_targets $_del_blocked >/dev/null || {
+            echo -e "${RED}Error: deleted $id but could not recompute the status of: $_del_blocked${NC}" >&2
+            return 1
+        }
     fi
 
     # Re-dump state.sql with the tombstones immediately

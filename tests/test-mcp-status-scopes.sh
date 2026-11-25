@@ -52,7 +52,10 @@ scope_field() { # json scope field
 # may not have started an otherwise configured server yet.
 : > "$TMP/no-processes"
 export MCP_PROCESS_FIXTURE="$TMP/no-processes"
-no_server=$(cd "$ROOT" && "$WV" mcp-status --json)
+# This suite judges per-scope process status, not the overall verdict:
+# mcp-status exits 1 when any other check fails, such as the server version
+# (wv-4cdc07), and under set -e that ended the suite with no output at all.
+no_server=$(cd "$ROOT" && "$WV" mcp-status --json) || true
 assert_eq "scope,expected,running,duplicate,status" \
     "$(jq -r '.status_report.per_scope_required_fields | join(",")' "$ROOT/mcp/contract.json")" \
     "contract freezes the per-scope field set"
@@ -73,14 +76,14 @@ cat > "$TMP/duplicates" <<'EOF'
 103 node /opt/weave/mcp/dist/index.js --scope=session
 EOF
 export MCP_PROCESS_FIXTURE="$TMP/duplicates"
-duplicates=$(cd "$ROOT" && "$WV" mcp-status --json)
+duplicates=$(cd "$ROOT" && "$WV" mcp-status --json) || true
 assert_eq 2 "$(scope_field "$duplicates" lite running)" "same-scope processes are counted"
 assert_eq true "$(scope_field "$duplicates" lite duplicate)" "same-scope excess is duplicate"
 assert_eq stale "$(scope_field "$duplicates" lite status)" "duplicate scope is stale"
 assert_eq 1 "$(scope_field "$duplicates" session running)" "independent scope count is preserved"
 assert_eq running "$(scope_field "$duplicates" session status)" "single process is running"
 
-text=$(cd "$ROOT" && "$WV" mcp-status)
+text=$(cd "$ROOT" && "$WV" mcp-status) || true
 assert_contains "$text" "lite expected/stale (2)" "text output identifies stale scope concisely"
 assert_contains "$text" "restart duplicate scope(s) lite:2" "text output gives duplicate remediation"
 

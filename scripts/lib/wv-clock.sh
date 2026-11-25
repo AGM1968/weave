@@ -25,6 +25,13 @@
 # "<ms> <kind>" lines; each reading takes the first line and removes it, so a
 # test can make two clocks diverge mid-interval or step one back.
 
+# Wall-clock readings come from wv_now in the resolver, beside this file
+# (BSD date prints %N literally, wv-99f296); it has no side effects on source.
+if ! declare -F wv_now >/dev/null; then
+    # shellcheck source=scripts/lib/wv-resolve-runtime.sh
+    . "${BASH_SOURCE[0]%/*}/wv-resolve-runtime.sh"
+fi
+
 # wv_clock_ms <ms-var> <kind-var> — one reading of the best clock available.
 wv_clock_ms() {
     local _wc_v="" _wc_k="" _wc_u _wc_rest
@@ -42,7 +49,7 @@ wv_clock_ms() {
                 _wc_v=$(( 10#${BASH_REMATCH[1]} * 1000 + 10#${BASH_REMATCH[2]} * 10 ))
                 _wc_k=boottime
             else
-                _wc_v=$(date +%s%3N 2>/dev/null)
+                _wc_v=$(wv_now ms 2>/dev/null)
                 _wc_k=wall
             fi
         fi
@@ -79,7 +86,7 @@ wv_clock_since() {
 if ! declare -F hook_duration_ms >/dev/null; then
     hook_duration_ms() {
         local _t0="$1" _t1 _d
-        _t1=$(date +%s%N 2>/dev/null || echo 0)
+        _t1=$(wv_now ns 2>/dev/null || echo 0)
         case "$_t0" in ''|*[!0-9]*) echo 0; return 0 ;; esac
         case "$_t1" in ''|*[!0-9]*) echo 0; return 0 ;; esac
         [ "$_t0" = "0" ] && { echo 0; return 0; }

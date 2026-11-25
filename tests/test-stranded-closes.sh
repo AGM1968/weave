@@ -69,7 +69,7 @@ commit_graph fixture
 for _id in "$A" "$B" "$C" "$D"; do
     [[ "$_id" =~ ^wv-[0-9a-f]{6}$ ]] || { echo "fixture: a node was not created"; exit 1; }
 done
-[ "$(printf '%s\n' "$A" "$B" "$C" "$D" | sort -u | wc -l)" -eq 4 ] || { echo "fixture: node ids repeat"; exit 1; }
+[ "$(( $(printf '%s\n' "$A" "$B" "$C" "$D" | sort -u | wc -l) ))" -eq 4 ] || { echo "fixture: node ids repeat"; exit 1; }
 
 echo "--- controls ---"
 expect "no close at all: clean" clean

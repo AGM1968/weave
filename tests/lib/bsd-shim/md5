@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+: "${WV_BSD_SHIM_REAL:=${0%/*}/../real}"  # env -i drops the export; this stand-in sits in bin/ beside real/ (wv-43082a)
+# BSD md5 stand-in (wv-7d7d41), from GNU md5sum: a file prints
+# "MD5 (<file>) = <hex>", standard input the bare digest; -q prints only the
+# digest, -r prints "<hex> <file>".
+quiet=0 rev=0
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -q) quiet=1 ;; -r) rev=1 ;; --) shift; break ;;
+        -?*) echo "md5: illegal option -- ${1#-}" >&2; exit 1 ;;
+        *) break ;;
+    esac
+    shift
+done
+if [ "$#" -eq 0 ]; then
+    h=$("$WV_BSD_SHIM_REAL/md5sum") || exit 1
+    echo "${h%% *}"; exit 0
+fi
+rc=0
+for f in "$@"; do
+    if ! h=$("$WV_BSD_SHIM_REAL/md5sum" -- "$f" 2>/dev/null); then
+        echo "md5: $f: No such file or directory" >&2; rc=1; continue
+    fi
+    h=${h%% *}
+    if [ "$quiet" -eq 1 ]; then echo "$h"
+    elif [ "$rev" -eq 1 ]; then echo "$h $f"
+    else echo "MD5 ($f) = $h"; fi
+done
+exit "$rc"

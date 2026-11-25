@@ -103,27 +103,52 @@ check "the replacement holds state.sql" "3" "$(nodes)"
 
 # 3. A healthy file held locked past the timeout is refused, never replaced
 # out from under its holder.
-fixture
+# load_while_locked — run wv load while a holder keeps the live database in
+# BEGIN EXCLUSIVE until the load has finished; sets load_err and load_rc. The
+# hold ends on a signal, not a fixed time: the load's own timeouts (snapshot,
+# restore) outlast a fixed hold on a slower host (12 s expired on the macOS
+# runner, so the restore ran unlocked and passed, wv-800cc9).
 lock_ready="$TEST_DIR/lock-ready"
-python3 - "$WV_DB" "$lock_ready" <<'EOF' &
-import sqlite3, sys, time
+load_while_locked() {
+    rm -f "$lock_ready" "$TEST_DIR/load-done"
+    python3 - "$WV_DB" "$lock_ready" "$TEST_DIR/load-done" <<'EOF' &
+import os, sqlite3, sys, time
 con = sqlite3.connect(sys.argv[1], isolation_level=None)
 con.execute("BEGIN EXCLUSIVE")
 open(sys.argv[2], "w").close()
-time.sleep(12)
+deadline = time.monotonic() + 90
+while not os.path.exists(sys.argv[3]) and time.monotonic() < deadline:
+    time.sleep(0.1)
 con.execute("ROLLBACK")
 EOF
-holder=$!
-for _ in $(seq 1 50); do [ -f "$lock_ready" ] && break; sleep 0.1; done
-load_err=$("$WV" load 2>&1 >/dev/null)
-load_rc=$?
-wait "$holder" 2>/dev/null
+    local holder=$!
+    for _ in $(seq 1 50); do [ -f "$lock_ready" ] && break; sleep 0.1; done
+    load_rc=0
+    load_err=$("$WV" load 2>&1 >/dev/null) || load_rc=$?
+    : > "$TEST_DIR/load-done"
+    wait "$holder" 2>/dev/null
+}
+fixture
+load_while_locked
 [ "$load_rc" -ne 0 ] && ok "load fails while the live database is locked" \
     || bad "load fails while the live database is locked" "rc=$load_rc"
 if grep -qF -- "stayed locked" <<<"$load_err"; then ok "the failure names the lock"
 else bad "the failure names the lock" "$(tail -3 <<<"$load_err")"; fi
 check "the locked database was left intact" "ok" "$(integrity)"
 check "the locked database kept its contents" "7" "$(nodes)"
+
+# 3b. The same without WAL: a held lock also blocks the corruption check, which
+# then cannot run. That is unknown, not corrupt, so the file is still refused
+# (wv-800cc9, wv-908f9e: the macOS runner replaced it, 7 rows -> 3).
+fixture
+sqlite3 "$WV_DB" "PRAGMA journal_mode=DELETE;" >/dev/null 2>&1
+check "(control) the live database is in rollback-journal mode" "delete" "$(sqlite3 "$WV_DB" "PRAGMA journal_mode;" 2>/dev/null)"
+load_while_locked
+[ "$load_rc" -ne 0 ] && ok "without WAL, load fails while the live database is locked" \
+    || bad "without WAL, load fails while the live database is locked" "rc=$load_rc"
+if grep -qF -- "stayed locked" <<<"$load_err"; then ok "without WAL, the failure names the lock"
+else bad "without WAL, the failure names the lock" "$(tail -3 <<<"$load_err")"; fi
+check "without WAL, the locked database kept its contents" "7" "$(nodes)"
 
 # 4. init --force takes the WAL with the database. The holder keeps committed
 # frames in the WAL (no checkpoint) while init replaces the file, and exits

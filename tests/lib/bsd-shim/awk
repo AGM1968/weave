@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+: "${WV_BSD_SHIM_REAL:=${0%/*}/../real}"  # env -i drops the export; this stand-in sits in bin/ beside real/ (wv-43082a)
+# BSD awk (one-true-awk) stand-in (wv-27b2f5): the two refusals gawk and mawk
+# do not make.
+#   - a newline in a -v value or a command-line assignment: "newline in string";
+#   - under a UTF-8 locale, an input file holding a byte that is not UTF-8:
+#     "towc: multibyte conversion failure". BSD awk fails on the record it is
+#     reading; this checks the whole file, so it is stricter for a program that
+#     stops early. Standard input is not checked.
+#   - a \xNN escape in -F does not split on the byte: under macOS awk a file
+#     separated by the real byte never split on -F'\x1f' (Mac round 3 trace,
+#     wv-e6ca42). gawk and mawk decode it, so the stand-in passes the escape on
+#     as literal characters. A real Mac split on those characters neither
+#     (run 45339323254, wv-1fa160): only "not on the byte" is modelled.
+real="$WV_BSD_SHIM_REAL/awk"
+literal_x() { printf '%s' "${1//\\x/\\\\\\\\x}"; }
+refuse_newline() { printf 'awk: newline in string %s... at source line 1\n' "${1%%$'\n'*}" >&2; exit 2; }
+
+args=() files=() have_prog=0
+while [ "$#" -gt 0 ]; do
+    a=$1
+    case "$a" in
+        --) args+=("$a"); shift; break ;;
+        -v) [[ "${2:-}" == *$'\n'* ]] && refuse_newline "$2"; args+=("$a" "$2"); shift 2; continue ;;
+        -v*) [[ "$a" == *$'\n'* ]] && refuse_newline "${a#-v}" ;;
+        -F) args+=("$a" "$(literal_x "${2:-}")"); shift 2; continue ;;
+        -F*) args+=("-F$(literal_x "${a#-F}")"); shift; continue ;;
+        -f) have_prog=1; args+=("$a" "${2:-}"); shift 2; continue ;;
+        -f*) have_prog=1 ;;
+        -?*) ;;
+        *) break ;;
+    esac
+    args+=("$a"); shift
+done
+[ "$have_prog" -eq 1 ] || { [ "$#" -gt 0 ] && { args+=("$1"); shift; }; }
+for a in "$@"; do
+    if [[ "$a" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then
+        [[ "$a" == *$'\n'* ]] && refuse_newline "${a#*=}"
+    elif [ "$a" != - ]; then
+        files+=("$a")
+    fi
+done
+
+loc=${LC_ALL:-${LC_CTYPE:-${LANG:-}}}
+shopt -s nocasematch
+if [[ "$loc" == *utf-8* || "$loc" == *utf8* ]] && [ "${#files[@]}" -gt 0 ]; then
+    for f in "${files[@]}"; do
+        [ -f "$f" ] && [ -r "$f" ] || continue
+        # iconv, not grep: GNU grep -a lets '.' match an invalid byte
+        if ! "$WV_BSD_SHIM_REAL/iconv" -f UTF-8 -t UTF-8 -- "$f" >/dev/null 2>&1; then
+            printf "awk: towc: multibyte conversion failure on: '?'\n\n input record number 1, file %s\n source line number 1\n" "$f" >&2
+            exit 2
+        fi
+    done
+fi
+exec "$real" "${args[@]}" "$@"

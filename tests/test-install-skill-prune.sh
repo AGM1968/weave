@@ -25,7 +25,9 @@ mkdir -p "$T/home" "$T/bin" "$T/lib" "$T/config/skills"
 # Provenance commands can refresh an index; give them private source and a
 # Git discovery boundary, not the checkout another gate reads (wv-6900e1).
 mkdir -p "$T/src"
-git -C "$ROOT" ls-files -z | (cd "$ROOT" && tar --null -T - --ignore-failed-read -cf - 2>/dev/null) | tar -x -C "$T/src" || exit 1
+# shellcheck source=tests/lib/copy-tracked.sh
+source "$ROOT/tests/lib/copy-tracked.sh"
+copy_tracked "$ROOT" "$T/src" || exit 1
 git -C "$T/src" init -q || exit 1
 ROOT="$T/src"
 SK="$T/config/skills"
@@ -50,7 +52,8 @@ check "a procedure-projected skill is kept" "present" "$(present projected)"
 # The names install.sh ships, read with the array on one line or several. The
 # list is empty since every Weave skill became a procedure projection
 # (wv-c7f784); it stays as the path for an owner-admitted host-only skill.
-SHIPPED=$(sed -n '/^WV_CONFIG_SKILLS=(/{:a;/)/!{N;ba;};p;}' "$ROOT/install.sh" | tr '\n' ' ' \
+# awk, not sed's ':a;...;ba': BSD sed ends a label at the newline (wv-0bf286).
+SHIPPED=$(awk '/^WV_CONFIG_SKILLS=\(/ { f = 1 } f { print; if (/\)/) exit }' "$ROOT/install.sh" | tr '\n' ' ' \
     | sed 's/^WV_CONFIG_SKILLS=(//; s/).*//' | tr ' ' '\n' | grep . | sort | xargs)
 for s in $SHIPPED; do check "shipped skill $s is installed" "present" "$(present "$s")"; done
 check "the manifest records exactly what install.sh ships" "$SHIPPED" \

@@ -75,8 +75,9 @@
 #     (see wv-5d3ba8), never hand-patched;
 #   - a hot-zone DB already migrated in the wrong order does NOT self-heal on
 #     `wv load` — cmd_load's pre-flight `auto_sync --force` dumps that DB over
-#     state.sql first. Recover by removing the hot zone so the reload has no
-#     live DB to flush: `rm -rf "$WV_HOT_ZONE" && wv load`.
+#     state.sql first. Recover by moving the hot zone aside so the reload has
+#     no live DB to flush, keeping the old copy to diff (hot_zone_rebuild_advice,
+#     wv-4ccc98).
 # tests/test-data.sh guards the committed .weave/state.sql against regressing to
 # a non-db_init order.
 
@@ -165,7 +166,7 @@ _db_lineage_unrepairable_report() {
     echo "  required: (lineage_actor, lineage_seq) on both nodes and edges" >&2
     echo "  ALTER TABLE can only append, so a reversed or seq-first shape cannot be repaired in place." >&2
     echo "  wv sync and wv commit-refs cannot persist until this is fixed. Recover with:" >&2
-    echo "    rm -rf \"\$WV_HOT_ZONE\" && wv load" >&2
+    echo "    $(hot_zone_rebuild_advice 2>/dev/null || echo "move the hot zone aside (never delete it), wv load, then wv hotzone diff the old brain.db against the new one")" >&2
 }
 
 # _db_lineage_repair_pair — append what each table is missing, one ALTER per

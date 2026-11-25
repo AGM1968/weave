@@ -79,7 +79,7 @@ PY
 }
 
 doctor_line() {
-    "$WV" doctor 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | grep "delta v2 catalog" || true
+    "$WV" doctor 2>&1 | LC_ALL=C sed $'s/\e\\[[0-9;]*m//g' | grep "delta v2 catalog" || true
 }
 
 check() {

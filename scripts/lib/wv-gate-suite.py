@@ -10,6 +10,7 @@ caches. The caller's supervisor owns cancellation and scratch cleanup.
 from __future__ import annotations
 
 import argparse
+from collections.abc import Mapping
 import configparser
 import fcntl
 from fnmatch import fnmatchcase
@@ -38,9 +39,51 @@ class SuiteError(Exception):
 
 
 def digest(path: Path) -> str:
-    """Hash actual bytes rather than accepting a declared digest."""
+    """Hash actual bytes rather than accepting a declared digest.
+
+    Read in chunks, not hashlib.file_digest: that is 3.11+, and a hook on macOS
+    can run /usr/bin/python3, which is 3.9 (wv-1d6c1e).
+    """
+    sha = hashlib.sha256()
     with path.open("rb") as stream:
-        return hashlib.file_digest(stream, "sha256").hexdigest()
+        for chunk in iter(lambda: stream.read(1 << 20), b""):
+            sha.update(chunk)
+    return sha.hexdigest()
+
+
+_MODERN_BASH: dict[tuple[str, str], str] = {}
+
+
+def modern_bash(env: dict[str, str] | None = None) -> str:
+    """The one bash>=4 every shell this backend starts runs under (wv-f7fe9f).
+
+    A hook re-execs into bash>=4 (scripts/lib/wv-bash-guard.sh), but a bare
+    'bash' here resolves on PATH, and on macOS /bin/bash is 3.2. Same search
+    order as the guard, PATH's bash first; refuse by name when none is found.
+    """
+    source: Mapping[str, str] = os.environ if env is None else env
+    path = source.get("PATH", "")
+    key = (path, source.get("WV_BASH", ""))
+    too_old = source.get("WV_TEST_MODE") == "1" and source.get("WV_TEST_BASH_TOO_OLD") == "1"
+    if not too_old and key in _MODERN_BASH:
+        return _MODERN_BASH[key]
+    candidates = [source.get("WV_BASH", ""), shutil.which("bash", path=path) or "",
+                  "/opt/homebrew/bin/bash", "/usr/local/bin/bash", "/usr/bin/bash", "/bin/bash"]
+    for candidate in dict.fromkeys(filter(None, candidates)):
+        if too_old or not os.access(candidate, os.X_OK):
+            continue
+        major = subprocess.run([candidate, "-c", 'echo "${BASH_VERSINFO[0]}"'], check=False,
+                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True).stdout.strip()
+        if major.isdigit() and int(major) >= 4:
+            _MODERN_BASH[key] = candidate
+            return candidate
+    raise SuiteError("no bash 4 or newer (WV_BASH, PATH, /opt/homebrew/bin, /usr/local/bin, /usr/bin, /bin); "
+                     "on macOS /bin/bash is 3.2: install a newer one (brew install bash) or set WV_BASH to it")
+
+
+def with_bash(argv: list[str], env: dict[str, str] | None = None) -> list[str]:
+    """Bind a leading bare 'bash' in protected argv to the modern bash."""
+    return [modern_bash(env), *argv[1:]] if argv and argv[0] == "bash" else list(argv)
 
 
 def run(command: list[str], cwd: Path, env: dict[str, str], *, capture: bool = False) -> str:
@@ -158,7 +201,8 @@ def legacy_suite(entry: dict[str, Any], suite: str, catalog: dict[str, Any], cat
 
 def tool_identity(name: str, env: dict[str, str], cwd: Path) -> dict[str, str]:
     """Host toolchains are explicit residual inputs: resolved bytes and version."""
-    executable = shutil.which(name, path=env["PATH"])
+    # bash is the binary the suite runs under, not whichever is first on PATH.
+    executable = modern_bash(env) if name == "bash" else shutil.which(name, path=env["PATH"])
     if executable is None:
         raise SuiteError(f"required toolchain {name} is missing")
     path = Path(executable).resolve()
@@ -389,7 +433,7 @@ def declaration_plan(repo: Path, tree: str, base: str | None, env: dict[str, str
         # Use the existing exact-byte, mode-bound, one-use history check;
         # staged records, shallow history and replay cannot admit removal.
         library = Path(__file__).resolve().parent
-        checked = subprocess.run(["bash", "-c", '''
+        checked = subprocess.run([modern_bash(env), "-c", '''
 source "$1/wv-gate-snapshot.sh" || exit 2
 source "$1/wv-gate-lanes.sh" || exit 2
 WV_GATE_TREE=$2 WV_GATE_BASE=$3
@@ -454,7 +498,7 @@ def routed_inputs(repo: Path, tree: str, base: str, changed: set[str],
         # Use the gate's existing router, including scanners, defaults and
         # naming rules. Do not implement a second, narrower routing algorithm.
         scripts = Path(__file__).resolve().parents[1]
-        route_text = run(["bash", "-c", '''
+        route_text = run([modern_bash(env), "-c", '''
 source "$1/cmd/wv-cmd-graph.sh" || exit
 REPO_ROOT=$2 WEAVE_DIR=$5
 _IMPACT_MAP_REVS=("$3" "$4")
@@ -559,8 +603,11 @@ def describe(args: argparse.Namespace, env: dict[str, str], work: Path) -> dict[
     for path in roles["invoking"]:
         actual = scripts / path.removeprefix("scripts/") if path.startswith("scripts/") else scripts.parent / path
         invoking[path] = digest(actual) if actual.is_file() else None
-    volatile = {"_", "PWD", "OLDPWD", "SHLVL", "WV_GATE_ID", "WV_GATE_PHASE", "WV_GATE_EXECUTION_MODE",
-                "WV_GATE_TREE", "WV_GATE_BASE", "WV_GATE_POOL_TAG"}
+    # MANPATH: macOS rewrites it between the hook's plan and the suite's
+    # re-description (Mac run 44910307265; Apple's /usr/bin shims inject
+    # variables into children), and it reaches only man(1) (wv-fec472).
+    volatile = {"_", "PWD", "OLDPWD", "SHLVL", "MANPATH", "WV_GATE_ID", "WV_GATE_PHASE",
+                "WV_GATE_EXECUTION_MODE", "WV_GATE_TREE", "WV_GATE_BASE", "WV_GATE_POOL_TAG"}
     common = {"execution_mode": "frozen", "input_base": input_base, "maps": [entry for entry, _ in maps],
               "enforcement": enforcement, "invoking": invoking,
               "router_sha256": digest(scripts / "cmd/wv-cmd-graph.sh"),
@@ -584,7 +631,10 @@ def describe(args: argparse.Namespace, env: dict[str, str], work: Path) -> dict[
         if args.mode == "auto":
             identity["declaration"] = args.declaration["declaration"]
         key = "snapshot-v1:" + hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
-        plans[suite] = {"key": key, "identity": identity}
+        # Per-variable digests sit beside the key, not in it: a plan-mismatch
+        # refusal can name the variable without writing its value (wv-fec472).
+        plans[suite] = {"key": key, "identity": identity, "environment": {
+            name: hashlib.sha256(value.encode()).hexdigest()[:16] for name, value in sorted(environment.items())}}
     return {"tree": tree, "base": args.base, "authority": authority, "suites": plans}
 
 
@@ -774,7 +824,7 @@ def provision(root: Path, work: Path, policy: dict[str, Any], env: dict[str, str
         commands = recipe["run"]
         for argv in [commands] if isinstance(commands[0], str) else commands:
             verify_provision_inputs(root, work, inputs, all_artifacts)
-            run([substitute(value, root, work) for value in argv], cwd, recipe_env)
+            run(with_bash([substitute(value, root, work) for value in argv], recipe_env), cwd, recipe_env)
             verify_provision_inputs(root, work, inputs, all_artifacts)
         for output in outputs:
             if not private_path(output, root, work).exists():
@@ -823,12 +873,30 @@ def execute(args: argparse.Namespace) -> int:
                     "tree": args.tree, "base": args.base, "suite": suite, "key": None}
         args.provenance.write_text(json.dumps(identity, sort_keys=True, indent=2) + "\n")
         print(f"Weave checkout: {suite}; mutable checkout inputs; reuse disabled", flush=True)
-        return subprocess.run(["bash", str(repo / suite), *suite_args], cwd=repo, check=False).returncode
+        return subprocess.run([modern_bash(), str(repo / suite), *suite_args], cwd=repo, check=False).returncode
     env = private_environment(repo, work)
     if args.describe:
         args.provenance.write_text(json.dumps(describe(args, env, work), sort_keys=True, indent=2) + "\n")
         return 0
     return execute_frozen(args, policy, env, work)
+
+
+def plan_differences(expected: Any, actual: Any, prefix: str = "") -> list[str]:
+    """Name each differing leaf of two plans, with short values (wv-fec472)."""
+    if isinstance(expected, dict) and isinstance(actual, dict):
+        found: list[str] = []
+        for name in sorted(expected.keys() | actual.keys(), key=str):
+            if name not in expected or name not in actual:
+                found.append(f"{prefix}{name} {'added' if name in actual else 'missing'}")
+            else:
+                found += plan_differences(expected[name], actual[name], f"{prefix}{name}.")
+        return found
+    if expected == actual:
+        return []
+    def short(value: Any) -> str:
+        text = json.dumps(value, sort_keys=True)
+        return text if len(text) <= 80 else text[:77] + "..."
+    return [f"{prefix.rstrip('.')}: planned {short(expected)}, now {short(actual)}"]
 
 
 def execute_frozen(args: argparse.Namespace, policy: dict[str, Any], env: dict[str, str], work: Path) -> int:
@@ -844,9 +912,15 @@ def execute_frozen(args: argparse.Namespace, policy: dict[str, Any], env: dict[s
             raise SuiteError("planned suite execution cannot change its arguments")
         expected = json.loads(args.plan.read_text())
         actual = describe(args, env, work)
-        if any(expected[name] != actual[name] for name in ("tree", "base", "authority")) \
-                or expected["suites"][suite] != actual["suites"][suite]:
-            raise SuiteError("suite execution inputs differ from the frozen reuse plan")
+        compared = ("tree", "base", "authority")
+        changed = plan_differences({name: expected.get(name) for name in compared},
+                                   {name: actual[name] for name in compared})
+        changed += plan_differences(expected["suites"].get(suite), actual["suites"][suite], f"suites.{suite}.")
+        causes = [line for line in changed if not line.startswith(f"suites.{suite}.key:")]
+        changed = causes or changed  # the key follows from its inputs; name those
+        if changed:
+            shown = "; ".join(changed[:6]) + (f"; and {len(changed) - 6} more" if len(changed) > 6 else "")
+            raise SuiteError(f"suite execution inputs differ from the frozen reuse plan: {shown}")
         key = actual["suites"][suite]["key"]
     env = configured_environment(policy, env, root, work)
     tools = {name: tool_identity(name, env, work) for name in policy["tools"]}
@@ -876,7 +950,8 @@ def execute_frozen(args: argparse.Namespace, policy: dict[str, Any], env: dict[s
         identity["declaration"] = args.declaration["declaration"]
     args.provenance.write_text(json.dumps(identity, sort_keys=True, indent=2) + "\n")
     print(f"Weave snapshot: {suite}; tree={args.tree}; base={args.base or 'unborn'}", flush=True)
-    command = [substitute(value, root, work) for value in policy["executor"]] or ["bash", str(root / suite)]
+    command = with_bash([substitute(value, root, work) for value in policy["executor"]] or ["bash", str(root / suite)],
+                        env)
     command += suite_args
     return subprocess.run(command, cwd=root, env=env, check=False).returncode
 

@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+: "${WV_BSD_SHIM_REAL:=${0%/*}/../real}"  # env -i drops the export; this stand-in sits in bin/ beside real/ (wv-43082a)
+# BSD touch stand-in (wv-418760): -d takes only YYYY-MM-DDThh:mm:SS[.frac][Z].
+prev=""
+for a in "$@"; do
+    if [ "$prev" = -d ] && ! [[ "$a" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}[T\ ][0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?Z?$ ]]; then
+        echo "touch: out of range or illegal time specification: YYYY-MM-DDThh:mm:SS[.frac][tz]" >&2; exit 1
+    fi
+    case "$a" in --date*) echo "touch: illegal option -- -" >&2; exit 1 ;; esac
+    prev=$a
+done
+exec "$WV_BSD_SHIM_REAL/touch" "$@"

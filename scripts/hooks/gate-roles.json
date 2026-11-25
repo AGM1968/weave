@@ -22,6 +22,7 @@
     "scripts/lib/wv-validate.sh",
     "scripts/lib/wv-violation-vocabulary.gen.sh",
     "scripts/lib/wv-config.sh",
+    "scripts/lib/wv-python-floor.sh",
     "scripts/lib/wv-resolve-runtime.sh",
     "scripts/lib/wv-checkpoint-ci.sh",
     "scripts/lib/wv-shell-scope.sh"
@@ -30,7 +31,8 @@
     "scripts/hooks/pre-commit-weave.sh": "pre-commit",
     "scripts/hooks/pre-push-weave.sh": "pre-push",
     "scripts/hooks/prepare-commit-msg-weave.sh": "prepare-commit-msg",
-    "scripts/hooks/reference-transaction-weave.sh": "reference-transaction"
+    "scripts/hooks/reference-transaction-weave.sh": "reference-transaction",
+    "scripts/hooks/reproject-weave.sh": "post-rewrite"
   },
   "external": {
     ".weave": "graph and gate configuration, read from the frozen candidate",

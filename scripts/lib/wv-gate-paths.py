@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Advisory literal-path inspection; never execute or expand a routed script."""
 
+from __future__ import annotations
+
 from pathlib import Path, PurePosixPath
 import re
 import shlex

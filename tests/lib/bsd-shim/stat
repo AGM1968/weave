@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+: "${WV_BSD_SHIM_REAL:=${0%/*}/../real}"  # env -i drops the export; this stand-in sits in bin/ beside real/ (wv-43082a)
+# BSD stat stand-in (wv-418760): no -c/--format; -f FORMAT is BSD's format
+# flag (GNU's -f means file-system status), translated for the common fields.
+if [ "${1:-}" = -c ] || [[ "${1:-}" == --format* ]] || [[ "${1:-}" == --printf* ]]; then
+    echo "stat: illegal option -- c" >&2; echo "usage: stat [-FLnq] [-f format | -l | -r | -s | -x] [-t timefmt] [file|handle ...]" >&2; exit 1
+fi
+if { [ "${1:-}" = -f ] && [ "$#" -ge 3 ]; } || { [[ "${1:-}" == -f?* ]] && [ "$#" -ge 2 ]; }; then
+    # BSD takes the format as the next argument or attached (-f%z)
+    if [ "$1" = -f ]; then fmt=$2; shift 2; else fmt=${1#-f}; shift; fi
+    g=$fmt
+    # %Fm (mtime with its fraction, wv-8ea297) before %m, which it contains.
+    g=${g//%Fm/%.9Y}
+    g=${g//%Lp/%a}; g=${g//%Sm/%y}; g=${g//%m/%Y}; g=${g//%c/%Z}; g=${g//%z/%s}; g=${g//%N/%n}
+    exec "$WV_BSD_SHIM_REAL/stat" -c "$g" "$@"
+fi
+for a in "$@"; do case "$a" in -c*|--format*) echo "stat: illegal option -- c" >&2; exit 1 ;; esac; done
+exec "$WV_BSD_SHIM_REAL/stat" "$@"

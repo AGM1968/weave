@@ -104,7 +104,7 @@ _ss_previous_session() {
             [ -z "$_SS_LIVE_PEER" ] || continue
             ended+=("$s")
         fi
-        m=$(stat -c %Y "$s" 2>/dev/null || stat -f %m "$s" 2>/dev/null || echo 0)
+        m=$(wv_stat mtime "$s" || echo 0)
         if [ "$m" -ge "$newest_m" ]; then newest="$s"; newest_m="$m"; fi
     done
     if [ -n "$newest" ]; then
@@ -244,13 +244,17 @@ wv_session_start_context() {
     sentinel=$(_ss_own_file "$hot_zone" sentinel)
 
     # ── Clear stale bash-dedup locks from the previous session ──
-    # bash-dedup.sh uses the same repo hash to locate lock files. Any lock still
-    # present at SessionStart is orphaned (crash, hard-block with no PostToolUse,
-    # or session killed). Clear them all so this session starts with a clean slate.
-    local dedup_dir
-    dedup_dir=$(resolve_bash_lock_dir "$repo_hash")
-    if [[ -d "$dedup_dir" ]] && hot_zone_check "$dedup_dir" 2>/dev/null; then
+    # A lock still in this session's own directory at SessionStart is orphaned
+    # (crash, hard-block with no PostToolUse, or a resumed session killed), so
+    # it is cleared. Another live session's locks are its own (wv-da7c28): only
+    # those older than any lock's lifetime (TTL 600s, grace 120s) are pruned.
+    local dedup_root dedup_dir
+    dedup_root=$(resolve_bash_lock_dir "$repo_hash")
+    dedup_dir=$(resolve_bash_lock_dir "$repo_hash" "$(hook_session_lock_key "$payload")")
+    if [[ -d "$dedup_root" ]] && hot_zone_check "$dedup_root" 2>/dev/null; then
         rm -f "${dedup_dir}"/*.lock 2>/dev/null || true
+        find "$dedup_root" -maxdepth 2 -name '*.lock' -mmin +60 -delete 2>/dev/null || true
+        find "$dedup_root" -mindepth 1 -maxdepth 1 -type d -name 's-*' -empty -delete 2>/dev/null || true
     fi
 
     # ── Harvest the last prompt (best-effort) ──
@@ -355,8 +359,7 @@ wv_session_start_context() {
         # the sentinel's own start time (an older sentinel has neither signal).
         alive_epoch=$(( hb > stop_ts ? hb : stop_ts ))
         if [ "$alive_epoch" -gt 0 ]; then
-            alive=$(date -u -d "@${alive_epoch}" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
-                || date -u -r "${alive_epoch}" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "$sentinel_ts")
+            alive=$(wv_date_fmt -u "$alive_epoch" +%Y-%m-%dT%H:%M:%SZ || echo "$sentinel_ts")
         else
             alive="$sentinel_ts"
         fi
@@ -477,7 +480,7 @@ Graph is NOT writable — wv sync and wv commit-refs cannot persist. Recover wit
     [ -f "$bc_file" ] || bc_file="${project_dir}/.weave/breadcrumbs.md"
     if [ -f "$bc_file" ]; then
         now=$(date +%s)
-        mtime=$(stat -c %Y "$bc_file" 2>/dev/null || stat -f %m "$bc_file" 2>/dev/null || echo "$now")
+        mtime=$(wv_stat mtime "$bc_file" || echo "$now")
         age_hours=$(( (now - mtime) / 3600 ))
         if [ "$age_hours" -gt 24 ]; then
             context="${context}

@@ -170,18 +170,14 @@ wv_potu_dedup_release_guard() (
     CMD=$(echo "$INPUT" | jq -r '.tool_input.command // .tool_input.cmd // empty' 2>/dev/null)
     [[ -z "$CMD" ]] && exit 0
 
-    # ── Portable repo hash (md5sum → md5 → sha256sum → fallback) ─────────────
-
+    # ── Repo hash ─────────────────────────────────────────────────────────────
+    # md5sum is wv-resolve-runtime's portable stand-in (wv-7d7d41).
+    _potu_source wv-resolve-runtime || exit 0
     REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
     # Use echo to match hash convention in the dedup guard and all other hooks
-    REPO_HASH=$(
-        echo "$REPO_ROOT" | md5sum    2>/dev/null | cut -c1-8 ||
-        echo "$REPO_ROOT" | md5       2>/dev/null | cut -c1-8 ||
-        echo "$REPO_ROOT" | sha256sum 2>/dev/null | cut -c1-8 ||
-        echo "default"
-    )
-    _potu_source wv-resolve-runtime || exit 0
-    LOCK_DIR=$(resolve_bash_lock_dir "$REPO_HASH")
+    REPO_HASH=$(echo "$REPO_ROOT" | md5sum 2>/dev/null | cut -c1-8)
+    REPO_HASH=${REPO_HASH:-default}
+    LOCK_DIR=$(resolve_bash_lock_dir "$REPO_HASH" "$(hook_session_lock_key "$INPUT")")
 
     # ── Helper: process one lock key ──────────────────────────────────────────
     # For foreground: clears the lock (command is done).
@@ -246,6 +242,24 @@ wv_potu_touched_guard() (
     _potu_tag_hook
     INPUT="$1"
 
+    # Attribute the edit in the checkout the file is in, as the edit guard
+    # judges it (wv-455739, wv-7ab9d4): from the session checkout a linked
+    # worktree's path stayed absolute and was dropped, so a worktree node never
+    # owned its files. Project and hot zone then resolve afresh from there.
+    _tf_first=$(_potu_paths "$INPUT")
+    _tf_first="${_tf_first%%$'\n'*}"
+    if [ -n "$_tf_first" ]; then
+        _tf_dir=$(dirname -- "$_tf_first")
+        while [ ! -d "$_tf_dir" ] && [ "$_tf_dir" != / ]; do _tf_dir=$(dirname -- "$_tf_dir"); done
+        _tf_repo=$(git -C "$_tf_dir" rev-parse --show-toplevel 2>/dev/null || true)
+        if [ -n "$_tf_repo" ] && [ -d "$_tf_repo/.weave" ] \
+            && [ "$_tf_repo" != "$(git rev-parse --show-toplevel 2>/dev/null || true)" ]; then
+            cd "$_tf_repo" || exit 0
+            unset WV_PROJECT_DIR WV_HOT_ZONE WV_DB WV
+            export CLAUDE_PROJECT_DIR="$_tf_repo"
+        fi
+    fi
+
     _potu_source wv-resolve-project || exit 0
     _potu_source wv-hook-common || true
     _potu_source wv-resolve-runtime || exit 0
@@ -286,9 +300,14 @@ wv_potu_touched_guard() (
 
     while IFS= read -r FILE_PATH; do
         REL_PATH="$FILE_PATH"
-        case "$FILE_PATH" in
-            "$REPO_ROOT"/*) REL_PATH="${FILE_PATH#"$REPO_ROOT"/}" ;;
-        esac
+        # Both sides canonical: git's toplevel is a physical path, while an
+        # edit payload can name the file through a symlink (macOS /tmp and
+        # /var are links into /private), and a literal prefix test then
+        # files a repository edit as outside it (wv-e6ca42).
+        if [ -n "$REPO_ROOT" ]; then
+            _tf_rel=$(wv_relpath "$REPO_ROOT" "$FILE_PATH" 2>/dev/null) && [ "$_tf_rel" != . ] \
+                && REL_PATH="$_tf_rel"
+        fi
 
         # Append to ring (newest at bottom), keep last 20 unique paths.
         {
@@ -471,7 +490,8 @@ _restore_generated_regions() {
 _potu_route_advisory() {
     local root rel conf sha node ev stale=""
     root=$(git rev-parse --show-toplevel 2>/dev/null) || return 0
-    rel=${1#"$root"/}
+    # Canonical on both sides (wv-e6ca42): a symlinked path left the prefix on.
+    rel=$(wv_relpath "$root" "$1" 2>/dev/null) || return 0
     conf="$root/.weave/test-map-retired.conf"
     [ -f "$conf" ] || return 0
     [ -f "$1" ] || return 0
@@ -532,7 +552,21 @@ _potu_lint_one() (
     # (e.g. ~/.claude/settings.json) which could strip fields it doesn't recognise.
     if [[ "$FILE_PATH" =~ \.(md|json|yaml|yml|js|ts|css|html)$ ]]; then
         REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
-        if [ -n "$REPO_ROOT" ] && [[ "$FILE_PATH" == "$REPO_ROOT"/* ]]; then
+        # wv_relpath canonicalises both sides: the toplevel is physical, the
+        # edited path may run through a symlink (wv-e6ca42). It fails outside
+        # the repository, and where it is not loaded, so prettier then skips.
+        _pel_rel=""
+        [ -z "$REPO_ROOT" ] || _pel_rel=$(wv_relpath "$REPO_ROOT" "$FILE_PATH" 2>/dev/null) || _pel_rel=""
+        # Only a file git counts as the repository's own: tracked, or new and
+        # not ignored. An ignored file (node_modules, build output, a vendored
+        # copy) is inside the tree but not the project's to reformat (owner
+        # ruling on wv-3c0db2, option B). check-ignore reports a tracked file
+        # as not ignored even when a pattern matches it, so tracked files stay
+        # in scope.
+        if [ -n "$_pel_rel" ] && git -C "$REPO_ROOT" check-ignore -q -- "$_pel_rel" 2>/dev/null; then
+            _pel_rel=""
+        fi
+        if [ -n "$_pel_rel" ] && [ "$_pel_rel" != . ]; then
             if command -v prettier &> /dev/null && [ -f "$FILE_PATH" ]; then
                 if ! prettier --check "$FILE_PATH" &> /dev/null; then
                     FORMATTED=$(mktemp)
@@ -582,6 +616,10 @@ wv_potu_lint_guard() (
     set -e
     _potu_tag_hook
     INPUT="$1"
+    # wv_relpath (repo-membership tests on canonical paths, wv-e6ca42) and the
+    # portable sha256sum the route advisory hashes with. Missing, the
+    # repo-only steps skip rather than guess.
+    _potu_source wv-resolve-runtime || true
 
     # Skip linting if the tool call itself failed (tool_response.success = false).
     # PostToolUseFailure fires for hard failures; this guards soft/partial failures.

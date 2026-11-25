@@ -37,13 +37,42 @@ wv_receipt_clear() {
     rm -f "$f" 2>/dev/null || true
 }
 
-# wv_receipt_catalog_listing <weave_dir> -- "path\tsize\tmtime" per published
-# delta file, sorted. Staging directories are PID-scoped scratch, not catalog.
+# wv_delta_file_listing <deltas_root> -- "path\tsize\tmtime" per published
+# delta file, the path relative to the root, sorted; nonzero when the walk or
+# any stat fails, never a shorter listing. Staging directories are PID-scoped
+# scratch, not catalog. find -printf is GNU-only, and with its error discarded
+# a BSD find listed nothing (wv-8ea297), so it runs only where a probe shows it
+# works: it is ~25 ms faster over a 19k-file catalog, and this listing is on
+# every instrumented call. Elsewhere stat lists, with its own format flag (BSD
+# -f: %N name, %z size, %Fm mtime with its fraction); the literal tab suits
+# both. One machine always takes the same branch, so its listings compare.
+wv_delta_file_listing() {
+    local root="$1" fmt=()
+    if ! LC_ALL=C find -P "$root" -maxdepth 0 -printf '' >/dev/null 2>&1; then  # printf-probed (wv-8ea297)
+        if stat -c %s -- "$root" >/dev/null 2>&1; then
+            fmt=(-c $'%n\t%s\t%.9Y')
+        else
+            fmt=(-f $'%N\t%z\t%Fm')
+        fi
+    fi
+    (
+        set -o pipefail
+        cd "$root" || exit 1
+        if [ "${#fmt[@]}" -eq 0 ]; then
+            LC_ALL=C find -P . -type f -not -path '*/.staging-*' -printf '%P\t%s\t%T@\n'  # printf-probed (wv-8ea297)
+        else
+            LC_ALL=C find -P . -type f -not -path '*/.staging-*' -exec stat "${fmt[@]}" -- {} + \
+                | LC_ALL=C sed 's|^\./||'
+        fi | LC_ALL=C sort
+    )
+}
+
+# wv_receipt_catalog_listing <weave_dir> -- wv_delta_file_listing of its
+# deltas/, or nothing when there is none.
 wv_receipt_catalog_listing() {
     local root="$1/deltas"
     [ -d "$root" ] || return 0
-    LC_ALL=C find -P "$root" -type f -not -path '*/.staging-*' -printf '%P\t%s\t%T@\n' 2>/dev/null \
-        | LC_ALL=C sort
+    wv_delta_file_listing "$root"
 }
 
 # _wv_receipt_sha -- sha256 of stdin, the hex only.
@@ -59,7 +88,7 @@ wv_receipt_rows() {
     local -
     [ -f "$db" ] || return 1
     set -o pipefail
-    sqlite3 -readonly "$db" 2>/dev/null <<'SQL' | _wv_receipt_sha
+    sqlite3 -cmd "PRAGMA query_only=1" "file:$db?mode=rw" 2>/dev/null <<'SQL' | _wv_receipt_sha
 BEGIN;
 SELECT json_array('node', id, text, status, json(metadata), alias, created_at, updated_at,
                   lineage_actor, lineage_seq)
@@ -100,8 +129,18 @@ wv_receipt_inputs() {
     fi
     rows=$( (wv_receipt_rows "$db") ) || return 1
     loader=$(wv_receipt_loader) || return 1
-    [[ "$state$catalog$rows$loader" =~ ^[a-f0-9]{256}$ ]] || return 1
+    _wv_receipt_digests_ok "$state" "$catalog" "$rows" "$loader" || return 1
     printf '%s %s %s %s\n' "$state" "$catalog" "$rows" "$loader"
+}
+
+# _wv_receipt_digests_ok <sha>... -- each argument is one lowercase sha256.
+# Checked one by one: a single {256} bound exceeds BSD regcomp's RE_DUP_MAX
+# (255), so a Mac refused every receipt (wv-b2e048).
+_wv_receipt_digests_ok() {
+    local d
+    for d in "$@"; do
+        [[ "$d" =~ ^[a-f0-9]{64}$ ]] || return 1
+    done
 }
 
 # wv_receipt_write <weave_dir> <db> [catalog_sha] -- record the inputs now;

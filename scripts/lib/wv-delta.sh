@@ -461,7 +461,7 @@ wv_compaction_fence() {
     local db="$1" weave_dir="$2" tree absorbed out
     tree=$(wv_compaction_epochs "$weave_dir") || return 1
     [ -n "$tree" ] || return 0
-    if ! out=$(sqlite3 -readonly -cmd ".timeout 5000" "$db" \
+    if ! out=$(sqlite3 -cmd "PRAGMA query_only=1" -cmd ".timeout 5000" "file:$db?mode=rw" \
         "SELECT name FROM _weave_absorbed_compactions;" 2>&1); then
         printf '%s\n' "$tree"
         return 1
@@ -646,7 +646,7 @@ _wv_lineage_stamp_verdict() {
 # promised retry is reassurance for a permanent outage.
 _wv_lineage_stamp_recovery() {
     echo "  run 'wv doctor' for the lineage schema check, then recover with:" >&2
-    echo "    rm -rf \"\$WV_HOT_ZONE\" && wv load" >&2
+    echo "    $(hot_zone_rebuild_advice 2>/dev/null || echo "move the hot zone aside (never delete it), wv load, then wv hotzone diff the old brain.db against the new one")" >&2
 }
 
 _wv_lineage_stamp_diagnose() {
@@ -1598,7 +1598,8 @@ PY
 # TIP reflect the Delta v2 operations committed with it? A rebase or merge keeps
 # one side's state.sql (.gitattributes merge=ours) while both sides' operations
 # travel, so a snapshot can be published that lags its own operations. The
-# operations added in BASE..TIP are replayed into a throwaway database built
+# operations added in BASE..TIP, and for each merge in that range those added
+# from its parents' merge base, are replayed into a throwaway database built
 # from TIP's snapshot by the loader's own evaluator; one that still applies is
 # lag. Prints one JSON object {verdict, applied, checked, base, tip, detail}:
 #   ok         every operation in the range is already in TIP's snapshot
@@ -1638,8 +1639,19 @@ wv_projection_lag() {
         return 0
     fi
     local -a paths=() files=()
-    mapfile -t paths < <(git -C "$root" diff --name-only --diff-filter=A "$base_sha" "$tip_sha" -- .weave/deltas 2>/dev/null \
-        | grep -E -- '^\.weave/deltas/[^/]+/v2/[^/]+\.json$')
+    # A merge in the range brings operations through its other parent, which
+    # BASE may already hold: under merge=ours the merge keeps one parent's
+    # snapshot, so those are checked too, from the parents' merge base to the
+    # merge (wv-6729a0; the 2026-11-25 canary's merge passed the BASE..TIP check
+    # while its snapshot lacked the upstream node).
+    mapfile -t paths < <({
+        git -C "$root" diff --name-only --diff-filter=A "$base_sha" "$tip_sha" -- .weave/deltas 2>/dev/null
+        while IFS= read -r _pl_merge; do
+            # shellcheck disable=SC2046  # one word per parent
+            _pl_mb=$(git -C "$root" merge-base --octopus $(git -C "$root" rev-parse "$_pl_merge^@") 2>/dev/null) || continue
+            git -C "$root" diff --name-only --diff-filter=A "$_pl_mb" "$_pl_merge" -- .weave/deltas 2>/dev/null
+        done < <(git -C "$root" rev-list --merges "$base_sha..$tip_sha" 2>/dev/null)
+    } | grep -E -- '^\.weave/deltas/[^/]+/v2/[^/]+\.json$' | LC_ALL=C sort -u)
     local result=""
     if [ "${#paths[@]}" -eq 0 ]; then
         result=$(_wv_pl_out ok 0 0 "no operations added in the range")

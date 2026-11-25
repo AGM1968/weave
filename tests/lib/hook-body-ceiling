@@ -5,5 +5,5 @@
 # new count; nothing raises it while wv-0e2998 is open.
 # mode: advisory (report only) until wv-0e2998 had a passing commit; enforced
 # since wv-a25168 (a count above or below the ceiling fails).
-ceiling=928
+ceiling=923
 mode=enforced

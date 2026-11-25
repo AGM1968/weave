@@ -8,6 +8,8 @@
 #   - Codex ownership: deleted/demoted managed entries pruned, manual preserved
 #   - resources removed from a contract are reconciled out of the skill dir
 #   - validate-before-mutate: unsafe paths / collisions / bad adapters rejected
+# shellcheck source=tests/lib/sed-inplace.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/sed-inplace.sh"  # sed -i is GNU-only (wv-076a98)
 set -euo pipefail
 export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 
@@ -35,9 +37,9 @@ mkproc "$A" beta '[codex]' 'visibility: shared'
 "$GEN" --source="$A" --check >/dev/null    # unique -> passes
 
 # duplicate id (two files declaring id: alpha)
-sed -i 's/^id: beta/id: alpha/' "$A/beta.md"
+sed_inplace 's/^id: beta/id: alpha/' "$A/beta.md"
 if "$GEN" --source="$A" --check >/dev/null 2>&1; then echo "FAIL: duplicate id not rejected"; exit 1; fi
-sed -i 's/^id: alpha/id: beta/' "$A/beta.md"
+sed_inplace 's/^id: alpha/id: beta/' "$A/beta.md"
 
 # duplicate claude_skill (distinct ids, same skill name)
 mkproc "$A" alpha '[claude]' 'visibility: shared' 'claude_skill: shared-skill'
@@ -258,11 +260,11 @@ bash "$PROJECT" --source="$N" --repo="$NREPO" --agent=all
 diff -r "$NREPO/.agents/skills/wv-neutral" "$NREPO/.claude/skills/wv-neutral" >/dev/null \
     || { echo "FAIL: neutral and Claude skill copies differ"; exit 1; }
 mkdir -p "$NREPO/.agents/skills/mine"; echo '# mine' > "$NREPO/.agents/skills/mine/SKILL.md"
-sed -i 's/^visibility: shared/visibility: local/' "$N/neutral.md"
+sed_inplace 's/^visibility: shared/visibility: local/' "$N/neutral.md"
 bash "$PROJECT" --source="$N" --repo="$NREPO" --agent=claude
 [ ! -e "$NREPO/.agents/skills/wv-neutral" ] || { echo "FAIL: demoted neutral skill not pruned"; exit 1; }
 [ -f "$NREPO/.agents/skills/mine/SKILL.md" ] || { echo "FAIL: hand-written neutral skill pruned"; exit 1; }
-sed -i 's/^visibility: local/visibility: shared/' "$N/neutral.md"
+sed_inplace 's/^visibility: local/visibility: shared/' "$N/neutral.md"
 mkdir -p "$NREPO/.agents/skills/wv-neutral"; echo '# hand-written' > "$NREPO/.agents/skills/wv-neutral/SKILL.md"
 rm -rf "$NREPO/.claude/skills"
 if bash "$PROJECT" --source="$N" --repo="$NREPO" --agent=all 2>/dev/null; then
@@ -289,7 +291,7 @@ RL="$TMP/optin-list"; mkdir -p "$RL"
 bash "$PROJECT" --source="$R" --repo="$RL" --agent=claude,codex
 grep -qF -- "$MARKER" "$RL/.agents/skills/wv-optin/SKILL.md" && [ -f "$RL/.claude/skills/wv-optin/SKILL.md" ] \
     || { echo "FAIL: --agent=claude,codex did not write both skill surfaces"; exit 1; }
-sed -i 's/^description: optin proc/description: optin proc revised/' "$R/optin.md"
+sed_inplace 's/^description: optin proc/description: optin proc revised/' "$R/optin.md"
 bash "$PROJECT" --source="$R" --repo="$RL" --agent=claude
 grep -qF 'optin proc revised' "$RL/.agents/skills/wv-optin/SKILL.md" \
     || { echo "FAIL: a managed .agents/skills copy was not refreshed under --agent=claude"; exit 1; }

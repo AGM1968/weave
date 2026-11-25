@@ -34,8 +34,8 @@ seen=alone
 printf 'leak:@CHECKER@:%s:%s:%s\n' "$pat" "$bld" "$seen" >> "@MARK@/external"
 case "@CHECKER@ $pat $bld" in *refuse*) echo 'release fixture policy refuses' >&2; exit 1 ;; esac
 LEAK_EOF
-    sed -i "s|@CHECKER@|$1|g; s|@MARK@|$MARK|g" tests/test-memory-projection-parity.sh
-    sed -i "s|@CHECKER@|$2|g; s|@MARK@|$MARK|g" tests/test-shipped-test-refs.sh
+    sed "s|@CHECKER@|$1|g; s|@MARK@|$MARK|g" tests/test-memory-projection-parity.sh > tests/.mpp.tmp && mv tests/.mpp.tmp tests/test-memory-projection-parity.sh  # sed -i is not portable (wv-076a98)
+    sed "s|@CHECKER@|$2|g; s|@MARK@|$MARK|g" tests/test-shipped-test-refs.sh > tests/.str.tmp && mv tests/.str.tmp tests/test-shipped-test-refs.sh
 }
 # _ep_roles <shared|undeclared|malformed|invoking> — HEAD's contract for the four files.
 # None is a shared product file here: a change to one would need a record,

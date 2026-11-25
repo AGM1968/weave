@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+: "${WV_BSD_SHIM_REAL:=${0%/*}/../real}"  # env -i drops the export; this stand-in sits in bin/ beside real/ (wv-43082a)
+# BSD mv stand-in (wv-0bcb09): no -T / --no-target-directory and no GNU long
+# options; BSD mv moves into an existing directory instead.
+for a in "$@"; do
+    case "$a" in
+        --) break ;;
+        --*) echo "mv: illegal option -- -" >&2; echo "usage: mv [-f | -i | -n] [-hv] source target" >&2; exit 64 ;;
+        -*T*) echo "mv: illegal option -- T" >&2; echo "usage: mv [-f | -i | -n] [-hv] source target" >&2; exit 64 ;;
+        -*) ;;
+        *) break ;;
+    esac
+done
+exec "$WV_BSD_SHIM_REAL/mv" "$@"

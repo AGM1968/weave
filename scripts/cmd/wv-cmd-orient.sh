@@ -517,7 +517,7 @@ _bootstrap_heavy_tier_json() {
 _bootstrap_load_json() {
     local db="${WV_DB:-}" row
     [ -n "$db" ] && [ -f "$db" ] || { echo null; return 0; }
-    row=$(sqlite3 -readonly -json "$db" "SELECT state, at, reasons FROM _weave_load_attempt WHERE id = 1;" 2>/dev/null) \
+    row=$(sqlite3 -cmd "PRAGMA query_only=1" -json "file:$db?mode=rw" "SELECT state, at, reasons FROM _weave_load_attempt WHERE id = 1;" 2>/dev/null) \
         || { echo null; return 0; }
     jq -c '.[0] // null' <<< "${row:-[]}" 2>/dev/null || echo null
 }
@@ -558,15 +558,35 @@ _bootstrap_stale_findings_json() {
     printf '{"count":%d,"days":%d}\n' "$count" "$days"
 }
 
+# _bootstrap_merge_drivers_json -> {"missing":[names],"fix":"<command>"} when
+# this checkout's .gitattributes names merge drivers its git config lacks, else
+# null (wv-d24a69). git config is not cloned: a fresh clone's first rebase over
+# another clone's graph commit stopped on state.sql and nodes.jsonl. The same
+# helpers as wv doctor's check, so both name the same drivers and remedy.
+_bootstrap_merge_drivers_json() {
+    local root missing
+    root=$(git rev-parse --show-toplevel 2>/dev/null) || { echo null; return 0; }
+    [ -f "$root/.gitattributes" ] || { echo null; return 0; }
+    declare -F wv_unregistered_merge_drivers >/dev/null \
+        || source "${WV_LIB_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}/lib/wv-git-hook-signature.sh" 2>/dev/null \
+        || { echo null; return 0; }
+    missing=$(wv_unregistered_merge_drivers "$root")
+    [ -n "$missing" ] || { echo null; return 0; }
+    jq -cn --arg m "$missing" --arg fix "$(wv_merge_driver_remedy "$root" "${WV_LIB_DIR:-$HOME/.local/lib/weave}/merge-trails.py")" \
+        '{missing: ($m | split("\n") | map(select(. != ""))), fix: $fix}'
+}
+
 # _bootstrap_readiness_advisories <framework_json> <structural_json>
-# [heavy_tier_json] [gate_json] [load_json] [stale_findings_json] -> a JSON
-# array of advisory strings, framework first.
+# [heavy_tier_json] [gate_json] [load_json] [stale_findings_json]
+# [merge_drivers_json] -> a JSON array of advisory strings, framework first.
 _bootstrap_readiness_advisories() {
     # The structural list is uncapped: files, not argv (wv-200d36).
     jq -cn --slurpfile fw <(printf '%s' "$1") --slurpfile st <(printf '%s' "$2") \
         --slurpfile ht <(printf '%s' "${3:-null}") --slurpfile gt <(printf '%s' "${4:-null}") \
-        --slurpfile ld <(printf '%s' "${5:-null}") --slurpfile sf <(printf '%s' "${6:-null}") '
+        --slurpfile ld <(printf '%s' "${5:-null}") --slurpfile sf <(printf '%s' "${6:-null}") \
+        --slurpfile md <(printf '%s' "${7:-null}") '
         $fw[0] as $fw | $st[0] as $st | $ht[0] as $ht | $gt[0] as $gt | $ld[0] as $ld | $sf[0] as $sf
+        | $md[0] as $md
         | ($gt.holder // null) as $hold
         | def short: (. // "") | .[0:9];
         # The tier the record names (wv-dfd636): make check is the fast tier.
@@ -576,6 +596,10 @@ _bootstrap_readiness_advisories() {
             (if $ld != null and $ld.state == "failed" then
                 "graph load not acknowledged (last attempt \($ld.at)): \($ld.reasons) - changes made only in deltas since the last state.sql are missing from this graph; fix before other work (wv load names the failing operation)"
              else empty end),
+            # Next, whether this clone can merge a graph from another clone at all.
+            (if $md == null then empty else
+                "git merge drivers not registered in this clone: \($md.missing | join(", ")) - .gitattributes routes .weave/ files to them, and without them a rebase over a graph commit from another clone conflicts; run: \($md.fix)"
+             end),
             (if $fw == null then empty
              elif $fw.state == "red" then
                 "framework red: \($fw | ran) failed (exit \($fw.exit)) at HEAD \($fw.commit | short) - fix it before other work"
@@ -752,7 +776,7 @@ cmd_bootstrap() {
     fi
 
     # ── Readiness (wv-814d33) ── first in advisories: fix the framework first.
-    local framework_json structural_json heavy_json gate_json load_json stale_json readiness_advisories
+    local framework_json structural_json heavy_json gate_json load_json stale_json merge_json readiness_advisories
     framework_json=$(_bootstrap_framework_json)
     structural_json=$(_bootstrap_structural_json)
     heavy_json=$(_bootstrap_heavy_tier_json 2>/dev/null) || heavy_json='null'
@@ -763,7 +787,9 @@ cmd_bootstrap() {
     [ -n "$load_json" ] || load_json='null'
     stale_json=$(_bootstrap_stale_findings_json 2>/dev/null) || stale_json='null'
     [ -n "$stale_json" ] || stale_json='null'
-    readiness_advisories=$(_bootstrap_readiness_advisories "$framework_json" "$structural_json" "$heavy_json" "$gate_json" "$load_json" "$stale_json" 2>/dev/null || echo '[]')
+    merge_json=$(_bootstrap_merge_drivers_json 2>/dev/null) || merge_json='null'
+    [ -n "$merge_json" ] || merge_json='null'
+    readiness_advisories=$(_bootstrap_readiness_advisories "$framework_json" "$structural_json" "$heavy_json" "$gate_json" "$load_json" "$stale_json" "$merge_json" 2>/dev/null || echo '[]')
 
     # ── Graph memory index (wv-bff31b) ── the agnostic delivery path: every
     # harness, MCP client (weave_bootstrap passes this through) and wv_client
@@ -1414,9 +1440,7 @@ cmd_session_summary() {
 _hygiene_score() {
     local start_ts="$1" now_ts="$2"
     local start_iso
-    start_iso=$(date -u -d "@$start_ts" +"%Y-%m-%d %H:%M:%S" 2>/dev/null \
-        || date -u -r "$start_ts" +"%Y-%m-%d %H:%M:%S" 2>/dev/null \
-        || echo "1970-01-01 00:00:00")
+    start_iso=$(wv_date_fmt -u "$start_ts" +"%Y-%m-%d %H:%M:%S" || echo "1970-01-01 00:00:00")
     start_iso=$(sql_escape "$start_iso")
 
     # Component 1: edit discipline = % Edit/Write attempts that had an active node.
@@ -1525,17 +1549,17 @@ _context_policy_decide() {
     local root="$1" nodes_file="$2" policy="MEDIUM" large_files jsonl_lines total_files
     local -a reasons=()
     large_files=$(cd "$root" && git ls-files -z '*.py' '*.ts' '*.js' '*.go' 2>/dev/null \
-        | xargs -0 -r stat -c %s 2>/dev/null | awk '$1 > 51200 {c++} END {print c+0}')
+        | xargs -0 -r sh -c 'find "$@" -prune -type f -size +51200c' _ 2>/dev/null | awk 'END {print NR}')
     if [ "${large_files:-0}" -gt 10 ]; then
         policy="LOW"; reasons+=("many large source files detected")
     fi
     if [ -f "$nodes_file" ]; then
-        jsonl_lines=$(wc -l < "$nodes_file" 2>/dev/null || echo 0)
+        jsonl_lines=$(( $(wc -l < "$nodes_file" 2>/dev/null || echo 0) ))
         if [ "$jsonl_lines" -gt 100 ]; then
             policy="LOW"; reasons+=("large Weave history ($jsonl_lines nodes)")
         fi
     fi
-    total_files=$(git -C "$root" ls-files '*.py' '*.ts' '*.js' 2>/dev/null | wc -l)
+    total_files=$(( $(git -C "$root" ls-files '*.py' '*.ts' '*.js' 2>/dev/null | wc -l) ))
     if [ "$total_files" -gt 500 ] && [ "$policy" = "MEDIUM" ]; then
         reasons+=("large codebase ($total_files source files)")
     fi
@@ -1586,7 +1610,9 @@ This file is loaded into weave-runtime system prompts. Keep repo-specific instru
 ${end}"
     tmp=$(mktemp) || return 0
     if grep -qF -- "$begin" "$runtime_md"; then
-        awk -v begin="$begin" -v end="$end" -v block="$block" '
+        # block through ENVIRON: BSD awk refuses a newline in a -v value (wv-27b2f5)
+        WV_AWK_BLOCK="$block" awk -v begin="$begin" -v end="$end" '
+            BEGIN { block = ENVIRON["WV_AWK_BLOCK"] }
             $0 == begin { print block; skip=1; next }
             skip && $0 == end { skip=0; next }
             skip { next }
@@ -1616,7 +1642,7 @@ cmd_context_policy() {
     default_cache="$weave_dir/.context_policy"
     cache="${POLICY_CACHE:-$default_cache}"
 
-    age=$(( $(date +%s) - $(stat -c %Y "$cache" 2>/dev/null || echo 0) ))
+    age=$(( $(date +%s) - $(wv_stat mtime "$cache" || echo 0) ))
     if [ "$refresh" = false ] && [ -s "$cache" ] && [ "$age" -lt 3600 ]; then
         policy=$(head -1 "$cache")
         mapfile -t reasons < <(tail -n +2 "$cache")
@@ -1742,7 +1768,7 @@ cmd_audit_pitfalls() {
         local is_addressed=false
         if [ -n "$resolvers" ]; then
             local resolver_count
-            resolver_count=$(echo "$resolvers" | wc -l)
+            resolver_count=$(( $(echo "$resolvers" | wc -l) ))
             [ "$resolver_count" -gt 0 ] && is_addressed=true
         fi
 

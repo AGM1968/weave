@@ -29,8 +29,8 @@ _memory_graduate_target() {
     case "$target" in
         /*) echo "Error: --target is a path inside the repository, relative to its root; $target is absolute" >&2; return 1 ;;
     esac
-    root=$(realpath -e "$REPO_ROOT" 2>/dev/null) || { echo "Error: repository root $REPO_ROOT cannot be resolved" >&2; return 1; }
-    if ! real=$(realpath -e "$root/$target" 2>/dev/null) || [ ! -f "$real" ]; then
+    root=$(wv_realpath_existing "$REPO_ROOT") || { echo "Error: repository root $REPO_ROOT cannot be resolved" >&2; return 1; }
+    if ! real=$(wv_realpath_existing "$root/$target") || [ ! -f "$real" ]; then
         echo "Error: --target $target is not a file in this repository" >&2
         return 1
     fi
@@ -115,7 +115,7 @@ _doctor_memory_budget() {
     fi
     memories=$(_memory_recall_json 2>/dev/null) || memories='[]'
     entries=$(_memory_index_entries <<< "$memories" 2>/dev/null) || entries='[]'
-    bytes=$(_memory_markdown_block "$entries" | wc -c)
+    bytes=$(( $(_memory_markdown_block "$entries" | wc -c) ))
 
     # A repository procedure or guide id, named in a memory's text, marks a
     # lesson that surface may already carry. The seeded example guide is no one's.

@@ -38,6 +38,12 @@ case "$SCRIPT_SOURCE" in
 esac
 SCRIPT_DIR="$(cd -P "$(dirname "$SCRIPT_SOURCE")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# shellcheck source=tests/lib/sed-inplace.sh
+source "$PROJECT_ROOT/tests/lib/sed-inplace.sh"
+# The product's md5sum (wv-resolve-runtime.sh, side-effect free): the repo hash a
+# product path is keyed on, the same on macOS, which has no md5sum(1) (wv-ef5621).
+# shellcheck disable=SC1091  # resolved at run time
+source "$PROJECT_ROOT/scripts/lib/wv-resolve-runtime.sh"
 cd "$PROJECT_ROOT"
 HOOKS_DIR="$PROJECT_ROOT/.claude/hooks"
 WV="$PROJECT_ROOT/scripts/wv"
@@ -765,7 +771,7 @@ set -e
 assert_exit_code "0" "$EXIT_CODE" "pre-close: exits 0 for legacy root command payload when verification exists"
 
 # Inline --verification-method flag satisfies hook without prior wv update
-ID2="$(add_active_node "inline-flag test node" --metadata='{"commit":"deadbeef"}' 2>/dev/null | grep -oP 'wv-[0-9a-f]{4,6}')"
+ID2="$(add_active_node "inline-flag test node" --metadata='{"commit":"deadbeef"}' 2>/dev/null | grep -oE 'wv-[0-9a-f]{4,6}')"
 set +e
 OUTPUT=$(echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"cmd\":\"wv done $ID2 --verification-method=\\\"make check\\\" --learning=\\\"test\\\"\"}}" | bash "$HOOKS_DIR/pre-close-verification.sh" 2>/dev/null)
 EXIT_CODE=$?
@@ -922,6 +928,17 @@ OUTPUT=$(echo "{\"tool_name\":\"Bash\",\"tool_input\":{\"cmd\":\"wv done $QUEUE_
 set -e
 assert_contains "$OUTPUT" "Commit work before close" "pre-close: a queued, unapplied edit is still the node's own"
 rm -f "$TEST_DIR/project/queued-own.txt" "$(dirname "$WV_DB")/attribution-queue"
+# An edit named through a symlink to the checkout is still the repository's
+# file (wv-e6ca42): git's toplevel is physical, and a literal prefix test kept
+# the path absolute, so the edit was filed as outside the repository (macOS
+# /tmp and /var are links into /private).
+ln -s "$TEST_DIR/project" "$TEST_DIR/project-alias"
+echo "own work, via a link" > "$TEST_DIR/project/via-link-own.txt"
+echo "{\"tool_name\":\"Edit\",\"tool_input\":{\"file_path\":\"$TEST_DIR/project-alias/via-link-own.txt\"},\"tool_response\":{\"success\":true}}" \
+    | (cd "$TEST_DIR/project" && bash "$HOOKS_DIR/wv-touched-files.sh") >/dev/null 2>&1 || true
+assert_equals "1" "$(sqlite3 "$WV_DB" "SELECT COUNT(*) FROM node_files WHERE node_id='$QUEUE_ID' AND path='via-link-own.txt';")" \
+    "attribution: an edit named through a symlink to the checkout is recorded repo-relative"
+rm -f "$TEST_DIR/project-alias" "$TEST_DIR/project/via-link-own.txt"
 git -C "$TEST_DIR/project" rm -q queue-seed.txt >/dev/null 2>&1 || true
 git -C "$TEST_DIR/project" commit -q -m "chore: clean up queue test fixture" >/dev/null 2>&1 || true
 "$WV" "done" "$QUEUE_ID" --skip-verification 2>/dev/null || true  # cleanup
@@ -990,7 +1007,11 @@ echo ""
 echo "--- bash-dedup.sh / bash-dedup-post.sh ---"
 setup_test_env
 
-DEDUP_LOCK_DIR="/tmp/weave-bash-locks-$(id -u)/$(echo "$(git rev-parse --show-toplevel 2>/dev/null || pwd)" | md5sum 2>/dev/null | cut -c1-8 || echo default)"
+# Derived as the hooks derive it (wv-b3cb72): the product's portable md5sum
+# and resolve_bash_lock_dir, not a literal path and bare md5sum.
+# shellcheck source=tests/lib/dedup-locks.sh
+. "$PROJECT_ROOT/tests/lib/dedup-locks.sh"
+DEDUP_LOCK_DIR=$(dedup_lock_dir "$(pwd)")
 # 700 like the hook makes it: a base left 775 by the umask is refused (wv-80be32).
 (umask 077 && mkdir -p "$DEDUP_LOCK_DIR")
 
@@ -1233,8 +1254,8 @@ rm -f "$DEDUP_LOCK_DIR/git-commit.lock"
 # Pattern-table parity: every lock key the dedup guard (wv-pre-tool-use.sh) classifies must also
 # appear in the release guard (wv-post-tool-use.sh), or its lock is never cleared/promoted.
 TESTS_RUN=$((TESTS_RUN + 1))
-PRE_KEYS=$(grep -oP 'LOCK_KEY="\K[a-z-]+' "$PROJECT_ROOT/scripts/lib/wv-pre-tool-use.sh" | sort -u)
-POST_KEYS=$(grep -oP '^[[:space:]]*_handle_lock "\K[a-z-]+' "$PROJECT_ROOT/scripts/lib/wv-post-tool-use.sh" | sort -u)
+PRE_KEYS=$(grep -oE 'LOCK_KEY="[a-z-]+' "$PROJECT_ROOT/scripts/lib/wv-pre-tool-use.sh" | sed 's/^LOCK_KEY="//' | sort -u)
+POST_KEYS=$(grep -oE '^[[:space:]]*_handle_lock "[a-z-]+' "$PROJECT_ROOT/scripts/lib/wv-post-tool-use.sh" | sed -E 's/.*_handle_lock "//' | sort -u)
 MISSING_KEYS=$(comm -23 <(echo "$PRE_KEYS") <(echo "$POST_KEYS"))
 if [[ -z "$MISSING_KEYS" ]]; then
     echo -e "${GREEN}✓${NC} bash-dedup: pre/post lock-key tables are in sync"
@@ -1418,6 +1439,49 @@ if command -v prettier >/dev/null 2>&1; then
         "post-edit-lint: CLAUDE.md's init-repo block is byte-identical after formatting"
     assert_equals "$_pel_memory" "$(_pel_managed "$_pel_claude" ':MEMORY')" \
         "post-edit-lint: CLAUDE.md's WEAVE:MEMORY block is byte-identical after formatting"
+    # Repository membership on canonical paths (wv-e6ca42): git's toplevel is
+    # physical, an edit can name the file through a symlink (macOS /tmp and
+    # /var), and a literal prefix test skipped prettier there. The reverse
+    # also holds: a link inside the repository that leads outside it is not
+    # the repository, so prettier must not rewrite what it reaches.
+    ln -s "$_pel_repo" "$TEST_DIR/project-link"
+    printf '\n%s\n' "$_pel_long" > "$_pel_repo/via-link.md"
+    echo "{\"tool_name\":\"Edit\",\"tool_input\":{\"file_path\":\"$TEST_DIR/project-link/via-link.md\"}}" \
+        | (cd "$_pel_repo" && bash "$HOOKS_DIR/post-edit-lint.sh") >/dev/null 2>&1 || true
+    assert_equals "absent" "$(grep -qxF -- "$_pel_long" "$_pel_repo/via-link.md" && echo present || echo absent)" \
+        "post-edit-lint: a file named through a symlink to the repository is formatted"
+    mkdir -p "$TEST_DIR/outside-repo"
+    printf '\n%s\n' "$_pel_long" > "$TEST_DIR/outside-repo/out.md"
+    ln -s "$TEST_DIR/outside-repo" "$_pel_repo/out-link"
+    echo "{\"tool_name\":\"Edit\",\"tool_input\":{\"file_path\":\"$_pel_repo/out-link/out.md\"}}" \
+        | (cd "$_pel_repo" && bash "$HOOKS_DIR/post-edit-lint.sh") >/dev/null 2>&1 || true
+    assert_equals "present" "$(grep -qxF -- "$_pel_long" "$TEST_DIR/outside-repo/out.md" && echo present || echo absent)" \
+        "post-edit-lint: a link inside the repository that leads outside it is not formatted"
+    # Only the repository's own files (wv-3c0db2, option B): a file git
+    # ignores is not formatted. prettier 3 already skips .gitignore matches by
+    # default, but prettier 2 and an --ignore-path override do not, so the
+    # hook's guard is tested against a stand-in prettier that honours no
+    # ignore file: it rewrites a control file and must not reach the ignored one.
+    mkdir -p "$_pel_repo/ignored-out" "$TEST_DIR/stub-prettier"
+    printf '#!/bin/sh\n[ "$1" = --check ] && exit 1\nprintf "STUB-FORMATTED\\n"\n' > "$TEST_DIR/stub-prettier/prettier"
+    chmod +x "$TEST_DIR/stub-prettier/prettier"
+    _pel_gi_had=no
+    [ -f "$_pel_repo/.gitignore" ] && { cp -p "$_pel_repo/.gitignore" "$TEST_DIR/pel-gitignore.saved"; _pel_gi_had=yes; }
+    printf 'ignored-out/\n' >> "$_pel_repo/.gitignore"
+    printf '\n%s\n' "$_pel_long" > "$_pel_repo/ignored-out/gen.md"
+    printf '\n%s\n' "$_pel_long" > "$_pel_repo/control.md"
+    for _pel_f in control.md ignored-out/gen.md; do
+        echo "{\"tool_name\":\"Edit\",\"tool_input\":{\"file_path\":\"$_pel_repo/$_pel_f\"}}" \
+            | (cd "$_pel_repo" && PATH="$TEST_DIR/stub-prettier:$PATH" bash "$HOOKS_DIR/post-edit-lint.sh") >/dev/null 2>&1 || true
+    done
+    assert_equals "STUB-FORMATTED" "$(cat "$_pel_repo/control.md")" \
+        "post-edit-lint: (control) the ignore-blind stand-in prettier rewrites an ordinary file"
+    assert_equals "present" "$(grep -qxF -- "$_pel_long" "$_pel_repo/ignored-out/gen.md" && echo present || echo absent)" \
+        "post-edit-lint: a file git ignores is not formatted, whatever prettier ignores itself"
+    rm -rf "$_pel_repo/ignored-out" "$_pel_repo/control.md" "$TEST_DIR/stub-prettier"
+    if [ "$_pel_gi_had" = yes ]; then mv "$TEST_DIR/pel-gitignore.saved" "$_pel_repo/.gitignore"; else rm -f "$_pel_repo/.gitignore"; fi
+    rm -f "$TEST_DIR/project-link" "$_pel_repo/out-link" "$_pel_repo/via-link.md"
+    rm -rf "$TEST_DIR/outside-repo"
     unset -f _pel_region _pel_managed
 else
     echo -e "${YELLOW}⊘${NC} post-edit-lint: prettier not installed, generated-region test skipped"
@@ -1902,7 +1966,7 @@ assert_not_contains "$OUTPUT" "✗ tests/test-pb.sh failed" "suite pool: the pas
 # measured rather than taken from ts, which is written after the last suite.
 # pb outlives the failing pa by 2s: a time taken at drain would give pa pb's end.
 _pool_setup pool-times 1 0
-sed -i 's/^exit 0$/sleep 2; exit 0/' "$TEST_DIR/project/tests/test-pb.sh"
+sed_inplace 's/^exit 0$/sleep 2; exit 0/' "$TEST_DIR/project/tests/test-pb.sh"  # BSD sed -i (wv-076a98)
 git -C "$TEST_DIR/project" add tests/test-pb.sh
 _pt_log="$TEST_DIR/times/suite_runs.jsonl"
 mkdir -p "$TEST_DIR/times"
@@ -1918,7 +1982,7 @@ _pt_b=$(_pt_row tests/test-pb.sh)
 _pt_g=$(tail -1 "$TEST_DIR/times/gate_runs.jsonl" 2>/dev/null)
 assert_equals "true true" \
     "$(jq -r '((.started_ms|type) == "number" and (.ended_ms|type) == "number" and .ended_ms >= .started_ms
-               and ((.ended_ms - .started_ms - .duration_ms) | fabs) <= 1000) | tostring' <<< "$_pt_a$_pt_b" | paste -sd ' ')" \
+               and ((.ended_ms - .started_ms - .duration_ms) | fabs) <= 1000) | tostring' <<< "$_pt_a$_pt_b" | paste -sd ' ' -)" \
     "suite times: both suite rows carry a start and an exit that agree with their duration"
 assert_equals "true" \
     "$(jq -nr --argjson a "${_pt_a:-null}" --argjson b "${_pt_b:-null}" '($b.ended_ms - $a.ended_ms) >= 1500 | tostring' 2>/dev/null)" \
@@ -1992,7 +2056,7 @@ EXIT_CODE=$?
 set -e
 assert_exit_code "0" "$EXIT_CODE" "suite pool: a lane share of 2 lets the two suites overlap"
 assert_contains "$OUTPUT" "running 2 suites, up to 2 at a time" "suite pool: announces the lane share as its bound"
-assert_equals "unset unset" "$(cat "$POOL_DIR/a.lanejobs" "$POOL_DIR/b.lanejobs" 2>/dev/null | paste -sd ' ')" \
+assert_equals "unset unset" "$(cat "$POOL_DIR/a.lanejobs" "$POOL_DIR/b.lanejobs" 2>/dev/null | paste -sd ' ' -)" \
     "suite pool: no suite inherits the lane share"
 
 # Consumer outcomes are history, not readiness. Recording still waits for the
@@ -2068,7 +2132,8 @@ assert_equals "yes no" "$(_pool_recorded tests/test-pa.sh) $(_pool_recorded test
 sleep 0.5
 # Anchored: an unanchored -f pattern also matches any shell whose command line
 # merely contains the text (the one running this suite, for instance).
-assert_equals "0" "$(pgrep -fc '^sleep 37$' 2>/dev/null || true)" \
+# Counted with wc: BSD pgrep has no -c count (wv-f8e26d).
+assert_equals "0" "$(( $(pgrep -f '^sleep 37$' 2>/dev/null | wc -l) ))" \
     "suite pool: an interrupted gate leaves none of the stopped suite's processes running"
 
 # Git runs the hook with GIT_INDEX_FILE set (a temporary index for
@@ -3086,7 +3151,7 @@ for i in 1 2 3 4 5; do
     echo "{\"tool_name\":\"Write\",\"tool_input\":{\"file_path\":\"$TEST_DIR/file${i}.py\"},\"tool_response\":{\"success\":true}}" \
         | bash "$HOOKS_DIR/wv-touched-files.sh" >/dev/null 2>&1 || true
 done
-RING_LINES=$(wc -l < "$RING_FILE" 2>/dev/null || echo 0)
+RING_LINES=$(( $(wc -l < "$RING_FILE" 2>/dev/null || echo 0) ))  # BSD wc pads (wv-2dbe9e)
 assert_equals "3" "$RING_LINES" "touched-files: ring respects cap (last 3 of 5)"
 RING_CONTENT=$(cat "$RING_FILE" 2>/dev/null || echo "")
 TESTS_RUN=$((TESTS_RUN + 1))

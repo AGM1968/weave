@@ -31,7 +31,7 @@ fail() { TESTS_RUN=$((TESTS_RUN+1)); TESTS_FAILED=$((TESTS_FAILED+1)); echo -e "
 # Production sources: everything shipped, excluding the suite itself, and the
 # release builder, whose seams can skip a release gate (wv-cfa8ee).
 scan_production() {
-    grep -rho "WV_TEST_[A-Z0-9_]*" \
+    grep -rhoI "WV_TEST_[A-Z0-9_]*" \
         "$REPO_ROOT/scripts" "$REPO_ROOT/install.sh" "$REPO_ROOT/build-release.sh" 2>/dev/null \
         | sort -u
 }

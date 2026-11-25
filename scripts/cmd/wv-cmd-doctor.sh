@@ -19,6 +19,12 @@ _dr_pass=0 _dr_fail=0 _dr_warn=0 _dr_total=0 _dr_results="" _dr_format="text"
 # (wv-3a7368), so doctor never calls a hook custom that they refresh as Weave's.
 # shellcheck source=scripts/lib/wv-git-hook-signature.sh
 source "${WV_LIB_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}/lib/wv-git-hook-signature.sh"
+# Which repository hooks Weave has retired: the list init-repo removes them by (wv-96b61e).
+# shellcheck source=scripts/lib/wv-skill-retirement.sh
+source "${WV_LIB_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}/lib/wv-skill-retirement.sh"
+# Which surfaces git must carry for the whole team (wv-f2a6a3).
+# shellcheck source=scripts/lib/wv-runtime-ignores.sh
+source "${WV_LIB_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}/lib/wv-runtime-ignores.sh"
 
 # Count durable Codex memory-pipeline rows scoped to THIS repo. Codex's
 # memories_*.sqlite stage1_outputs is the durable-memory analog to Claude's
@@ -350,7 +356,7 @@ _doctor_check_stranded_closes() {
     main_ref=$(git -C "$root" rev-parse --verify -q refs/heads/main 2>/dev/null \
         || git -C "$root" rev-parse --verify -q refs/heads/master 2>/dev/null) || {
         _doctor_record "stranded closes" "pass" "no main or master branch to compare"; return 0; }
-    rel=$(realpath --relative-to="$root" "${WEAVE_DIR:-$root/.weave}" 2>/dev/null) || rel=".weave"
+    rel=$(wv_relpath "$root" "${WEAVE_DIR:-$root/.weave}") || rel=".weave"
     if ! closes=$(db_query "SELECT id FROM nodes WHERE status = 'done'
             AND updated_at < datetime('now', '-24 hours') ORDER BY id;" 2>/dev/null); then
         _doctor_record "stranded closes" "warn" "could not read this graph's closes"
@@ -392,7 +398,7 @@ _doctor_check_edge_invariants() {
             ORDER BY type, invariant, source, target;" 2>/dev/null); then
         _doctor_record "edge invariants" "warn" "could not evaluate the edge invariants"
     elif [ -n "$edges" ]; then
-        n=$(wc -l <<< "$edges")
+        n=$(( $(wc -l <<< "$edges") ))
         list=$(head -5 <<< "$edges" | tr '\n' ';' | sed 's/;$//; s/;/; /g')
         _doctor_record "edge invariants" "warn" "$n stored edge(s) break their type's invariant: $list$([ "$n" -gt 5 ] && echo '; ...') — see contracts/edge-types-v1.json"
     else
@@ -404,7 +410,7 @@ _doctor_check_edge_invariants() {
             ORDER BY p.id, c.id;" 2>/dev/null); then
         _doctor_record "closed parents" "warn" "could not evaluate closed parents over open children"
     elif [ -n "$children" ]; then
-        n=$(wc -l <<< "$children")
+        n=$(( $(wc -l <<< "$children") ))
         list=$(head -5 <<< "$children" | tr '\n' ' ' | sed 's/ $//')
         _doctor_record "closed parents" "warn" "$n open child(ren) under a closed parent, not parked, re-parented or resolved (parent>child): $list$([ "$n" -gt 5 ] && echo ' ...')"
     else
@@ -417,12 +423,18 @@ _doctor_check_edge_invariants() {
             ORDER BY source, target, type;" 2>/dev/null); then
         _doctor_record "dangling edges" "warn" "could not evaluate edges whose endpoint names no node"
     elif [ -n "$edges" ]; then
-        n=$(wc -l <<< "$edges")
+        n=$(( $(wc -l <<< "$edges") ))
         list=$(head -5 <<< "$edges" | tr '\n' ';' | sed 's/;$//; s/;/; /g')
         _doctor_record "dangling edges" "warn" "$n edge(s) name a node that does not exist: $list$([ "$n" -gt 5 ] && echo '; ...') — remove each with wv unlink <source> <target> --type=<type>, or all with wv clean-ghosts"
     else
         _doctor_record "dangling edges" "pass" "every edge names two existing nodes"
     fi
+}
+
+# _doctor_has_fts5 — the sqlite3 on PATH can build an FTS5 table (wv-649510);
+# the same probe as db_require_fts5, run directly so doctor reports the cause.
+_doctor_has_fts5() {
+    sqlite3 :memory: "CREATE VIRTUAL TABLE wv_fts5_probe USING fts5(a);" >/dev/null 2>&1
 }
 
 _doctor_record() {
@@ -793,7 +805,9 @@ _doctor_check_host_hooks() {
     # WV_DOCTOR_HOSTS narrows the hosts probed (tests use one fake host).
     for host in ${WV_DOCTOR_HOSTS:-claude codex code amp pi}; do
         bin=$(command -v "$host" 2>/dev/null) || continue
-        ver=$(timeout 10 "$bin" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9][0-9A-Za-z.+-]*' | head -1)
+        # Bounded through perl's alarm, which survives exec: timeout(1) is not on
+        # macOS, where every version read 'unknown' (wv-afe960).
+        ver=$(perl -e 'alarm shift; exec @ARGV or exit 127' 10 "$bin" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9][0-9A-Za-z.+-]*' | head -1)
         [ -n "$ver" ] || ver="unknown"
         case "$host" in
             claude) cfg="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"; caps="SessionEnd:60" ;;
@@ -885,25 +899,35 @@ _doctor_check_hook_module() {
     fi
 }
 
-# _doctor_check_hot_zone_orphans — warn about hot-zone dirs with no matching repo owner.
+# _doctor_check_hot_zone_orphans — warn about hot-zone dirs whose repository
+# is deleted, and separately about those whose owner cannot be seen. The
+# verdict is hot_zone_owner_state's, the predicate wv hotzone gc quarantines on
+# (wv-4ccc98): advising gc for an owner on an unmounted disk was advising the
+# deletion of its only copy of unsnapshotted state.
 # Args: hot_zone path
 _doctor_check_hot_zone_orphans() {
     local hot_zone="$1"
     local hz_parent; hz_parent=$(dirname "$hot_zone")
     [ -d "$hz_parent" ] || return 0
-    local orphan_count=0 d owner
+    local gone=0 unknown=0 d state first_unknown=""
     for d in "$hz_parent"/*/; do
         [ -f "${d}brain.db" ] || continue
-        owner=$(cat "${d}.repo_root" 2>/dev/null || echo "")
-        if [ -n "$owner" ] && [ ! -d "$owner" ]; then
-            orphan_count=$((orphan_count + 1))
-        elif [ -z "$owner" ]; then
-            [ "${d%/}" != "$hot_zone" ] && orphan_count=$((orphan_count + 1))
-        fi
+        [ "${d%/}" = "$hot_zone" ] && continue
+        state=$(hot_zone_owner_state "${d%/}")
+        case "${state%%$'\t'*}" in
+            gone) gone=$((gone + 1)) ;;
+            unknown)
+                unknown=$((unknown + 1))
+                [ -n "$first_unknown" ] || first_unknown="${d%/}: ${state#*$'\t'}" ;;
+        esac
     done
-    if [ "$orphan_count" -gt 0 ]; then
+    if [ "$gone" -gt 0 ]; then
         _doctor_record "orphan hot-zones" "warn" \
-            "$orphan_count unmatched dir(s) under $hz_parent — run: wv hotzone gc"
+            "$gone dir(s) under $hz_parent belong to deleted repositories — run: wv hotzone gc"
+    fi
+    if [ "$unknown" -gt 0 ]; then
+        _doctor_record "unknown hot-zone owners" "warn" \
+            "$unknown dir(s) under $hz_parent whose repository cannot be seen (e.g. $first_unknown); wv hotzone gc keeps them. Mount the disk or inspect them; remove one only once its repository is synced or known gone"
     fi
 }
 
@@ -1002,10 +1026,10 @@ _doctor_check_hot_zone_names() {
                 "$n $problem; wv refuses it as a hot-zone base"
         elif [ ! -e "$l" ] && [ ! -L "$l" ]; then
             _doctor_record "hot-zone names" "pass" \
-                "$n is an alias of $l, which is absent; the next wv call that opens the zone recreates it as the physical directory"
+                "$n is an alias of $l, which is absent; the next wv call that opens the zone makes $n the physical directory"
         else
             _doctor_record "hot-zone names" "pass" \
-                "physical: $l (legacy name, kept while hosts run mixed versions); $n is an alias of it"
+                "physical: $l (legacy layout); $n is an alias of it. To relocate: wv hotzone migrate, in a quiet window"
         fi
     elif [ -d "$n" ] && [ -d "$l" ] && [ ! -L "$l" ]; then
         if [ -n "$_HZ_TMP_CONFLICT" ]; then
@@ -1019,17 +1043,21 @@ _doctor_check_hot_zone_names() {
                 "physical: ${_HZ_ZONES[0]} (neither holds a database, so the legacy directory is the default authority); $n and $l are separate directories"
         fi
     elif [ -d "$n" ]; then
-        if [ -L "$l" ]; then
-            _doctor_record "hot-zone names" "pass" "physical: $n; legacy name $l is a symlink"
+        if [ -L "$l" ] && [ "$(readlink -- "$l")" = "$n" ]; then
+            _doctor_record "hot-zone names" "pass" "physical: $n; legacy name $l is its fence link (wv-97d68a)"
+        elif [ -L "$l" ]; then
+            _doctor_record "hot-zone names" "pass" \
+                "physical: $n; legacy name $l is a symlink to $(readlink -- "$l"), not $n; wv never uses it"
         else
-            _doctor_record "hot-zone names" "pass" "physical: $n; legacy name $l absent"
+            _doctor_record "hot-zone names" "pass" \
+                "physical: $n; legacy name $l absent (the next wv call that opens the zone adds its fence link)"
         fi
     elif [ -d "$l" ] && [ ! -L "$l" ]; then
         _doctor_record "hot-zone names" "pass" \
-            "physical: $l (legacy name); the alias $n is added on the next wv call that opens the zone"
+            "physical: $l (legacy layout); the alias $n is added on the next wv call that opens the zone. To relocate: wv hotzone migrate, in a quiet window"
     else
         _doctor_record "hot-zone names" "pass" \
-            "neither $n nor $l exists; first use creates $l and the alias $n"
+            "neither $n nor $l is a zone; first use creates $n and the fence link $l"
     fi
     return 0
 }
@@ -1042,7 +1070,7 @@ _doctor_check_hot_zone_names() {
 _doctor_check_graph_load() {
     [ -n "${WV_DB:-}" ] && [ -f "$WV_DB" ] || return 0
     local row state at reasons
-    row=$(sqlite3 -readonly -separator $'\t' "$WV_DB" \
+    row=$(sqlite3 -cmd "PRAGMA query_only=1" -separator $'\t' "file:$WV_DB?mode=rw" \
         "SELECT state, at, reasons FROM _weave_load_attempt WHERE id = 1;" 2>/dev/null) || return 0
     [ -n "$row" ] || return 0
     IFS=$'\t' read -r state at reasons <<< "$row"
@@ -1062,10 +1090,16 @@ _doctor_check_graph_load() {
 _doctor_check_delta_v2_catalog() {
     [ -n "${WEAVE_DIR:-}" ] && [ -d "$WEAVE_DIR/deltas" ] || return 0
     # mapfile, not a read loop: read takes a pipe one byte at a time
-    # (wv-12dce0). find prints no empty path, so the list is the same.
+    # (wv-12dce0). find prints no empty path, so the list is the same. A walk
+    # that fails is a failed check, not a clean catalog (wv-8ea297).
     local -a ops=()
-    mapfile -t ops < <(find "$WEAVE_DIR/deltas" -path '*/v2/*.json' -type f 2>/dev/null)
-    [ "${#ops[@]}" -gt 0 ] || return 0
+    local ops_list
+    if ! ops_list=$(wv_delta_paths_by_name "$WEAVE_DIR/deltas" -path '*/v2/*.json' -type f 2>&1); then
+        _doctor_record "delta v2 catalog" "fail" "could not list the v2 operations under $WEAVE_DIR/deltas: ${ops_list:-the walk failed}"
+        return 0
+    fi
+    [ -n "$ops_list" ] || return 0
+    mapfile -t ops <<< "$ops_list"
 
     local replay_py="${WV_LIB_DIR:-$SCRIPT_DIR}/lib/wv-delta-v2-replay.py"
     [ -f "$replay_py" ] || replay_py="$SCRIPT_DIR/lib/wv-delta-v2-replay.py"
@@ -1092,7 +1126,7 @@ _doctor_check_delta_v2_catalog() {
 
 # _doctor_check_install_drift — compare source scripts/ tree with installed ~/.local/lib/weave/.
 _doctor_check_install_drift() {
-    local source_path_file="$HOME/.config/weave/source-path"
+    local source_path_file="${WV_CONFIG_DIR:-$HOME/.config/weave}/source-path"
     [ -f "$source_path_file" ] || return 0
     local src_root; src_root=$(cat "$source_path_file" 2>/dev/null || echo "")
     [ -n "$src_root" ] && [ -d "$src_root/scripts/cmd" ] || return 0
@@ -1105,8 +1139,7 @@ _doctor_check_install_drift() {
         [ "$rel" = "wv" ] && installed_file="$HOME/.local/bin/wv"
         if [ ! -f "$installed_file" ]; then
             drifted_count=$((drifted_count + 1))
-        elif [ "$(md5sum "$src_file" 2>/dev/null | awk '{print $1}')" != \
-              "$(md5sum "$installed_file" 2>/dev/null | awk '{print $1}')" ]; then
+        elif ! cmp -s -- "$src_file" "$installed_file"; then
             drifted_count=$((drifted_count + 1))
         fi
     done
@@ -1243,6 +1276,7 @@ cmd_doctor() {
     _doctor_check_storage
     _doctor_check_repository_state
     _doctor_check_surfaces
+    _doctor_check_mcp_server
 
     if [ "$_dr_agent" = true ]; then
         _doctor_check_agent_env
@@ -1287,13 +1321,11 @@ _doctor_check_prerequisites() {
         else
             _doctor_record "sqlite3 version" "warn" "$sq_ver < 3.35"
         fi
-        # 3. FTS5
-        local fts5
-        fts5=$(sqlite3 ":memory:" "SELECT sqlite_compileoption_used('ENABLE_FTS5');" 2>/dev/null || echo "0")
-        if [ "$fts5" = "1" ]; then
+        # 3. FTS5: required (wv-649510); every wv command refuses without it.
+        if _doctor_has_fts5; then
             _doctor_record "FTS5" "pass" "available"
         else
-            _doctor_record "FTS5" "warn" "not available"
+            _doctor_record "FTS5" "fail" "$(command -v sqlite3) has no FTS5 module; put a sqlite3 with FTS5 first on PATH (macOS: /usr/bin/sqlite3)"
         fi
     else
         _doctor_record "sqlite3" "fail" "not found"
@@ -1380,7 +1412,7 @@ _doctor_check_storage() {
     _phase_file=$(resolve_phase_file "$hot_zone") || true
     if [ -f "$_phase_file" ]; then
         local _phase_val
-        _phase_val=$(cat "$_phase_file" 2>/dev/null | tr -d '[:space:]')
+        _phase_val=$(tr -d '[:space:]' < "$_phase_file" 2>/dev/null)
         local _phase_valid=false
         local _pv
         for _pv in ${PHASE_VALUES:-discover execute closing}; do
@@ -1439,7 +1471,7 @@ _doctor_check_storage() {
             _doctor_record "lineage schema" "warn" "graph tables not created yet (nodes=$_lin_nodes, edges=$_lin_edges)"
             ;;
         *)
-            _doctor_record "lineage schema" "fail" "nodes=$_lin_nodes, edges=$_lin_edges — sync and commit-refs cannot persist; recover with: rm -rf \"\$WV_HOT_ZONE\" && wv load"
+            _doctor_record "lineage schema" "fail" "nodes=$_lin_nodes, edges=$_lin_edges — sync and commit-refs cannot persist; recover with: $(hot_zone_rebuild_advice)"
             ;;
         esac
     fi
@@ -1456,7 +1488,11 @@ _doctor_check_storage() {
     # entries as well as stale ones (wv-ccd364). The plain self-check passed
     # both missing-entry and orphan incidents. Keep the orphan probe to name
     # the stranded-rowid class caused by INSERT OR REPLACE (wv-d2e6c6).
-    if [ -n "${WV_DB:-}" ] && [ -f "$WV_DB" ]; then
+    # Without the module every probe below fails, which is no evidence of
+    # corruption and no case for --repair: say why it was not checked.
+    if [ -n "${WV_DB:-}" ] && [ -f "$WV_DB" ] && ! _doctor_has_fts5; then
+        _doctor_record "FTS5 index" "fail" "not checked: sqlite3 has no FTS5 module (see FTS5); --repair cannot help"
+    elif [ -n "${WV_DB:-}" ] && [ -f "$WV_DB" ]; then
         local fts5_ok fts5_orphans fts5_rc=0
         fts5_ok=$(sqlite3 "$WV_DB" \
             "INSERT INTO nodes_fts(nodes_fts,rank) VALUES('integrity-check',1);" 2>&1) || fts5_rc=$?
@@ -1504,10 +1540,9 @@ _doctor_check_storage() {
     # re-derive the index FROM that shadow table and preserve any
     # corruption living there. See db_reindex_fts5.
     if [ -n "${WV_DB:-}" ] && [ -f "$WV_DB" ]; then
-        local learning_fts5_available
-        learning_fts5_available=$(sqlite3 "$WV_DB" \
-            "SELECT sqlite_compileoption_used('ENABLE_FTS5');" 2>/dev/null || echo "0")
-        if [ "$learning_fts5_available" = "1" ]; then
+        if ! _doctor_has_fts5; then
+            _doctor_record "FTS5 learning index" "fail" "not checked: sqlite3 has no FTS5 module (see FTS5); --repair cannot help"
+        else
             local learning_table_exists learning_fts_ok
             learning_table_exists=$(sqlite3 "$WV_DB" \
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='nodes_learning_fts';" 2>/dev/null)
@@ -1570,6 +1605,7 @@ _hook_common_unwired() {
         hook="$root/$rel"
         _hook_common_named "$hook" && continue
         if [ -f "$hook" ]; then
+            # shellcheck disable=SC2013  # library names: one word each, no spaces
             for lib in $(grep -v '^[[:space:]]*#' "$hook" \
                 | grep -E '(^|[[:space:];&|])(\.|source)[[:space:]]' \
                 | grep -oE 'wv-[a-z0-9-]+\.sh' | sort -u); do
@@ -2075,10 +2111,100 @@ _doctor_package_projections() {
     fi
     stale=$(_doctor_projection_stale "$root" "$config_dir") || return 0
     if [ -n "$stale" ]; then
-        _doctor_record "procedure-projections" "warn" "projection out of date in $stale — run: wv init-repo --update"
+        _doctor_record "procedure-projections" "warn" "projection out of date in $(_doctor_projection_agents "$stale") — run: wv init-repo --update (refreshes every adapter surface present)"
     else
         _doctor_record "procedure-projections" "pass" "package procedure projections current"
     fi
+}
+
+# _doctor_projection_agents <comma list of surfaces> — each surface with the
+# init-repo --agent that writes it (wv-82bd03); AGENTS.md is written for any.
+_doctor_projection_agents() {
+    local rel out="" agent
+    while IFS= read -r rel; do
+        rel="${rel# }"
+        [ -n "$rel" ] || continue
+        case "$rel" in
+            .claude/skills) agent=claude ;;
+            .agents/skills|.codex/weave.json) agent=codex ;;
+            .github/copilot-instructions.md) agent=copilot ;;
+            *) agent=any ;;
+        esac
+        out="${out:+$out, }$rel (--agent=$agent)"
+    done <<< "$(tr ',' '\n' <<< "$1")"
+    printf '%s' "$out"
+}
+
+# _mcp_server_bundle — the MCP bundle mcp-status and doctor judge (shared with cmd_mcp_status in wv-cmd-ops.sh): the
+# installed copy, else this checkout's development build. Nothing when neither
+# exists (the server is optional).
+_mcp_server_bundle() {
+    local candidate
+    for candidate in "${WV_LIB_DIR:-$HOME/.local/lib/weave}/mcp/dist/index.js" "${REPO_ROOT:-}/mcp/dist/index.js"; do
+        case "$candidate" in /mcp/dist/index.js) continue ;; esac
+        [ -f "$candidate" ] && { printf '%s\n' "$candidate"; return 0; }
+    done
+    return 1
+}
+
+# _mcp_server_health <bundle> — the bundle's --health-check JSON, or nothing:
+# rc 1 when it gave no valid answer, rc 2 when it did not answer within
+# WV_MCP_HEALTH_TIMEOUT seconds (default 30). Both are failures to the
+# callers: a check that cannot verify the server must not pass it (wv-4cdc07),
+# and a timeout says to retry, not to rebuild. Stdin is closed, so a server too
+# old to know the flag starts its stdio loop, reads EOF and exits without the JSON.
+_mcp_health_timeout() {
+    local t="${WV_MCP_HEALTH_TIMEOUT:-30}"
+    [[ "$t" =~ ^[0-9]+([.][0-9]+)?$ ]] || t=30
+    printf '%s\n' "$t"
+}
+_mcp_server_health() {
+    local json rc=0
+    command -v node >/dev/null 2>&1 || return 1
+    # Bounded on every host (wv-ea88cd); before, without timeout(1) the probe
+    # ran unbounded.
+    json=$(wv_bound --group "$(_mcp_health_timeout)" node "$1" --scope=lite --health-check </dev/null 2>/dev/null) || rc=$?
+    [ "$rc" -ne 124 ] || return 2
+    [ "$rc" -eq 0 ] || return 1
+    printf '%s' "$json" | jq -se 'length == 1 and (.[0] | .schema == "weave-mcp-startup.v1")' >/dev/null 2>&1 || return 1
+    printf '%s\n' "$json"
+}
+
+# _mcp_version_verdict <server-version> — "pass<TAB>detail" when the server
+# reports the CLI's own version, else "fail<TAB>detail" with the remedy
+# (wv-4cdc07): a consumer ran an rc.10 server under an rc.18 CLI for every
+# upgrade, and weave_list silently ignored arguments the old server never knew.
+_mcp_version_verdict() {
+    local server="${1:-}" remedy="rebuild it: ./install.sh --with-mcp (needs npm beside node), then restart the MCP client"
+    if [ -z "$server" ] || [ "$server" = "unknown" ] || [ "$server" = "null" ]; then
+        printf 'fail\tthe server reports no version under CLI %s; %s\n' "$WV_VERSION" "$remedy"
+    elif [ "$server" != "$WV_VERSION" ]; then
+        printf 'fail\tserver %s under CLI %s; %s\n' "$server" "$WV_VERSION" "$remedy"
+    else
+        printf 'pass\tserver %s matches the CLI\n' "$server"
+    fi
+}
+
+# _doctor_check_mcp_server — the MCP server, when one is built, must report the
+# CLI's own version (wv-4cdc07; the same verdict as wv mcp-status). No bundle
+# is no finding: the server is optional.
+_doctor_check_mcp_server() {
+    local bundle json verdict
+    bundle=$(_mcp_server_bundle) || return 0
+    if ! command -v node >/dev/null 2>&1; then
+        _doctor_record "mcp server version" "warn" "node not found; cannot ask $bundle its version"
+        return 0
+    fi
+    local hrc=0
+    json=$(_mcp_server_health "$bundle") || hrc=$?
+    if [ "$hrc" -eq 0 ]; then
+        verdict=$(_mcp_version_verdict "$(printf '%s' "$json" | jq -r '.version // empty')")
+    elif [ "$hrc" -eq 2 ]; then
+        verdict=$(printf 'fail\tversion not confirmed: %s did not answer its health check within %ss; re-run wv doctor (or raise WV_MCP_HEALTH_TIMEOUT on a loaded machine)' "$bundle" "$(_mcp_health_timeout)")
+    else
+        verdict=$(printf 'fail\t%s did not answer the version handshake under CLI %s; rebuild it: ./install.sh --with-mcp (needs npm beside node), then restart the MCP client' "$bundle" "$WV_VERSION")
+    fi
+    _doctor_record "mcp server version" "${verdict%%$'\t'*}" "${verdict#*$'\t'}"
 }
 
 _doctor_check_surfaces() {
@@ -2092,17 +2218,22 @@ _doctor_check_surfaces() {
         candidate=$(dirname "$WV_LIB_DIR")
         [ -d "$candidate/.claude/hooks" ] && source_hooks_dir="$candidate/.claude/hooks"
     fi
-    local installed_hooks_dir="$HOME/.config/weave/hooks"
+    local installed_hooks_dir="${WV_CONFIG_DIR:-$HOME/.config/weave}/hooks"
     if [ -d "$source_hooks_dir" ] && [ -d "$installed_hooks_dir" ]; then
-        local drifted=""
+        local drifted="" retired=""
         # Forward: repo-local hooks stale vs installed (catches wv self-update without init-repo --update)
         for src in "$source_hooks_dir"/*.sh; do
+            [ -f "$src" ] || continue
             local fname
             fname=$(basename "$src")
             local dst="$installed_hooks_dir/$fname"
-            if [ ! -f "$dst" ]; then
+            # A retired hook is absent from the installation because it was
+            # retired, not because it is missing (wv-96b61e).
+            if wv_retired_hook "$fname"; then
+                retired="${retired:+$retired, }$fname"
+            elif [ ! -f "$dst" ]; then
                 drifted="${drifted:+$drifted, }$fname (missing)"
-            elif [ "$(md5sum "$src" 2>/dev/null | awk '{print $1}')" != "$(md5sum "$dst" 2>/dev/null | awk '{print $1}')" ]; then
+            elif ! cmp -s -- "$src" "$dst"; then
                 drifted="${drifted:+$drifted, }$fname (stale)"
             fi
         done
@@ -2124,13 +2255,31 @@ _doctor_check_surfaces() {
                     _fname=$(basename "$src")
                     cp "$src" "$source_hooks_dir/$_fname" && _repaired=$((_repaired + 1))
                 done
-                _doctor_record "hook drift" "pass" "repaired ($_repaired hooks synced from ~/.config/weave/hooks/)"
+                _doctor_record "hook drift" "pass" "repaired ($_repaired hooks synced from $installed_hooks_dir/)"
             else
                 _doctor_record "hook drift" "warn" "run: wv init-repo --update — drifted: $drifted"
             fi
         fi
+        if [ -n "$retired" ]; then
+            local _rh_rm
+            _rh_rm=$(tr ',' '\n' <<< "$retired" | sed 's/^ *//; s|^|.claude/hooks/|' | paste -sd' ' -)
+            _doctor_record "retired hooks" "warn" "retired by Weave, no longer run: $retired — wv init-repo --update removes an unedited copy; to remove an edited one: git rm $_rh_rm"
+        fi
     else
         _doctor_record "hook drift" "warn" "cannot compare — source or installed hooks dir missing"
+    fi
+
+    # 15b. Shared surfaces the repository's ignore rules hide from git (wv-f2a6a3):
+    # written for the team, they silently stay on this machine.
+    local _ss_root _ss_hidden
+    _ss_root=$(git rev-parse --show-toplevel 2>/dev/null || true)
+    if [ -n "$_ss_root" ]; then
+        _ss_hidden=$(wv_ignored_shared_surfaces "$_ss_root" | awk -F'\t' '{printf "%s%s (rule %s)", (NR > 1 ? ", " : ""), $1, $2}')
+        if [ -n "$_ss_hidden" ]; then
+            _doctor_record "shared surfaces" "warn" "hidden from git by ignore rules, so never shared: $_ss_hidden — add a !<path> exception or git add -f them"
+        else
+            _doctor_record "shared surfaces" "pass" "every shared Weave surface present is visible to git"
+        fi
     fi
 
     # 16. wv-runtime wrapper retired (S2) — standalone repo uses python -m weave_runtime
@@ -2187,17 +2336,40 @@ _doctor_check_surfaces() {
             "$_dr_hooks/reference-transaction" \
             "Weave reference-transaction" \
             "install -m 755 scripts/hooks/reference-transaction-weave.sh $_dr_hooks/reference-transaction"
+        # Re-project .weave/ after a rebase or merge kept another copy's
+        # snapshot (wv-6729a0): without them, pre-push refuses that push instead.
+        local _dr_rp_hook
+        for _dr_rp_hook in post-rewrite post-merge; do
+            _doctor_check_git_hook \
+                "$_dr_rp_hook hook" \
+                "$git_root/scripts/hooks/reproject-weave.sh" \
+                "$_dr_hooks/$_dr_rp_hook" \
+                "Weave re-projection" \
+                "install -m 755 scripts/hooks/reproject-weave.sh $_dr_hooks/$_dr_rp_hook"
+        done
     fi
 
     # 17a. Merge drivers .gitattributes names (wv-f0b143). A rule whose driver
     # is not registered is an inactive adapter: git merges the file as text
-    # without a word. Read only; the setup steps named in the fix write it.
+    # without a word: a fresh clone's first rebase over another clone's graph
+    # commit stopped on state.sql and nodes.jsonl (wv-d24a69). The fix is one
+    # generated git config line; --repair also registers them in an owned repo.
     if [ -n "$git_root" ] && [ -f "$git_root/.gitattributes" ] \
         && grep -qE '(^|[[:space:]])merge=' "$git_root/.gitattributes" 2>/dev/null; then
-        local _dr_missing _dr_fix="wv init-repo --update"
+        local _dr_missing _dr_fix _dr_fixed="" _dr_trails="${WV_LIB_DIR:-$HOME/.local/lib/weave}/merge-trails.py"
         _dr_missing=$(wv_unregistered_merge_drivers "$git_root" | paste -sd, - | sed 's/,/, /g')
-        [ -f "$git_root/install.sh" ] && [ -f "$git_root/scripts/lib/wv-git-hook-signature.sh" ] && _dr_fix="./install.sh"
-        if [ -n "$_dr_missing" ]; then
+        if [ -n "$_dr_missing" ] && [ "$_dr_repair" = "true" ]; then
+            wv_register_merge_drivers "$git_root" "$_dr_trails" 2>/dev/null || true
+            _dr_fixed="$_dr_missing"
+            _dr_missing=$(wv_unregistered_merge_drivers "$git_root" | paste -sd, - | sed 's/,/, /g')
+            # Repaired only when nothing is left; a partial repair reports
+            # what remains, not success.
+            [ -z "$_dr_missing" ] || _dr_fixed=""
+        fi
+        if [ -n "$_dr_fixed" ]; then
+            _doctor_record "merge drivers" "pass" "repaired: registered $_dr_fixed"
+        elif [ -n "$_dr_missing" ]; then
+            _dr_fix=$(wv_merge_driver_remedy "$git_root" "$_dr_trails")
             _doctor_record "merge drivers" "warn" ".gitattributes names merge driver(s) with no git config driver: $_dr_missing; git merges those files as text. Fix: $_dr_fix"
         else
             _doctor_record "merge drivers" "pass" "every merge driver .gitattributes names is registered"
@@ -2482,7 +2654,7 @@ cmd_pattern_audit() {
     local _pa_hook="$_project_root/.claude/hooks/pre-action.sh"
     if [ -f "$_pa_hook" ]; then
         local pa_lines
-        pa_lines=$(wc -l < "$_pa_hook")
+        pa_lines=$(( $(wc -l < "$_pa_hook") ))
         if [ "$pa_lines" -gt 60 ]; then
             if [ "$format" = "text" ]; then
                 echo -e "${RED}✗ Check 5 FAIL: pre-action.sh is $pa_lines lines (limit 60)${NC}"
@@ -2569,11 +2741,16 @@ infunc {
     if (line != "" && line !~ /^#/) { last=$0; lastnr=FNR }
 }'
         local _pa7_files tail_hits=""
-        _pa7_files=$(find "$_pa7_scope" -name '*.sh' -not -path '*/tests/*' -not -path '*/archive/*' 2>/dev/null)
+        # A walk or scan that fails is a failed check, not a pass (wv-8ea297).
+        if ! _pa7_files=$(find "$_pa7_scope" -name '*.sh' -not -path '*/tests/*' -not -path '*/archive/*' 2>/dev/null); then
+            _pa7_files=""
+            tail_hits="(could not list $_pa7_scope: the check did not run)"
+        fi
         [ -f "$_pa7_scope/wv" ] && _pa7_files="${_pa7_files}${_pa7_files:+
 }$_pa7_scope/wv"
-        if [ -n "$_pa7_files" ]; then
-            tail_hits=$(echo "$_pa7_files" | xargs -r awk "$_pa7_awk" 2>/dev/null || true)
+        if [ -n "$_pa7_files" ] && [ -z "$tail_hits" ]; then
+            tail_hits=$(echo "$_pa7_files" | xargs -r awk "$_pa7_awk" 2>/dev/null) \
+                || tail_hits="(the scan of $_pa7_scope failed: the check did not run)"
         fi
         if [ -n "$tail_hits" ]; then
             local tail_count

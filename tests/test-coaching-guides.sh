@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Suite-driven wv calls are tagged test so call-stats retro reads can exclude them.
+# shellcheck source=tests/lib/sed-inplace.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/sed-inplace.sh"  # sed -i is GNU-only (wv-076a98)
 export WV_CALL_SOURCE=test
 # test-coaching-guides.sh — coaching guide assets and their resolution contract.
 #
@@ -458,7 +460,7 @@ gdoc "$dp"
 [ "$GDOC_RC" -eq 0 ] && jq -e '.unused == [] and .examples == ["example-violation.md"]' "$TMP/gdoc.json" >/dev/null \
     && pass "doctor: the seeded example guide is listed as an example, not unused" \
     || fail "doctor: the seeded example guide is listed as an example, not unused" "$(cat "$TMP/gdoc.json")"
-sed -i 's/^violation_type: .*/violation_type: code:swallowed-exception/' "$dp/.weave/guides/example-violation.md"
+sed_inplace 's/^violation_type: .*/violation_type: code:swallowed-exception/' "$dp/.weave/guides/example-violation.md"
 gdoc "$dp"
 jq -e '.unused == ["example-violation.md"] and .examples == []' "$TMP/gdoc.json" >/dev/null \
     && pass "doctor: the example id coaching a catalogued type is reported unused" \

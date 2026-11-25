@@ -1,5 +1,7 @@
 #!/bin/bash
 # Suite-driven wv calls are tagged test so call-stats retro reads can exclude them.
+# shellcheck source=tests/lib/sed-inplace.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/sed-inplace.sh"  # sed -i is GNU-only (wv-076a98)
 export WV_CALL_SOURCE=test
 # test-data.sh — Tests for wv data commands (sync, load, import, prune, learnings, refs)
 # Weave-ID: wv-4b44
@@ -8,7 +10,10 @@ set -e
 export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/lib/bounded.sh"  # timeout(1) is GNU-only; macOS has none (wv-f8e26d)
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# shellcheck disable=SC1091  # resolved at run time
+source "$REPO_ROOT/scripts/lib/wv-lock.sh"  # flock(1) is util-linux; macOS has none (wv-412db3)
 WV="$REPO_ROOT/scripts/wv"
 
 # Isolated test environment
@@ -539,7 +544,7 @@ assert_contains "$output" "1." "refs --max shows first reference"
 # it stalls it, which is how wv-f541e1 cost 900s and read as a concurrency
 # fault. Verified: reverting the fix makes this line hang until the outer
 # timeout kills the whole run, and every assertion after it goes unreported.
-output=$(timeout 5 $WV refs 2>&1 || true)
+output=$(bounded 5 $WV refs 2>&1 || true)
 assert_contains "$output" "input required" "refs without input shows error"
 
 # Test refs with an inherited idle pipe on stdin (wv-f541e1)
@@ -562,33 +567,33 @@ mkfifo "$idle_fifo"
 exec 9<>"$idle_fifo"
 
 set +e
-timeout 5 $WV refs <"$idle_fifo" >/dev/null 2>&1
+bounded 5 $WV refs <"$idle_fifo" >/dev/null 2>&1
 refs_idle_rc=$?
 set -e
 assert_equals "1" "$refs_idle_rc" "refs on an idle stdin pipe fails fast (124 = still blocked)"
 
-output=$(timeout 5 $WV refs <"$idle_fifo" 2>&1 || true)
+output=$(bounded 5 $WV refs <"$idle_fifo" 2>&1 || true)
 assert_contains "$output" "input required" "refs on an idle stdin pipe shows usage"
 
 # An explicit pipe with data still reaches the extractor, and a producer that
 # is slow but real is not mistaken for absent input: the wait is bounded on
 # the first byte, not on the whole stream.
-output=$(echo "See $ref_node for details" | timeout 5 $WV refs 2>&1)
+output=$(echo "See $ref_node for details" | bounded 5 $WV refs 2>&1)
 assert_contains "$output" "$ref_node" "refs still reads a piped stdin"
 
-output=$( (sleep 1; echo "See $ref_node for details") | timeout 8 $WV refs 2>&1)
+output=$( (sleep 1; echo "See $ref_node for details") | bounded 8 $WV refs 2>&1)
 assert_contains "$output" "$ref_node" "refs waits for a slow stdin producer"
 
 # Test batch with an inherited idle pipe on stdin (wv-f541e1)
 # Same defect, and worse: cmd_batch defaulted to reading /dev/stdin with no
 # terminal check at all, so it blocked on a bare tty too.
 set +e
-timeout 5 $WV batch <"$idle_fifo" >/dev/null 2>&1
+bounded 5 $WV batch <"$idle_fifo" >/dev/null 2>&1
 batch_idle_rc=$?
 set -e
 assert_equals "1" "$batch_idle_rc" "batch on an idle stdin pipe fails fast (124 = still blocked)"
 
-output=$(timeout 5 $WV batch <"$idle_fifo" 2>&1 || true)
+output=$(bounded 5 $WV batch <"$idle_fifo" 2>&1 || true)
 assert_contains "$output" "no input on stdin" "batch on an idle stdin pipe shows usage"
 
 exec 9>&-
@@ -600,19 +605,19 @@ rm -f "$idle_fifo"
 # reported "0 succeeded, 0 failed (of 0)" with rc 0 — a no-op certified as a
 # successful run. Nothing ran, so nothing is proven.
 set +e
-timeout 5 $WV batch </dev/null >/dev/null 2>&1
+bounded 5 $WV batch </dev/null >/dev/null 2>&1
 batch_empty_rc=$?
 set -e
 assert_equals "1" "$batch_empty_rc" "batch on empty stdin exits nonzero"
 
-output=$(timeout 5 $WV batch </dev/null 2>&1 || true)
+output=$(bounded 5 $WV batch </dev/null 2>&1 || true)
 assert_contains "$output" "no commands to execute" "batch on empty stdin shows usage"
 assert_not_contains "$output" "Batch complete" "batch on empty stdin does not report a completed run"
 
 # A file that parses to nothing is the same no-op by another route.
 printf '# only a comment\n\n   \n' > "$TEST_DIR/batch-blank.txt"
 set +e
-timeout 5 $WV batch "$TEST_DIR/batch-blank.txt" >/dev/null 2>&1
+bounded 5 $WV batch "$TEST_DIR/batch-blank.txt" >/dev/null 2>&1
 batch_blank_rc=$?
 set -e
 assert_equals "1" "$batch_blank_rc" "batch on a comments-and-blanks file exits nonzero"
@@ -620,12 +625,12 @@ assert_equals "1" "$batch_blank_rc" "batch on a comments-and-blanks file exits n
 # A whitespace-only line survived the `[ -z ]` skip, ran a bare `wv`, printed
 # the help text and was counted as a succeeded command.
 printf '   \nready --count\n' > "$TEST_DIR/batch-ws.txt"
-output=$(timeout 8 $WV batch "$TEST_DIR/batch-ws.txt" 2>&1 || true)
+output=$(bounded 8 $WV batch "$TEST_DIR/batch-ws.txt" 2>&1 || true)
 assert_contains "$output" "1 succeeded" "batch skips a whitespace-only line rather than running a bare wv"
 assert_not_contains "$output" "Usage: wv <command>" "batch does not execute a whitespace-only line"
 
 # A piped command list is still executed.
-batch_node=$(echo 'add "batch stdin still works"' | timeout 8 $WV batch 2>&1 || true)
+batch_node=$(echo 'add "batch stdin still works"' | bounded 8 $WV batch 2>&1 || true)
 assert_contains "$batch_node" "Batch complete" "batch still reads a piped command list"
 
 # A batch line is split by shell quoting rules with nothing expanded
@@ -642,7 +647,7 @@ add "batchq it's \"escaped\" # not a comment"
 add 'batchq unbalanced
 EOF
 set +e
-output=$(cd "$TEST_DIR" && timeout 15 $WV batch "$TEST_DIR/batch-quote.txt" 2>&1)
+output=$(cd "$TEST_DIR" && bounded 15 $WV batch "$TEST_DIR/batch-quote.txt" 2>&1)
 batch_quote_rc=$?
 set -e
 batch_texts=$($WV list --all --json 2>/dev/null | jq -r '.[].text | select(startswith("batchq"))' | sort)
@@ -878,7 +883,14 @@ assert_contains "$output" "$node2" "search finds second auth node"
 assert_not_contains "$output" '\033[' "search non-tty output avoids literal ANSI escapes"
 
 # Test interactive search output does not leak literal escape sequences
-tty_output=$(script -qec "$WV search authentication" /dev/null 2>&1 | tr -d '\r')
+# Under a pseudo-terminal from script(1), in each dialect: util-linux takes the
+# command as one -c string, BSD script (macOS) has no -c and takes it after the
+# file as separate words (wv-f8e26d). --version is util-linux only.
+if script --version >/dev/null 2>&1; then
+    tty_output=$(script -qec "$WV search authentication" /dev/null 2>&1 | tr -d '\r')
+else
+    tty_output=$(script -q /dev/null "$WV" search authentication 2>&1 | tr -d '\r')
+fi
 assert_contains "$tty_output" "$node1" "search tty output still shows first auth node"
 assert_not_contains "$tty_output" '\033[' "search tty output avoids literal ANSI escapes"
 
@@ -2319,25 +2331,34 @@ rm -f "$WEAVE_DIR/trails.md"
 for ci in $(seq 1 12); do $WV trails save --message="M-CONC-$ci" >/dev/null 2>&1 & done
 wait
 assert_equals "12" "$(grep -c '^<!-- wv-note -->$' "$WEAVE_DIR/trails.md")" "12 concurrent saves all retained"
-assert_equals "0" "$(ls "$WEAVE_DIR"/trails.md.tmp.* 2>/dev/null | wc -l)" "no temporary file left behind"
-assert_equals "0" "$(ls -d "$WEAVE_DIR"/trails.md.lock.d 2>/dev/null | wc -l)" "no lock directory left behind"
+assert_equals "0" "$(( $(ls "$WEAVE_DIR"/trails.md.tmp.* 2>/dev/null | wc -l) ))" "no temporary file left behind"
+assert_equals "0" "$(( $(ls -d "$WEAVE_DIR"/trails.md.lock.d 2>/dev/null | wc -l) ))" "no lock directory left behind"
+rm -f "$WEAVE_DIR/trails.md" "$WEAVE_DIR"/trails.md.lock
+# ...and under python3 fcntl, the mechanism a host without flock(1) uses (wv-f38225).
+for ci in $(seq 1 8); do WV_TEST_MODE=1 WV_TEST_LOCK_MECH=python $WV trails save --message="M-CONCPY-$ci" >/dev/null 2>&1 & done
+wait
+assert_equals "8" "$(grep -c '^<!-- wv-note -->$' "$WEAVE_DIR/trails.md")" "8 concurrent saves all retained under python3 fcntl"
 rm -f "$WEAVE_DIR/trails.md" "$WEAVE_DIR"/trails.md.lock
 
 # 13b. Durability: a save that cannot take the lock, or cannot write, must FAIL
 # rather than report success. Each of these previously returned 0.
 rm -f "$WEAVE_DIR/trails.md" "$WEAVE_DIR"/trails.md.lock
 $WV trails save --message="M-DUR-BASE" >/dev/null 2>&1
-# (a) lock held by another process: the save must not write alongside it
-exec 9>"$WEAVE_DIR/trails.md.lock"
-flock 9 2>/dev/null || true
-dur_out=$(WV_TRAILS_LOCK_WAIT=1 $WV trails save --message="M-DUR-INTRUDER" 2>&1) && dur_rc=0 || dur_rc=$?
-exec 9>&-
-if command -v flock >/dev/null 2>&1; then
-    assert_equals "1" "$dur_rc" "a save that cannot take the held lock exits nonzero"
-    assert_not_contains "$dur_out" "Trails saved" "a lock timeout never reports success"
-    assert_equals "0" "$(grep -c 'M-DUR-INTRUDER' "$WEAVE_DIR/trails.md")" "a lock timeout writes nothing"
-    assert_contains "$(cat "$WEAVE_DIR/trails.md")" "M-DUR-BASE" "a lock timeout leaves the existing notes intact"
-fi
+# (a) lock held by another process: the save must not write alongside it.
+# Under each wv_lock_fd mechanism (wv-f38225): python3 fcntl is what a host
+# without flock(1) uses, forced here so Linux runs it; neither is skipped.
+for dur_mech in default python; do
+    dur_env=(); [ "$dur_mech" = default ] || dur_env=(WV_TEST_MODE=1 WV_TEST_LOCK_MECH="$dur_mech")
+    exec 9>>"$WEAVE_DIR/trails.md.lock"
+    env "${dur_env[@]}" bash -c 'source "$1"; wv_lock_fd 9 -x 10' _ "$REPO_ROOT/scripts/lib/wv-lock.sh"
+    dur_out=$(env "${dur_env[@]}" WV_TRAILS_LOCK_WAIT=1 $WV trails save --message="M-DUR-INTRUDER" 2>&1) && dur_rc=0 || dur_rc=$?
+    exec 9>&-
+    assert_equals "1" "$dur_rc" "a save that cannot take the held lock exits nonzero ($dur_mech)"
+    assert_not_contains "$dur_out" "Trails saved" "a lock timeout never reports success ($dur_mech)"
+    assert_contains "$dur_out" "held the lock for more than 1s" "a lock timeout says the lock was held ($dur_mech)"
+    assert_equals "0" "$(grep -c 'M-DUR-INTRUDER' "$WEAVE_DIR/trails.md")" "a lock timeout writes nothing ($dur_mech)"
+    assert_contains "$(cat "$WEAVE_DIR/trails.md")" "M-DUR-BASE" "a lock timeout leaves the existing notes intact ($dur_mech)"
+done
 # (b) the lock is released cleanly, so the next save still works
 $WV trails save --message="M-DUR-AFTER" >/dev/null 2>&1
 assert_contains "$(cat "$WEAVE_DIR/trails.md")" "M-DUR-AFTER" "a save succeeds once the lock is free"
@@ -2349,7 +2370,7 @@ chmod u+w "$WEAVE_DIR"
 assert_equals "1" "$dur2_rc" "a save into an unwritable directory exits nonzero"
 assert_not_contains "$dur2_out" "Trails saved" "a failed write never reports success"
 assert_equals "true" "$(cmp -s "$TEST_DIR/dur-before.md" "$WEAVE_DIR/trails.md" && echo true || echo false)" "a failed write leaves trails.md byte-identical"
-assert_equals "0" "$(ls "$WEAVE_DIR"/trails.md.tmp.* 2>/dev/null | wc -l)" "a failed write leaves no temporary file"
+assert_equals "0" "$(( $(ls "$WEAVE_DIR"/trails.md.tmp.* 2>/dev/null | wc -l) ))" "a failed write leaves no temporary file"
 rm -f "$WEAVE_DIR/trails.md" "$WEAVE_DIR"/trails.md.lock
 
 # (d) tail integrity: a save is validated for the content the generator always
@@ -2386,10 +2407,10 @@ tr_lib=$(mktemp -d)
 cp -r "$REPO_ROOT/scripts/lib" "$REPO_ROOT/scripts/cmd" "$tr_lib/" 2>/dev/null || true
 if [ -f "$tr_lib/cmd/wv-cmd-data.sh" ]; then
     cp -r "$tr_lib/cmd" "$tr_lib/cmd-body" 2>/dev/null || true
-    sed -i 's|^        echo "## Health"$|        echo "## Health" >\&2|' "$tr_lib/cmd/wv-cmd-data.sh" || true
+    sed_inplace 's|^        echo "## Health"$|        echo "## Health" >\&2|' "$tr_lib/cmd/wv-cmd-data.sh" || true
     # Body loss: the row emission FAILS outright, leaving the heading intact.
     # shellcheck disable=SC2016  # the pattern matches literal $ in the source text it reads
-    sed -i 's|^                echo "- \*\*\$nid\*\* (\$ntype): \$ntext"$|                false|' "$tr_lib/cmd-body/wv-cmd-data.sh" || true
+    sed_inplace 's|^                echo "- \*\*\$nid\*\* (\$ntype): \$ntext"$|                false|' "$tr_lib/cmd-body/wv-cmd-data.sh" || true
 
     # An active node is required, or the Active Work section is never emitted
     # and the body-loss injection would have nothing to lose.
@@ -2477,7 +2498,7 @@ echo ""
 # findings list: node text containing '|' must not shift pipe-parsed fields
 # ═══════════════════════════════════════════════════════════════════════════
 echo "--- findings list pipe-in-text parsing ---"
-pf_id=$($WV add "finding with embedded pipe char in body text" --force 2>/dev/null | grep -oP 'wv-[a-f0-9]+' | head -1)
+pf_id=$($WV add "finding with embedded pipe char in body text" --force 2>/dev/null | grep -oE 'wv-[a-f0-9]+' | head -1)
 sqlite3 "$WV_DB" "UPDATE nodes SET metadata=json_set(COALESCE(metadata,'{}'),
     '\$.type','finding', '\$.node_kind','finding',
     '\$.promoted_at',datetime('now','-3 days'),
@@ -3021,7 +3042,7 @@ assert_equals "$_lin_before" "$_lin_after" "re-running the lineage migration add
 
 # The migration must also reach a database that predates every lineage column,
 # not only one db_init already built.
-_lin_bare=$(mktemp /tmp/wv-lineage-bare-XXXXXX.db)
+_lin_bare=$(mktemp /tmp/wv-lineage-bare-XXXXXX)
 sqlite3 "$_lin_bare" <<'SQL'
 CREATE TABLE nodes (id TEXT PRIMARY KEY, text TEXT, status TEXT,
     metadata TEXT DEFAULT '{}', created_at DATETIME, updated_at DATETIME);
@@ -3207,8 +3228,13 @@ _lin_msg=$(WV_DB="$_lin_tmp/reversed.db" bash -c "
     source '$REPO_ROOT/scripts/lib/wv-db.sh'; db_migrate_lineage" 2>&1 >/dev/null || true)
 assert_equals "1" "$([ -n "$_lin_msg" ] && echo 1 || echo 0)" \
     "an unrepairable schema reports the failure on stderr instead of discarding it"
-assert_equals "1" "$(echo "$_lin_msg" | grep -c 'rm -rf' || true)" \
-    "the failure names the hot-zone reset recovery"
+# The recovery moves the zone aside and rebuilds; it never deletes it, since a
+# zone whose lineage cannot be stamped holds writes no repository has yet
+# (wv-4ccc98). Sourced here without the resolver, so this is the fallback text.
+assert_equals "1" "$(echo "$_lin_msg" | grep -c 'aside.*wv load' || true)" \
+    "the failure names the hot-zone rebuild recovery (move aside, wv load)"
+assert_equals "0" "$(echo "$_lin_msg" | grep -c 'rm -rf' || true)" \
+    "the recovery never says to delete the hot zone"
 
 # ── the full pair matrix ──────────────────────────────────────────────────────
 #
@@ -3289,7 +3315,7 @@ _lin_load=$(mktemp -d)
     WV_FORCE_SYNC=1 "${_LL[@]}" "$WV" sync >/dev/null 2>&1
     sqlite3 "$_lin_load/hz/brain.db" "SELECT COUNT(*) FROM nodes;" > "$_lin_load/.before"
     # A snapshot with no edges table at all.
-    grep -v '^CREATE TABLE edges\|^INSERT INTO edges' "$_lin_load/.weave/state.sql" > "$_lin_load/.weave/state.sql.new"
+    grep -vE '^CREATE TABLE edges|^INSERT INTO edges' "$_lin_load/.weave/state.sql" > "$_lin_load/.weave/state.sql.new"
     mv "$_lin_load/.weave/state.sql.new" "$_lin_load/.weave/state.sql"
     "${_LL[@]}" "$WV" load > "$_lin_load/.load.out" 2>&1
     printf '%s' "$?" > "$_lin_load/.rc"

@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+: "${WV_BSD_SHIM_REAL:=${0%/*}/../real}"  # env -i drops the export; this stand-in sits in bin/ beside real/ (wv-43082a)
+# macOS realpath stand-in (wv-418760): only -q; no -e, -m, -s, --relative-to.
+for a in "$@"; do
+    case "$a" in
+        -q|--) ;;
+        -*) echo "realpath: illegal option -- ${a#-}" >&2; echo "usage: realpath [-q] [path ...]" >&2; exit 1 ;;
+    esac
+done
+exec "$WV_BSD_SHIM_REAL/realpath" "$@"

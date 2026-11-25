@@ -124,10 +124,10 @@ echo "--- seeding scratch graph ---"
 "$WV" init >/dev/null 2>&1
 EXERCISED="$EXERCISED init"
 
-N_PIPE=$("$WV" add "battery: glob gap fix | calibration: pipe in text" --force 2>/dev/null | grep -oP 'wv-[a-f0-9]+' | head -1)
-N_APOS=$("$WV" add "battery: O'Brien's quoting probe node" --force --alias=bat-apos 2>/dev/null | grep -oP 'wv-[a-f0-9]+' | head -1)
-N_DONE=$("$WV" add "battery: pre-closed node carrying integer gh metadata" --force 2>/dev/null | grep -oP 'wv-[a-f0-9]+' | head -1)
-N_FIND=$("$WV" add "battery finding: suite-pass evidence with zero new-path coverage" --force 2>/dev/null | grep -oP 'wv-[a-f0-9]+' | head -1)
+N_PIPE=$("$WV" add "battery: glob gap fix | calibration: pipe in text" --force 2>/dev/null | grep -oE 'wv-[a-f0-9]+' | head -1)
+N_APOS=$("$WV" add "battery: O'Brien's quoting probe node" --force --alias=bat-apos 2>/dev/null | grep -oE 'wv-[a-f0-9]+' | head -1)
+N_DONE=$("$WV" add "battery: pre-closed node carrying integer gh metadata" --force 2>/dev/null | grep -oE 'wv-[a-f0-9]+' | head -1)
+N_FIND=$("$WV" add "battery finding: suite-pass evidence with zero new-path coverage" --force 2>/dev/null | grep -oE 'wv-[a-f0-9]+' | head -1)
 if [ -z "$N_PIPE" ] || [ -z "$N_APOS" ] || [ -z "$N_DONE" ] || [ -z "$N_FIND" ]; then
     echo -e "${RED}✗ seed failed — aborting battery${NC}"
     exit 1
@@ -321,7 +321,7 @@ for c in $DISPATCH; do
     esac
 done
 if [ -z "$MISSING" ]; then
-    echo -e "  ${GREEN}✓${NC} coverage: all $(echo "$DISPATCH" | wc -w) dispatch commands exercised or skip-documented"
+    echo -e "  ${GREEN}✓${NC} coverage: all $(( $(echo "$DISPATCH" | wc -w) )) dispatch commands exercised or skip-documented"
     TESTS_PASSED=$((TESTS_PASSED + 1))
 else
     echo -e "  ${RED}✗${NC} coverage: dispatch commands neither exercised nor skip-documented:$MISSING"

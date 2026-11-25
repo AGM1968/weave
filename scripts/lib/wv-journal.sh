@@ -303,7 +303,8 @@ journal_clear_stale() {
 
     local now op_ts age_seconds
     now=$(date -u +%s 2>/dev/null || echo "0")
-    op_ts=$(date -u -d "$stale_ts" +%s 2>/dev/null || echo "0")
+    # An op whose start cannot be read is kept, never cleared as ancient (wv-e1ee87).
+    op_ts=$(wv_date_epoch "$stale_ts") || return 1
     age_seconds=$(( now - op_ts ))
 
     if [ "$age_seconds" -gt "$max_age" ] 2>/dev/null; then

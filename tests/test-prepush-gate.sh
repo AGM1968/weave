@@ -17,6 +17,8 @@
 # this checkout's: the installed wv may predate [heavy], and a hot zone owned by
 # another repository is refused as a leaked override (wv-5e804e). The last check proves
 # the ledger rows landed in the fixture's DB, not the live graph.
+# shellcheck source=tests/lib/sed-inplace.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/sed-inplace.sh"  # sed -i is GNU-only (wv-076a98)
 set -uo pipefail
 export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 export WV_CALL_SOURCE=test
@@ -107,7 +109,7 @@ echo "resolver: [heavy] is a tier, not a route"
 tiers=$(wv impact --suites --files=src/a.sh 2>/dev/null | jq -r 'sort_by(.name) | map("\(.name)=\(.tier)") | join(" ")')
 check "a [heavy] suite resolves as heavy, the rest as light" \
     "tests/test-heavy.sh=heavy tests/test-light.sh=light" "$tiers"
-cp .weave/test-map.conf "$T/map.bak"; sed -i '/^\[heavy\]/,$d' .weave/test-map.conf
+cp .weave/test-map.conf "$T/map.bak"; sed_inplace '/^\[heavy\]/,$d' .weave/test-map.conf
 check "removing [heavy] changes no route" "tests/test-heavy.sh tests/test-light.sh" \
     "$(wv impact --suites --files=src/a.sh 2>/dev/null | jq -r '[.[].name] | sort | join(" ")')"
 cp "$T/map.bak" .weave/test-map.conf
@@ -145,6 +147,11 @@ check "...does not run it" "0" "$(runs heavy)"
 check "...still runs the light suite" "1" "$(runs light)"
 check "...handing it HEAD as the gate base, not an inherited one" "$(git rev-parse HEAD)" "$(base_seen light)"
 git -c core.hooksPath=/dev/null commit -q -m "change a"
+# The rows name the tree the gate judged (wv-abc855): the staged tree, which
+# is the tree of the commit it admitted.
+check "...its gate row and the light suite's row name the staged tree it judged" \
+    "$(git rev-parse 'HEAD^{tree}') $(git rev-parse 'HEAD^{tree}')" \
+    "$(jq -r 'select(.phase == "pre-commit") | .tree' "$WV_GATE_LOG" | tail -1) $(jq -r 'select(.suite == "tests/test-light.sh") | .tree' "$WV_SUITE_LOG" | tail -1)"
 
 echo "pre-push: the heavy tier gates the tip"
 reset_runs; WV_GATE_BASE=0123456789abcdef0123456789abcdef01234567 prepush
@@ -161,6 +168,9 @@ check "...and its gate record carries the host's CPU and IO stall where the kern
 check "...and its gate record carries when the gate started, consistent with its end and duration" "true" \
     "$(tail -1 "$WV_GATE_LOG" | jq -r '.phase == "pre-push" and (.started_ms | type == "number")
         and (((.ts | fromdateiso8601) * 1000 - .started_ms - .duration_ms) | fabs < 2000)')"
+check "...and its gate row and the heavy suite's row name the pushed tip's tree (wv-abc855)" \
+    "$(git rev-parse 'HEAD^{tree}') $(git rev-parse 'HEAD^{tree}')" \
+    "$(tail -1 "$WV_GATE_LOG" | jq -r '.tree') $(jq -r 'select(.suite == "tests/test-heavy.sh") | .tree' "$WV_SUITE_LOG" | tail -1)"
 hasnt "...the light suite is not re-run at push" "$(runs light)" "1"
 reset_runs; prepush
 check "a retried push of the same content passes" "0" "$RC"
@@ -340,7 +350,7 @@ git show HEAD:src/a.sh > src/a.sh
 check "opposite staged/unstaged edits do not preserve observation readiness" "pending" \
     "$(wv bootstrap --json 2>/dev/null | jq -r '.readiness.heavy_tier.state')"
 git reset -q HEAD -- src/a.sh
-cp .weave/test-map.conf "$T/map.bak"; sed -i 's/^\[heavy\]$/  [heavy]/' .weave/test-map.conf
+cp .weave/test-map.conf "$T/map.bak"; sed_inplace 's/^\[heavy\]$/  [heavy]/' .weave/test-map.conf
 # The edited map is an input of the suite, so the green row no longer applies;
 # what matters is that the tier is reported at all, not dropped as null.
 check "an indented [heavy] header still reports the tier (N3, wv-ee5e36)" "pending" \
@@ -369,7 +379,7 @@ r2_map; r2_commit "r2 baseline map"; published
 # The review's reproduction: the commit drops a's heavy route but keeps the
 # [heavy] declaration; its own gate routes by both maps and defers the suite.
 printf '#!/bin/sh\necho r2a\n' > src/a.sh
-sed -i 's|^src/a.sh = .*|src/a.sh = tests/test-light.sh|' .weave/test-map.conf
+sed_inplace 's|^src/a.sh = .*|src/a.sh = tests/test-light.sh|' .weave/test-map.conf
 git add -A; reset_runs; precommit
 has "(control) pre-commit defers the baseline route's heavy suite" "$OUT" "deferred to the pre-push gate (heavy tier): tests/test-heavy.sh"
 commit_nohook "drop a's heavy route"; reset_runs; prepush
@@ -378,22 +388,22 @@ check "...and passes" "0" "$RC"
 published; r2_map; r2_commit "r2 map again"; published
 # A route one pushed commit creates and a later one removes.
 printf '#!/bin/sh\necho r2b\n' > src/b.sh
-sed -i 's|^src/b.sh = .*|src/b.sh = tests/test-light.sh tests/test-heavy.sh|' .weave/test-map.conf
+sed_inplace 's|^src/b.sh = .*|src/b.sh = tests/test-light.sh tests/test-heavy.sh|' .weave/test-map.conf
 commit_nohook "route b to heavy"
-sed -i 's|^src/b.sh = .*|src/b.sh = tests/test-light.sh|' .weave/test-map.conf
+sed_inplace 's|^src/b.sh = .*|src/b.sh = tests/test-light.sh|' .weave/test-map.conf
 commit_nohook "unroute b"
 reset_runs; prepush
 check "a route created and then removed within the push still runs its suite" "1" "$(runs heavy)"
 published
 # The tip drops the whole [heavy] section after a commit that deferred.
 printf '#!/bin/sh\necho r2c\n' > src/a.sh; commit_nohook "a owes heavy"
-sed -i '/^\[heavy\]/,$d' .weave/test-map.conf; commit_nohook "drop the heavy section"
+sed_inplace '/^\[heavy\]/,$d' .weave/test-map.conf; commit_nohook "drop the heavy section"
 reset_runs; prepush
 check "a tip without [heavy] still pays what an earlier pushed commit deferred" "1" "$(runs heavy)"
 published; r2_map; r2_commit "r2 map restored"; published
 
 echo "N3 (wv-ee5e36): an indented [heavy] header declares the tier, as the router reads it"
-sed -i 's/^\[heavy\]$/  [heavy]/' .weave/test-map.conf; commit_nohook "indent the heavy header"; published
+sed_inplace 's/^\[heavy\]$/  [heavy]/' .weave/test-map.conf; commit_nohook "indent the heavy header"; published
 check "(precondition) the router reads the indented header as heavy" \
     "tests/test-heavy.sh=heavy tests/test-light.sh=light" \
     "$(wv impact --suites --files=src/a.sh 2>/dev/null | jq -r 'sort_by(.name) | map("\(.name)=\(.tier)") | join(" ")')"
@@ -460,7 +470,7 @@ published
 
 echo "F3 (wv-ade029): bootstrap reports what pre-push owes, commit by commit"
 printf '#!/bin/sh\necho f3\n' > src/a.sh; commit_nohook "a owes heavy (f3)"
-sed -i '/^[[:space:]]*\[heavy\]/,$d' .weave/test-map.conf; commit_nohook "drop the heavy section (f3)"
+sed_inplace '/^[[:space:]]*\[heavy\]/,$d' .weave/test-map.conf; commit_nohook "drop the heavy section (f3)"
 b=$(wv bootstrap --json 2>/dev/null)
 check "a suite an earlier unpushed commit owes is reported after a later one removes [heavy]" \
     "pending tests/test-heavy.sh" "$(jq -r '.readiness.heavy_tier | "\(.state) \([.suites[].suite] | join(","))"' <<< "$b")"
@@ -475,7 +485,7 @@ check "ledger rows landed in the fixture's database" "yes" \
 # Everything owed so far is published: what follows is a repository whose
 # map has no [heavy] section, not a range that still carries deferrals.
 git -c core.hooksPath=/dev/null push -q origin main 2>/dev/null
-sed -i '/^\[heavy\]/,$d' .weave/test-map.conf; commit_nohook "no heavy section"
+sed_inplace '/^\[heavy\]/,$d' .weave/test-map.conf; commit_nohook "no heavy section"
 printf '#!/bin/sh\necho a8\n' > src/a.sh; commit_nohook "a without tiers"
 reset_runs; prepush
 check "without a [heavy] section the pre-push hook passes at once" "0" "$RC"

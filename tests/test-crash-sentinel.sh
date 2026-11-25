@@ -27,6 +27,9 @@ TESTS_FAILED=0
 # Paths
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# wv_stat / wv_date_fmt: GNU and BSD behind one call (wv-resolve-runtime.sh, side-effect free).
+# shellcheck disable=SC1091  # resolved at run time
+source "$PROJECT_ROOT/scripts/lib/wv-resolve-runtime.sh"
 WV="$PROJECT_ROOT/scripts/wv"
 
 # Test environment
@@ -228,7 +231,7 @@ signals $((NOW - 60)) $((NOW - 600))
 OUTPUT=$(echo '{}' | bash "$HOOKS_DIR/session-start-context.sh" 2>/dev/null || true)
 assert_contains "$OUTPUT" "CRASH DETECTED" "a claim made after start, then death mid-turn, is a crash"
 assert_contains "$OUTPUT" "$NODE_A" "the crash names the node claimed after start"
-assert_contains "$OUTPUT" "$(date -u -d "@$((NOW - 60))" +%Y-%m-%dT%H:%M:%SZ)" \
+assert_contains "$OUTPUT" "$(wv_date_fmt -u "$((NOW - 60))" +%Y-%m-%dT%H:%M:%SZ)" \
     "the crash reports the last activity, not the session's start"
 
 # False positive before: the sentinel's start list names a node the session
@@ -395,7 +398,7 @@ fi
 
 # Test: done nodes not listed
 setup_test_env
-ID=$("$WV" add "Done task" --status=active --criteria="recover session fixture" --risks=low --force 2>/dev/null | grep -oP 'wv-[a-f0-9]+')
+ID=$("$WV" add "Done task" --status=active --criteria="recover session fixture" --risks=low --force 2>/dev/null | grep -oE 'wv-[a-f0-9]+')
 "$WV" "done" "$ID" --skip-verification 2>/dev/null || true
 OUTPUT=$("$WV" recover --session 2>/dev/null)
 assert_contains "$OUTPUT" "No orphaned active nodes" "recover --session excludes done nodes"
@@ -542,6 +545,36 @@ OUTPUT=$(WV_SESSION_IDENTITY=1 WV_SESSION_ID=sess-C bash "$HOOKS_DIR/session-sta
 assert_contains "$OUTPUT" "died mid-turn" "with no live peer, an ended session is still labelled"
 assert_file_absent "$WV_HOT_ZONE/.session_sentinel.$DA" "an ended session's sentinel is removed"
 assert_file_absent "$WV_HOT_ZONE/.session_heartbeat.$DA" "an ended session's heartbeat is removed"
+
+# The same live peer through the ps/lsof backend, the one macOS uses (it has
+# no /proc), forced here so Linux runs it too (wv-655a34): before, a host
+# without /proc saw no peer and removed the peer's sentinel and heartbeat.
+echo ""
+echo "═══ Two sessions, ps/lsof backend ═══"
+DD=$(digest sess-D)
+setup_test_env
+echo "hot/" >> .gitignore
+WV_SESSION_IDENTITY=1 WV_SESSION_ID=sess-D bash "$HOOKS_DIR/session-start-context.sh" <<< '{}' >/dev/null 2>&1 || true
+WV_SESSION_IDENTITY=1 WV_SESSION_ID=sess-D bash "$HOOKS_DIR/pre-action.sh" <<< '{"tool_name":"Read","tool_input":{"file_path":"/dev/null"}}' >/dev/null 2>&1 || true
+fake_agent_bin "$TEST_DIR/bin/codex"
+(cd "$TEST_DIR" && exec "$TEST_DIR/bin/codex" 300) & PEER_PID=$!
+sleep 1
+OUTPUT=$(WV_TEST_MODE=1 WV_TEST_PEER_SCAN=ps WV_SESSION_IDENTITY=1 WV_SESSION_ID=sess-E \
+    bash "$HOOKS_DIR/session-start-context.sh" <<< '{}' 2>/dev/null || true)
+assert_contains "$OUTPUT" "another session is live in this checkout" "ps backend: a session starting beside a live peer reports the peer"
+assert_file_exists "$WV_HOT_ZONE/.session_sentinel.$DD" "ps backend: the peer's sentinel is left alone"
+assert_file_exists "$WV_HOT_ZONE/.session_heartbeat.$DD" "ps backend: the peer's heartbeat is left alone"
+# The backend on its own, so the check cannot pass through the /proc scan.
+OUT=$(bash -c '. "$1/scripts/lib/wv-config.sh"; _wv_concurrent_session_ps "$2"' _ "$PROJECT_ROOT" "$TEST_DIR" 2>/dev/null || true)
+assert_contains "$OUT" "another live agent process (pid $PEER_PID" "ps backend alone: finds the peer by name and cwd"
+kill "$PEER_PID" 2>/dev/null || true; wait "$PEER_PID" 2>/dev/null || true
+OUT=$(bash -c '. "$1/scripts/lib/wv-config.sh"; _wv_concurrent_session_ps "$2" || echo clean' _ "$PROJECT_ROOT" "$TEST_DIR" 2>/dev/null)
+assert_equals "clean" "$OUT" "ps backend alone: no peer once it is gone"
+# The knob is inert without WV_TEST_MODE=1 and refuses an unknown value.
+OUT=$(cd "$TEST_DIR" && env -u WV_TEST_MODE WV_TEST_PEER_SCAN=ps bash -c '. "$1/scripts/lib/wv-config.sh"; _wv_peer_scan_backend' _ "$PROJECT_ROOT" 2>&1)
+assert_contains "$OUT" "WV_TEST_MODE=1 is not; ignoring it" "the backend knob is ignored without WV_TEST_MODE=1, and says so"
+RC=0; (cd "$TEST_DIR" && WV_TEST_MODE=1 WV_TEST_PEER_SCAN=bogus bash -c '. "$1/scripts/lib/wv-config.sh"; _wv_peer_scan_backend' _ "$PROJECT_ROOT" >/dev/null 2>&1) || RC=$?
+assert_equals "1" "$RC" "an unknown backend value is refused"
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Summary

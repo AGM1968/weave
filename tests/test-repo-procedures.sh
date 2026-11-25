@@ -127,6 +127,42 @@ C="$TMP/repo-c"; mkdir -p "$C/.weave"; git -C "$C" init -q
 check "doctor is silent in a repo with no managed projection at all" \
     test "$(WV_HOT_ZONE="$TMP/hotzone-c" package_check "$C")" = null
 
+# wv-82bd03: a consumer using Claude and Copilot, not Codex. The warning names the
+# --agent for each stale surface, and init-repo --update (the projector with
+# --present) clears it without adopting a surface the repository never had.
+D="$TMP/repo-d"; mkdir -p "$D/.weave"; git -C "$D" init -q
+(umask 077 && mkdir -p "$TMP/hotzone-d")
+present_update() { WV_CONFIG_DIR="$CONFIG" "$CONFIG/project-procedures.sh" --repo="$1" --agent=claude --present; }
+check "projector writes Claude and Copilot only" env WV_CONFIG_DIR="$CONFIG" "$CONFIG/project-procedures.sh" --repo="$D" --agent=claude,copilot
+# The Copilot index lists ids, so a new package procedure is what makes it stale.
+procedure "$CONFIG/procedures" extra wv-extra '# Package extra, added by an install'
+d=$(WV_HOT_ZONE="$TMP/hotzone-d" package_check "$D")
+check "doctor names the stale Copilot surface with its --agent" contains "$d" '.github/copilot-instructions.md (--agent=copilot)'
+check "...and the Claude one with its own" contains "$d" '.claude/skills (--agent=claude)'
+check "an update for Claude alone (old behaviour) leaves Copilot stale" \
+    env WV_CONFIG_DIR="$CONFIG" "$CONFIG/project-procedures.sh" --repo="$D" --agent=claude
+d=$(WV_HOT_ZONE="$TMP/hotzone-d" package_check "$D")
+check "...so the warning survives it" contains "$d" '"status":"warn"'
+check "the --present update runs" present_update "$D"
+d=$(WV_HOT_ZONE="$TMP/hotzone-d" package_check "$D")
+check "the --present update clears the warning" contains "$d" '"status":"pass"'
+check "...without adopting Codex" test ! -e "$D/.codex/weave.json"
+check "...or .agents/skills" test ! -e "$D/.agents/skills"
+# A Codex surface already present is refreshed by --present, but .agents/skills
+# is still not adopted by it.
+check "projector adds a Codex surface" env WV_CONFIG_DIR="$CONFIG" "$CONFIG/project-procedures.sh" --repo="$D" --agent=codex
+rm -rf "$D/.agents/skills"
+procedure "$CONFIG/procedures" session wv-session '# Package session, revised for Codex'
+check "the --present update runs with Codex present" present_update "$D"
+check "...refreshing the Codex entry" jq -e '[.procedures[] | select(.id == "session" and .managed)] | length == 1' "$D/.codex/weave.json"
+d=$(WV_HOT_ZONE="$TMP/hotzone-d" package_check "$D")
+check "...and doctor passes" contains "$d" '"status":"pass"'
+check "...without adopting .agents/skills" test ! -e "$D/.agents/skills"
+check "wv init-repo --update passes --present to the projector" grep -qF '[ "$UPDATE_MODE" = "1" ] && _pp_present=(--present)' "$ROOT/install.sh"
+rm -f "$CONFIG/procedures/extra.md"
+procedure "$CONFIG/procedures" session wv-session '# Package session'
+check "projector restores the second repo after the Copilot case" project "$B"
+
 # Contract failures: an invalid repo procedure is an error, never a fallback.
 printf '%s\n' '---' 'id: verify' 'description: broken' '---' '# no adapters' > "$A/.weave/procedures/verify.md"
 out=$(guide "$A" verify || true)

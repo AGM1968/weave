@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+: "${WV_BSD_SHIM_REAL:=${0%/*}/../real}"  # env -i drops the export; this stand-in sits in bin/ beside real/ (wv-43082a)
+# bsdtar stand-in (wv-f8e26d): macOS tar is bsdtar, which has no
+# --ignore-failed-read; GNU-only long options are refused as bsdtar refuses them.
+# bsdtar exits 0 or 1: GNU tar's 2 (fatal error, e.g. not an archive) is 1
+# there, so a check that expects "status 2" fails on a Mac (wv-412db3).
+for a in "$@"; do
+    case "$a" in
+        --ignore-failed-read|--ignore-failed-read=*)
+            echo "tar: Option $a is not supported" >&2
+            echo "Usage:" >&2
+            echo "  List:    tar -tf <archive-filename>" >&2
+            exit 1 ;;
+    esac
+done
+"$WV_BSD_SHIM_REAL/tar" "$@"
+rc=$?
+[ "$rc" -le 1 ] || rc=1
+exit "$rc"

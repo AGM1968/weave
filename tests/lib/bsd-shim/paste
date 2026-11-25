@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+: "${WV_BSD_SHIM_REAL:=${0%/*}/../real}"  # env -i drops the export; this stand-in sits in bin/ beside real/ (wv-43082a)
+# BSD paste stand-in (wv-418760): a file operand is required (use - for stdin).
+files=0; skip=0
+for a in "$@"; do
+    if [ "$skip" = 1 ]; then skip=0; continue; fi
+    # An option cluster ending in d (-d, -sd) takes the next word as the
+    # delimiters; before, only a bare -d did, so 'paste -sd " "' counted the
+    # delimiter as a file and passed where BSD refuses (wv-412db3).
+    case "$a" in -d|-[a-z]*d) skip=1 ;; -) files=$((files + 1)) ;; -*) ;; *) files=$((files + 1)) ;; esac
+done
+[ "$files" -gt 0 ] || { echo "usage: paste [-s] [-d delimiters] file ..." >&2; exit 1; }
+exec "$WV_BSD_SHIM_REAL/paste" "$@"

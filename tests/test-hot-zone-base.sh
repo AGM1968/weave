@@ -83,10 +83,25 @@ check "a path deeper in a base is guarded" "/tmp/weave-hotzone-$uid" \
     "$(resolver1 hot_zone_guarded_base "/tmp/weave-hotzone-$uid/a/b")"
 check "a sibling sharing the base's prefix is not guarded" "rc=0" \
     "$(resolver hot_zone_guarded_base "/tmp/weave-hotzone-${uid}x/a")"
+# The live lock base: no test root, whatever this suite inherited (the gate
+# gives each suite its own root, which now prefixes the lock base, wv-b3cb72).
 check "the bash-dedup lock base is guarded" "/tmp/weave-bash-locks-$uid" \
-    "$(resolver1 hot_zone_guarded_base "$(resolver1 resolve_bash_lock_dir abcd1234)")"
+    "$(unset WV_TEST_HOT_ZONE_ROOT; resolver1 hot_zone_guarded_base "$(unset WV_TEST_HOT_ZONE_ROOT; resolver1 resolve_bash_lock_dir abcd1234)")"
 check "the lock directory is per uid" "/tmp/weave-bash-locks-$uid/abcd1234" \
-    "$(resolver1 resolve_bash_lock_dir abcd1234)"
+    "$(unset WV_TEST_HOT_ZONE_ROOT; resolver1 resolve_bash_lock_dir abcd1234)"
+# The test root prefixes the lock base as it prefixes every zone (wv-b3cb72):
+# an isolated suite never reads or clears a live session's in-flight locks.
+mkdir -p "$T/lockroot"
+check "under a test root the lock directory is inside the root" "$T/lockroot/tmp/weave-bash-locks-$uid/abcd1234/s-sess" \
+    "$(WV_TEST_MODE=1 WV_TEST_HOT_ZONE_ROOT="$T/lockroot" resolver1 resolve_bash_lock_dir abcd1234 sess)"
+check "...and that base is guarded" "$T/lockroot/tmp/weave-bash-locks-$uid" \
+    "$(WV_TEST_MODE=1 WV_TEST_HOT_ZONE_ROOT="$T/lockroot" resolver1 hot_zone_guarded_base "$T/lockroot/tmp/weave-bash-locks-$uid/abcd1234")"
+check "...and ensure makes it inside the root, <root>/tmp included, mode 700" "rc=0 700" \
+    "$(WV_TEST_MODE=1 WV_TEST_HOT_ZONE_ROOT="$T/lockroot" resolver hot_zone_ensure "$T/lockroot/tmp/weave-bash-locks-$uid/abcd1234" | tail -1) $(mode_of "$T/lockroot/tmp/weave-bash-locks-$uid")"
+out=$(unset WV_TEST_MODE; WV_TEST_HOT_ZONE_ROOT="$T/lockroot" resolver resolve_bash_lock_dir abcd1234)
+check "without WV_TEST_MODE=1 the root is ignored for locks too" "/tmp/weave-bash-locks-$uid/abcd1234" \
+    "$(grep -m1 '^/' <<< "$out")"
+has "...and says so" "WV_TEST_HOT_ZONE_ROOT needs WV_TEST_MODE=1" "$out"
 out=$(unset WV_TEST_MODE; WV_TEST_HOT_ZONE_BASE="$T/tb" resolver hot_zone_guarded_base "$T/tb/leaf")
 has "the test base is ignored without WV_TEST_MODE=1" "rc=0" "$out"
 check "and not added" "no" "$([[ "$out" == "$T/tb"* ]] && echo yes || echo no)"
@@ -149,36 +164,40 @@ out=$(resolver hot_zone_ensure "$T/chosen/leaf")
 check "a hot zone outside any guarded base is created as before" "rc=0" "$out"
 check "and is 700" "700" "$(mode_of "$T/chosen/leaf")"
 
-# ── concurrent first use: the alias is created once, never inside itself ────
-# wv-5cd5a4: both alias sites check that the neutral name is absent, then link.
+# ── concurrent first use: each link is created once, never inside itself ────
+# wv-5cd5a4: both link sites check that the other name is absent, then link.
 # A second process passing the check before the first links used to run a
-# plain ln -s onto the new alias, which ln treats as a destination directory,
+# plain ln -s onto the new link, which ln treats as a destination directory,
 # leaving legacy/weave-codex-<uid> -> legacy. The ln wrapper makes the
-# interleaving deterministic: the winner's alias lands between the loser's
-# check and its ln.
-echo "concurrent first use: the loser of the alias race adds no link"
+# interleaving deterministic: the winner's link lands between the loser's
+# check and its ln. The legacy site adds the neutral alias beside a legacy
+# directory; the neutral site, first use of a fresh zone, adds the legacy
+# fence link beside the neutral directory (wv-97d68a).
+echo "concurrent first use: the loser of the link race adds no link"
 uid=$(id -u)
-race() {  # race <root> <path to ensure> -> rc of the loser's hot_zone_ensure
+race() {  # race <root> <path to ensure> <winner's link target> <winner's link name>
     WV_TEST_HOT_ZONE_ROOT="$1" bash -c '
-        source "$1"; _hot_zone_tmp_names
-        ln() { if [ -z "${raced:-}" ]; then raced=1; command ln -s -- "$_HZ_LEGACY" "$_HZ_NEUTRAL"; fi; command ln "$@"; }
-        hot_zone_ensure "$2"; echo "rc=$?"' _ "$RESOLVER" "$2" 2>&1
+        source "$1"
+        ln() { if [ -z "${raced:-}" ]; then raced=1; command ln -s -- "$3" "$4"; fi; command ln "$@"; }
+        hot_zone_ensure "$2"; echo "rc=$?"' _ "$RESOLVER" "$2" "$3" "$4" 2>&1
 }
 for site in legacy neutral; do
     R="$T/race-$site"; mkdir -p "$R/tmp"
     N="$R/tmp/weave-hotzone-$uid"; L="$R/tmp/weave-codex-$uid"
     if [ "$site" = legacy ]; then
-        # hot_zone_ensure's own alias step, reached through the legacy name.
-        mkdir -m 700 "$L"; out=$(race "$R" "$L/abcd1234")
+        # hot_zone_ensure's alias step, reached through the legacy name.
+        mkdir -m 700 "$L"; out=$(race "$R" "$L/abcd1234" "$L" "$N")
+        real="$L"; link="$N"; inner="$L/weave-hotzone-$uid"
     else
-        # _hot_zone_mkdir creating the neutral name as the alias.
-        out=$(race "$R" "$N/abcd1234")
+        # hot_zone_ensure's fence-link step, a fresh zone by the neutral name.
+        out=$(race "$R" "$N/abcd1234" "$N" "$L")
+        real="$N"; link="$L"; inner="$N/weave-codex-$uid"
     fi
     check "$site site: the loser still succeeds" "rc=0" "${out##*$'\n'}"
-    check "$site site: no link inside the legacy directory" "absent" \
-        "$([ -L "$L/weave-codex-$uid" ] || [ -e "$L/weave-codex-$uid" ] && echo present || echo absent)"
-    check "$site site: the neutral name is the alias to the legacy directory" "$L" "$(readlink -- "$N")"
-    check "$site site: the legacy directory holds only the repo directory" "abcd1234" "$(ls -A "$L")"
+    check "$site site: no link inside the real directory" "absent" \
+        "$([ -L "$inner" ] || [ -e "$inner" ] && echo present || echo absent)"
+    check "$site site: the other name links to the real directory" "$real" "$(readlink -- "$link")"
+    check "$site site: the real directory holds only the repo directory" "abcd1234" "$(ls -A "$real")"
 done
 unset WV_TEST_MODE
 
@@ -188,11 +207,11 @@ echo "creation sites: no mkdir -p of a hot-zone path outside hot_zone_ensure"
 # umask, which is how the live base became 775. The variables are the ones that
 # name a hot zone, a path in one, or the lock directory.
 hz_vars='WV_HOT_ZONE|_HC_HOT_ZONE|_SC_HOT_ZONE|hot_zone|RING_DIR|BUDGET_DIR|ADVISORY_DIR|LOCK_DIR|WV_RUN_CACHE_DIR|_WV_JOURNAL_FILE|WV_DB|marker|dedup_dir'
-offenders=$(grep -rnE "mkdir -p (-- )?\"?\\\$\{?(${hz_vars})|mkdir -p \"\\\$\(dirname \"\\\$\{?(${hz_vars})" \
+offenders=$(grep -rnIE "mkdir -p (-- )?\"?\\\$\{?(${hz_vars})|mkdir -p \"\\\$\(dirname \"\\\$\{?(${hz_vars})" \
     "$ROOT/scripts/lib" "$ROOT/scripts/cmd" "$ROOT/scripts/hooks" "$ROOT/scripts/wv" 2>/dev/null \
     | grep -v "wv-resolve-runtime.sh" || true)
 check "no unguarded mkdir -p of a hot-zone path" "" "$offenders"
-offenders=$(grep -rn "/tmp/weave-bash-locks/" "$ROOT/scripts" "$ROOT/templates" 2>/dev/null || true)
+offenders=$(grep -rnI "/tmp/weave-bash-locks/" "$ROOT/scripts" "$ROOT/templates" 2>/dev/null || true)
 check "no production path names the uid-less lock directory" "" "$offenders"
 
 # ── end to end through wv ───────────────────────────────────────────────────

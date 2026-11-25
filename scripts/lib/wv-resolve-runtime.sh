@@ -6,6 +6,223 @@
 # - Do not read WV_HOT_ZONE or WV_DB at source time.
 # - Keep process-local memoization inside is_container().
 
+# Hash commands macOS lacks or keeps off a short PATH (wv-7d7d41): macOS 26
+# ships md5sum and sha256sum only in /sbin, older macOS has md5 and shasum
+# only. Every caller of `md5sum`/`sha256sum` in a shell that sourced this file
+# gets the same output format ("<hex>  <name>", "-" for stdin) from whichever
+# exists, so a repository hash keyed on it is the same on every platform.
+# _wv_hash_cmd <md5|sha256> sets _WV_HASH_CMD to a command that prints that
+# format, or fails; for xargs, which cannot call a function.
+_wv_hash_cmd() {
+    local bin="$1sum" d
+    _WV_HASH_CMD=()
+    if d=$(type -P "$bin"); then _WV_HASH_CMD=("$d"); return 0; fi
+    for d in /sbin /usr/sbin; do [ -x "$d/$bin" ] && { _WV_HASH_CMD=("$d/$bin"); return 0; }; done
+    case "$1" in
+        sha256) d=$(type -P shasum) && { _WV_HASH_CMD=("$d" -a 256); return 0; } ;;
+        md5) d=$(type -P md5) && { _WV_HASH_CMD=(_wv_md5_bsd "$d"); return 0; } ;;
+    esac
+    return 1
+}
+# BSD md5 prints the bare digest with -q; this adds md5sum's name column.
+_wv_md5_bsd() {
+    local md5="$1" h f; shift
+    [ "${1:-}" != -- ] || shift
+    if [ "$#" -eq 0 ]; then h=$("$md5" -q) || return 1; printf '%s  -\n' "$h"; return 0; fi
+    for f in "$@"; do
+        if [ "$f" = - ]; then h=$("$md5" -q) || return 1; else h=$("$md5" -q -- "$f") || return 1; fi
+        printf '%s  %s\n' "$h" "$f"
+    done
+}
+_wv_hash() {
+    local algo="$1" _WV_HASH_CMD; shift
+    _wv_hash_cmd "$algo" || { echo "${algo}sum: command not found" >&2; return 127; }
+    "${_WV_HASH_CMD[@]}" "$@"
+}
+# Stand-ins take md5sum's arguments, even where this file calls them with none.
+# shellcheck disable=SC2120
+md5sum() { _wv_hash md5 "$@"; }
+# shellcheck disable=SC2120
+sha256sum() { _wv_hash sha256 "$@"; }
+
+# wv_rename_new <src> <dst> -- rename src to dst, which must not exist: the
+# guard GNU mv -T gives against moving into an existing directory, on any mv
+# (BSD mv has no -T, wv-0bcb09).
+wv_rename_new() {
+    if [ -e "$2" ] || [ -L "$2" ]; then echo "rename: $2 already exists" >&2; return 1; fi
+    mv -- "$1" "$2"
+}
+
+# Portable realpath forms (wv-e7426f): macOS realpath takes only -q, so GNU's
+# -e, -m and --relative-to are spelled with plain realpath, which resolves an
+# existing path fully on both.
+# wv_realpath_existing <path> -- canonical path of something that exists (GNU -e).
+wv_realpath_existing() {
+    [ -e "$1" ] || return 1
+    realpath -- "$1" 2>/dev/null
+}
+# wv_realpath_missing <path> -- canonical path whose tail may not exist yet
+# (GNU -m): the longest existing ancestor resolved, the rest appended as given.
+wv_realpath_missing() {
+    local p="$1" rest="" head
+    case "$p" in /*) ;; *) p="$PWD/$p" ;; esac
+    while [ ! -e "$p" ] && [ ! -L "$p" ]; do
+        rest="/${p##*/}$rest"
+        p=${p%/*}
+        [ -n "$p" ] || { p=/; break; }
+    done
+    head=$(realpath -- "$p" 2>/dev/null) || return 1
+    [ "$head" != / ] || head=""
+    printf '%s%s\n' "$head" "$rest"
+}
+# wv_relpath <root> <path> -- path relative to root ("." for root itself);
+# fails when path is not under root, where GNU would print ../.
+wv_relpath() {
+    local root path
+    root=$(wv_realpath_missing "$1") || return 1
+    path=$(wv_realpath_missing "$2") || return 1
+    if [ "$path" = "$root" ]; then echo .; return 0; fi
+    case "$path" in "${root%/}"/*) printf '%s\n' "${path#"${root%/}"/}" ;; *) return 1 ;; esac
+}
+
+# wv_stat <mtime|size|dev|ino> <path> -- one numeric field of <path> itself
+# (links not followed) from GNU stat -c or BSD stat -f (wv-372560). Prints
+# nothing and fails when neither gives a number: on Linux `stat -f` is the
+# file-system form, so its output is checked, never trusted.
+wv_stat() {
+    local gnu bsd out
+    case "$1" in
+        mtime) gnu=%Y bsd=%m ;; size) gnu=%s bsd=%z ;;
+        dev) gnu=%d bsd=%d ;; ino) gnu=%i bsd=%i ;; *) return 2 ;;
+    esac
+    out=$(stat -c "$gnu" -- "$2" 2>/dev/null) && [[ "$out" =~ ^[0-9]+$ ]] \
+        || out=$(stat -f "$bsd" -- "$2" 2>/dev/null) || return 1
+    [[ "$out" =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "$out"
+}
+
+# wv_now <ns|ms|us> [<var>] -- the wall clock now: nanoseconds, milliseconds,
+# or "<seconds>.<microseconds>" (wv-99f296). BSD date prints %N as a literal N
+# and exits 0, so date's answer is checked; when it is not a number the
+# reading comes from _wv_clock_ns: bash's EPOCHREALTIME, else python3. Fails
+# when no clock answers. date is asked first, in the caller's format, so a test's date stub
+# still steers the reading. Durations belong to wv-clock.sh; this is for ids,
+# stamps and wall-clock timers.
+_wv_clock_ns() {
+    if [[ "${EPOCHREALTIME:-}" =~ ^([0-9]+)[.,]([0-9]{6})$ ]]; then
+        printf '%s%s000\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+        return 0
+    fi
+    python3 -I -S -c 'import time; print(time.time_ns())' 2>/dev/null
+}
+# _wv_clock_as <ns|ms|us> -- a _wv_clock_ns reading in wv_now's units.
+_wv_clock_as() {
+    local t
+    t=$(_wv_clock_ns) && [[ "$t" =~ ^[0-9]{19,}$ ]] || return 1
+    case "$1" in
+        ns) printf '%s\n' "$t" ;;
+        ms) printf '%s\n' "${t:0:${#t}-6}" ;;
+        us) printf '%s.%s\n' "${t:0:${#t}-9}" "${t:${#t}-9:6}" ;;
+    esac
+}
+wv_now() {
+    local _wn_fmt _wn_t
+    case "$1" in ns) _wn_fmt=+%s%N ;; ms) _wn_fmt=+%s%3N ;; us) _wn_fmt=+%s.%6N ;; *) return 2 ;; esac
+    _wn_t=$(date "$_wn_fmt" 2>/dev/null)
+    [[ "$_wn_t" =~ ^[0-9]{13,}(\.[0-9]{6})?$ ]] || _wn_t=$(_wv_clock_as "$1") || return 1
+    if [ -n "${2:-}" ]; then printf -v "$2" '%s' "$_wn_t"; else printf '%s\n' "$_wn_t"; fi
+}
+
+# wv_date_epoch <stamp> -- epoch seconds of a UTC stamp: YYYY-MM-DD, with an
+# optional " HH:MM[:SS]" or "THH:MM[:SS]", fractional seconds, and a trailing
+# Z or +00:00; or "@<epoch>" (wv-e1ee87). Zone-less stamps are UTC, as sqlite
+# writes them. GNU date -d or BSD date -j -f; fails on anything else rather
+# than answering 0, which reads as "very old".
+wv_date_epoch() {
+    local s="$1" out
+    if [[ "$s" =~ ^@([0-9]+)$ ]]; then printf '%s\n' "${BASH_REMATCH[1]}"; return 0; fi
+    s=${s%Z}; s=${s%+00:00}; s=${s/T/ }
+    [[ "$s" =~ ^([0-9]{4}-[0-9]{2}-[0-9]{2})(\ ([0-9]{2}:[0-9]{2})(:([0-9]{2})(\.[0-9]+)?)?)?$ ]] || return 1
+    s="${BASH_REMATCH[1]} ${BASH_REMATCH[3]:-00:00}:${BASH_REMATCH[5]:-00}"
+    out=$(date -u -d "$s" +%s 2>/dev/null) && [[ "$out" =~ ^-?[0-9]+$ ]] \
+        || out=$(date -j -u -f '%Y-%m-%d %H:%M:%S' "$s" +%s 2>/dev/null) || return 1
+    [[ "$out" =~ ^-?[0-9]+$ ]] || return 1
+    printf '%s\n' "$out"
+}
+
+# wv_date_fmt [-u] <epoch> <+format> -- format epoch seconds with GNU date -d @
+# or BSD date -r (wv-e1ee87); -u for UTC, else local time. Fails, printing
+# nothing, when neither accepts it.
+wv_date_fmt() {
+    local u=()
+    [ "$1" != -u ] || { u=(-u); shift; }
+    [[ "$1" =~ ^[0-9]+$ ]] || return 1
+    date "${u[@]}" -d "@$1" "$2" 2>/dev/null || date "${u[@]}" -r "$1" "$2" 2>/dev/null
+}
+
+# wv_bound [--group] <duration> <command...> -- run <command> with a deadline,
+# one mechanism on every host (owner ruling on wv-ea88cd, 2026-11-22: the
+# deadline is Weave's policy everywhere; stopping a stage is a platform trait
+# Weave absorbs). perl forks the command; at the deadline it sends TERM, then
+# KILL after one second, and the call returns 124, as timeout(1) does.
+# <duration> is seconds, fractions allowed, with an optional s, m or h.
+# Without --group only the command is signalled and it stays in the caller's
+# process group, keeping the terminal's signals (timeout --foreground). With
+# --group it runs in a group of its own and the whole group is signalled, so
+# a child holding a lock or the caller's output pipe goes with it. Without
+# perl, timeout(1) with the same semantics; with neither it refuses with 125
+# rather than run unbounded. Otherwise the command's own status (128+N when
+# a signal ended it).
+wv_bound() {
+    local group=0 d secs
+    [ "${1:-}" != --group ] || { group=1; shift; }
+    d="${1:-}"; shift || true
+    if [[ "$d" =~ ^([0-9]+([.][0-9]+)?)([smh]?)$ ]]; then
+        case "${BASH_REMATCH[3]}" in
+            m) secs=$(awk -v n="${BASH_REMATCH[1]}" 'BEGIN{print n*60}') ;;
+            h) secs=$(awk -v n="${BASH_REMATCH[1]}" 'BEGIN{print n*3600}') ;;
+            *) secs="${BASH_REMATCH[1]}" ;;
+        esac
+    else
+        echo "wv_bound: '$d' is not a duration" >&2
+        return 125
+    fi
+    [ "$#" -gt 0 ] || { echo "wv_bound: no command" >&2; return 125; }
+    if command -v perl >/dev/null 2>&1; then
+        perl -MPOSIX -MTime::HiRes=alarm,sleep -e '
+            my ($t, $grp) = (shift, shift);
+            my $pid = fork;
+            defined $pid or exit 125;
+            if (!$pid) { POSIX::setpgid(0, 0) if $grp; exec @ARGV or exit 127; }
+            my $tgt = $grp ? -$pid : $pid;
+            # perl restarts a blocking waitpid after a handler, so the
+            # escalation lives in the handler: TERM at the deadline, KILL one
+            # second later if the command ignored it.
+            my $expired = 0;
+            $SIG{ALRM} = sub {
+                if ($expired) { kill "KILL", $tgt; return; }
+                $expired = 1; kill "TERM", $tgt; alarm 1;
+            };
+            alarm $t;
+            waitpid($pid, 0);
+            alarm 0;
+            exit 124 if $expired;
+            my $s = $?;
+            exit(($s & 127) ? 128 + ($s & 127) : $s >> 8);
+        ' "$secs" "$group" "$@"
+        return "$?"
+    fi
+    if command -v timeout >/dev/null 2>&1; then
+        local rc=0
+        if [ "$group" -eq 1 ]; then timeout -k 1 "$secs" "$@" || rc=$?
+        else timeout --foreground -k 1 "$secs" "$@" || rc=$?; fi
+        [ "$rc" -ne 137 ] || rc=124
+        return "$rc"
+    fi
+    echo "wv_bound: no perl and no timeout(1); refusing to run '$1' unbounded" >&2
+    return 125
+}
+
 # Check if a path has enough free space (in KB)
 check_free_space() { # predicate
     local path="$1"
@@ -256,11 +473,7 @@ _wv_session_sid_compute() {
     _WV_SESSION_SID_FOR="$_WV_SESSION_RAW"; _WV_SESSION_SID=""; _WV_SESSION_NOHASH=0
     [ -n "$_WV_SESSION_RAW" ] || return 0
     local out=""
-    if command -v sha256sum >/dev/null 2>&1; then
-        out=$(printf '%s' "$_WV_SESSION_RAW" | sha256sum 2>/dev/null) || out=""
-    elif command -v shasum >/dev/null 2>&1; then
-        out=$(printf '%s' "$_WV_SESSION_RAW" | shasum -a 256 2>/dev/null) || out=""
-    fi
+    out=$(printf '%s' "$_WV_SESSION_RAW" | sha256sum 2>/dev/null) || out=""
     out="${out%% *}"
     if [[ "$out" =~ ^[0-9a-f]{64}$ ]]; then _WV_SESSION_SID="${out:0:16}"; else _WV_SESSION_NOHASH=1; fi
 }
@@ -440,6 +653,81 @@ read_hot_zone_owner() {
     cat "$owner_file" 2>/dev/null || echo ""
 }
 
+# hot_zone_owner_state <hot-zone dir> — print "live", "gone" or "unknown" and,
+# after a tab, why: whether the repository that owns a hot-zone directory is
+# known to be deleted (wv-4ccc98). The one predicate behind wv hotzone gc and
+# doctor's orphan check, which delete or advise deleting on it. A hot zone can
+# hold writes no repository holds yet (node_files before a snapshot, wv-64178f;
+# a store a failed sync could not publish), so an owner that cannot be seen is
+# unknown, never gone:
+#   - no .repo_root: unknown (wv init leaves a zone unstamped until a later
+#     command names its owner, wv-29e416);
+#   - the owner path is a directory: live;
+#   - absent, and its parent directory is present and lists entries: gone (the
+#     repository itself was removed from a filesystem that is there);
+#   - absent under a temporary root (/tmp, /var/tmp, /dev/shm, $TMPDIR) with
+#     the whole scratch tree gone: gone;
+#   - anything else (a parent missing or empty, as an unmounted disk leaves
+#     it; an unreadable parent): unknown.
+# _hz_tmpdir_base <var> -- the temporary root named by $<var> (TMPDIR, TEMP),
+# default /tmp, without a trailing slash: macOS sets TMPDIR to
+# /var/folders/.../T/, and a join kept the slash, so zone paths read
+# .../T//weave-<uid> and failed every prefix check (wv-4ccc98).
+_hz_tmpdir_base() {
+    local t="${!1:-/tmp}"
+    t="${t%/}"
+    printf '%s\n' "${t:-/}"
+}
+
+hot_zone_owner_state() {
+    local owner parent tmp
+    owner=$(read_hot_zone_owner "$1")
+    owner="${owner%/}"
+    if [ -z "$owner" ]; then
+        printf 'unknown\tno owner recorded (.repo_root)\n'
+    elif [ -d "$owner" ]; then
+        printf 'live\t%s\n' "$owner"
+    elif [ -e "$owner" ] || [ -L "$owner" ]; then
+        printf 'unknown\t%s exists but is not a directory\n' "$owner"
+    else
+        parent="${owner%/*}"
+        if [ -n "$parent" ] && [ -d "$parent" ] && [ -r "$parent" ] && [ -n "$(ls -A -- "$parent" 2>/dev/null)" ]; then
+            printf 'gone\t%s removed from %s\n' "$owner" "$parent"
+            return 0
+        fi
+        # Each root as written and canonical: .repo_root holds the canonical
+        # path, and on macOS /tmp and $TMPDIR (/var/folders/...) resolve
+        # under /private (wv-4ccc98).
+        for tmp in /tmp /var/tmp /dev/shm "$(_hz_tmpdir_base TMPDIR)"; do
+            case "$owner" in
+                "$tmp"/*|"$(canonicalize_runtime_path "$tmp")"/*)
+                    printf 'gone\t%s was under %s and is gone\n' "$owner" "$tmp"; return 0 ;;
+            esac
+        done
+        printf 'unknown\t%s not found, and %s is missing or empty (an unmounted disk?)\n' "$owner" "${parent:-/}"
+    fi
+}
+
+# hot_zone_rebuild_advice [<hot-zone dir>] — the one recovery command printed
+# when a hot zone must be rebuilt from .weave/ (wv-4ccc98). It moves the zone
+# aside instead of deleting it: the states that call for a rebuild (a lineage
+# schema sync cannot stamp, a failed delta publish) are exactly the ones in
+# which the zone holds writes no repository has yet, and node_files rows reach
+# disk only in a snapshot (wv-64178f). It names the resolved path, since a
+# user's shell has no WV_HOT_ZONE.
+hot_zone_rebuild_advice() {
+    local hz="${1:-${WV_HOT_ZONE:-}}" aside
+    hz="${hz%/}"
+    if [ -z "$hz" ]; then
+        echo "move this repository's hot zone (the directory of wv hotzone db) aside, wv load, then wv hotzone diff the old brain.db against the new one and carry over what only the old copy holds"
+        return 0
+    fi
+    aside="${hz}.broken-$(date +%Y%m%d%H%M%S)"
+    # shellcheck disable=SC2016  # $(wv hotzone db) is for the user's shell to run
+    printf 'mv %s %s && wv load; then wv hotzone diff %s "$(wv hotzone db)" and carry over what only the old copy holds before removing it\n' \
+        "$hz" "$aside" "$aside/brain.db"
+}
+
 hot_zone_matches_repo() {
     local hot_zone="$1"
     local repo_root="$2"
@@ -473,19 +761,24 @@ hot_zone_matches_repo() {
 # hot_zone_ensure is the one function here that creates anything; it acts
 # only when called (the source-only contract above is about source time).
 
-# ── The /tmp zone's two names (wv-95bddf) ────────────────────────────────────
+# ── The /tmp zone's two names (wv-95bddf, wv-97d68a) ─────────────────────────
 # The /tmp zone is named /tmp/weave-hotzone-<uid>: it names the storage, not an
 # agent. Its old name, /tmp/weave-codex-<uid>, made two investigations read it
-# as a Codex-only zone. Old binaries create and use only the old name, so
-# while hosts run mixed versions the legacy directory stays the physical one
-# and the neutral name is at most a symlink to it, which hot_zone_ensure adds
-# (owner decision 2026-10-05). Nothing here moves or renames live storage.
-# A neutral name that is a real directory is what a deliberate relocation
-# leaves; it is then used directly. Beside a real legacy directory it comes
-# first only when it alone holds databases: otherwise the legacy directory
-# stays the authority, and a new repository lands there rather than making a
-# second populated zone. Both names as separate directories that both hold
-# databases is refused: that is two sets of graphs, and nothing here picks.
+# as a Codex-only zone.
+# Created fresh (owner decision 2026-11-19, wv-97d68a), the neutral name is the
+# real directory and the legacy name a symlink to it: a fence, never used as a
+# base. Releases from rc.14 read that layout; an older binary refuses the
+# symlinked base (wv-80be32) or, older still, follows it into the same
+# directory, so none can make a second populated zone.
+# The earlier layout, a real legacy directory with the neutral name a symlink
+# to it (owner decision 2026-10-05), is still adopted as it stands: rc.14 to
+# rc.18 create it, and nothing here moves live storage. wv hotzone migrate
+# (lib/wv-hotzone-migrate.sh) relocates it, by hand, in a quiet window.
+# Beside a real legacy directory the neutral directory comes first only when it
+# alone holds databases: otherwise the legacy directory stays the authority,
+# and a new repository lands there rather than making a second populated zone.
+# Both names as separate directories that both hold databases is refused: that
+# is two sets of graphs, and nothing here picks.
 
 # _hot_zone_tmp_names — set _HZ_NEUTRAL and _HZ_LEGACY, the /tmp zone's two
 # names. Under WV_TEST_MODE=1, WV_TEST_HOT_ZONE_ROOT (an absolute path)
@@ -538,11 +831,12 @@ _hot_zone_linux_zones() {
         else
             _HZ_ZONES=("$_HZ_NEUTRAL")
         fi
-    elif [ -e "$_HZ_LEGACY" ] || [ -L "$_HZ_LEGACY" ]; then
+    elif [ -e "$_HZ_LEGACY" ] && [ ! -L "$_HZ_LEGACY" ]; then
         # Only the legacy name: hot_zone_ensure adds the alias on first use.
         _HZ_ZONES=("$_HZ_LEGACY")
     else
-        # Neither: hot_zone_ensure creates the legacy directory and the alias.
+        # Neither, or only a legacy fence link whose directory is gone:
+        # hot_zone_ensure creates the neutral directory and the fence link.
         _HZ_ZONES=("$_HZ_NEUTRAL")
     fi
     _HZ_ZONES+=("${_HZ_ROOT}/dev/shm/weave" "${_HZ_ROOT}/tmp/weave-${UID}")
@@ -565,18 +859,21 @@ _hot_zone_inventory() {
 }
 
 # _hot_zone_pair <base> — set _HZ_ALIAS_TARGET to the legacy directory when
-# <base> is the neutral name (the one symlink target it may have), and
-# _HZ_ALIAS_NAME to the neutral name when <base> is the legacy directory (the
-# alias hot_zone_ensure adds beside it). Both empty for any other base.
+# <base> is the neutral name (the one symlink target it may have, the layout
+# rc.14 to rc.18 create), and _HZ_ALIAS_NAME to the zone's other name, which
+# hot_zone_ensure links to <base> when it is absent: the legacy fence link
+# beside the neutral directory (wv-97d68a), or the neutral alias beside a
+# legacy directory. Both empty for any other base.
 _hot_zone_pair() {
     local base="${1%/}"
     _HZ_ALIAS_TARGET=""
     _HZ_ALIAS_NAME=""
     _hot_zone_tmp_names
     case "$base" in
-        "$_HZ_NEUTRAL") _HZ_ALIAS_TARGET="$_HZ_LEGACY" ;;
+        "$_HZ_NEUTRAL") _HZ_ALIAS_TARGET="$_HZ_LEGACY"; _HZ_ALIAS_NAME="$_HZ_LEGACY" ;;
         "$_HZ_LEGACY") _HZ_ALIAS_NAME="$_HZ_NEUTRAL" ;;
-        "/tmp/weave-hotzone-${UID}") _HZ_ALIAS_TARGET="/tmp/weave-codex-${UID}" ;;
+        "/tmp/weave-hotzone-${UID}") _HZ_ALIAS_TARGET="/tmp/weave-codex-${UID}"
+            _HZ_ALIAS_NAME="/tmp/weave-codex-${UID}" ;;
         "/tmp/weave-codex-${UID}") _HZ_ALIAS_NAME="/tmp/weave-hotzone-${UID}" ;;
     esac
 }
@@ -594,10 +891,15 @@ _hot_zone_bases() {
     if [ -n "${WV_TEST_HOT_ZONE_ROOT:-}" ]; then
         _hot_zone_tmp_names
         _HZ_BASES+=("$_HZ_NEUTRAL" "$_HZ_LEGACY" "${_HZ_ROOT}/dev/shm/weave"
-            "${_HZ_ROOT}/tmp/weave-${UID}")
+            "${_HZ_ROOT}/tmp/weave-${UID}" "${_HZ_ROOT}/tmp/weave-bash-locks-${UID}")
     fi
     case "${OSTYPE:-}" in
-        darwin*) _HZ_BASES+=("${TMPDIR:-/tmp}/weave-${UID}") ;;
+        # The live temp-directory zone, and under a test root the zone
+        # resolve_hot_zone now places there (wv-19572f).
+        darwin*) _HZ_BASES+=("$(_hz_tmpdir_base TMPDIR)/weave-${UID}")
+            [ -z "${WV_TEST_HOT_ZONE_ROOT:-}" ] || [ -z "${_HZ_ROOT:-}" ] || _HZ_BASES+=("${_HZ_ROOT}$(_hz_tmpdir_base TMPDIR)/weave-${UID}") ;;
+        msys*|cygwin*|win32*)
+            [ -z "${WV_TEST_HOT_ZONE_ROOT:-}" ] || [ -z "${_HZ_ROOT:-}" ] || _HZ_BASES+=("${_HZ_ROOT}$(_hz_tmpdir_base TEMP)/weave-${UID}") ;;
     esac
     [ -n "${WV_TEST_HOT_ZONE_BASE:-}" ] || return 0
     if [ "${WV_TEST_MODE:-}" = "1" ] && [ "${WV_TEST_HOT_ZONE_BASE:0:1}" = "/" ]; then
@@ -634,20 +936,50 @@ hot_zone_guarded_base() {
     done
 }
 
-# resolve_bash_lock_dir <repo-hash> — the bash-dedup lock directory for a repo.
+# resolve_bash_lock_dir <repo-hash> [<session-key>] — the bash-dedup lock
+# directory for a repo, and within it for one session when <session-key> is
+# given (wv-da7c28): sessions on one repository run their hooks from the same
+# project directory, so a repo-only key let one session's running commit deny
+# another's, with a notification the denied session never receives. A call that
+# names no session keeps the repository's shared directory.
 # Per uid and guarded like a hot-zone base: the uid-less /tmp/weave-bash-locks
 # it replaces could be created first by another user (wv-80be32).
+# Under WV_TEST_MODE=1 an absolute WV_TEST_HOT_ZONE_ROOT prefixes it, as it
+# prefixes every hot zone: a suite isolated by the root no longer reads or
+# clears a live session's in-flight locks (wv-b3cb72).
 resolve_bash_lock_dir() {
-    printf '/tmp/weave-bash-locks-%s/%s\n' "$UID" "$1"
+    local base="/tmp/weave-bash-locks-${UID}"
+    if [ -n "${WV_TEST_HOT_ZONE_ROOT:-}" ]; then
+        _hot_zone_tmp_names
+        base="${_HZ_ROOT}${base}"
+    fi
+    if [ -n "${2:-}" ]; then
+        printf '%s/%s/s-%s\n' "$base" "$1" "$2"
+    else
+        printf '%s/%s\n' "$base" "$1"
+    fi
+}
+
+# hook_session_lock_key <payload> — the session a hook call belongs to, as a
+# directory-safe name for resolve_bash_lock_dir: the payload's session_id
+# (Claude Code, Copilot CLI), thread_id (Codex) or sessionId, else
+# WV_SESSION_ID, else nothing (wv-da7c28).
+hook_session_lock_key() {
+    local sid
+    sid=$(printf '%s' "${1:-}" | jq -r '(.session_id // .thread_id // .sessionId // empty) | strings' 2>/dev/null) || sid=""
+    [ -n "$sid" ] || sid="${WV_SESSION_ID:-}"
+    sid=${sid//[^A-Za-z0-9_-]/}
+    printf '%s\n' "${sid:0:64}"
 }
 
 # _hot_zone_owner_mode <path> — print "<uid> <octal mode>" of <path> itself,
 # never of a symlink's target (stat does not follow links by default).
 _hot_zone_owner_mode() {
-    case "${OSTYPE:-}" in
-        darwin*|*bsd*) stat -f '%u %Lp' -- "$1" 2>/dev/null ;;
-        *) stat -c '%u %a' -- "$1" 2>/dev/null ;;
-    esac
+    local out
+    out=$(stat -c '%u %a' -- "$1" 2>/dev/null) && [[ "$out" =~ ^[0-9]+\ [0-7]+$ ]] \
+        || out=$(stat -f '%u %Lp' -- "$1" 2>/dev/null) || return 1
+    [[ "$out" =~ ^[0-9]+\ [0-7]+$ ]] || return 1
+    printf '%s\n' "$out"
 }
 
 # hot_zone_dir_problem <path> [<alias-target>] — print why <path> may not be a
@@ -744,36 +1076,47 @@ _hot_zone_symlink() {
 # _hot_zone_mkdir <path> [<alias-target>] — create one directory, mode 700,
 # and verify what is there afterwards without following links. A path that
 # already exists, or that another process creates first, gets the same
-# verification. With <alias-target> (the neutral name, wv-95bddf), an absent
-# <path> becomes a symlink to <alias-target>, which is created first: the
-# neutral name is never created as a real directory while old binaries can
-# still create the legacy one beside it.
+# verification. <alias-target> (the legacy name when <path> is the neutral
+# one, wv-95bddf) is the one symlink target an existing <path> may have; a
+# neutral alias that outlived its legacy directory is replaced by the real
+# directory (wv-97d68a), which is what an absent neutral name becomes too.
 _hot_zone_mkdir() {
-    local path="$1" alias_target="${2:-}" problem
-    if [ -n "$alias_target" ] && [ -L "$path" ] && [ ! -e "$alias_target" ] && [ ! -L "$alias_target" ]; then
-        # The alias outlived its legacy directory: recreate the directory.
-        problem=$(_hot_zone_mkdir "$alias_target")
-        if [ -n "$problem" ]; then
-            echo "would alias ${alias_target}, which ${problem}"
-            return 0
-        fi
-    elif [ ! -e "$path" ] && [ ! -L "$path" ]; then
-        if [ -n "$alias_target" ]; then
-            problem=$(_hot_zone_mkdir "$alias_target")
-            if [ -n "$problem" ]; then
-                echo "would alias ${alias_target}, which ${problem}"
-                return 0
-            fi
-            _hot_zone_symlink "$alias_target" "$path" || true
-        else
-            ( umask 077 && mkdir -- "$path" ) 2>/dev/null || true
-        fi
+    local path="$1" alias_target="${2:-}"
+    if [ -n "$alias_target" ] && [ -L "$path" ] && [ ! -e "$alias_target" ] && [ ! -L "$alias_target" ] \
+        && [ "$(readlink -- "$path")" = "$alias_target" ]; then
+        # The alias reaches nothing: drop the link, not anything it named.
+        rm -f -- "$path" 2>/dev/null || true
+    fi
+    if [ ! -e "$path" ] && [ ! -L "$path" ]; then
+        ( umask 077 && mkdir -- "$path" ) 2>/dev/null || true
     fi
     if [ ! -e "$path" ] && [ ! -L "$path" ]; then
         echo "could not be created"
         return 0
     fi
     hot_zone_dir_problem "$path" "$alias_target"
+}
+
+# _hot_zone_test_tmpdir_parent <base> — under WV_TEST_MODE=1 with a test root,
+# create the parent of the prefixed temp-directory zone (<root>$TMPDIR on
+# macOS, <root>$TEMP on Windows) inside that root. A guarded base is made
+# with a plain mkdir because its parent is a shared system directory that
+# exists; under a test root that parent is the root plus the whole $TMPDIR
+# path, which no suite should have to spell (wv-19572f). Nothing else, and
+# nothing outside the test root, is ever created here.
+_hot_zone_test_tmpdir_parent() {
+    [ "${WV_TEST_MODE:-}" = "1" ] && [ -n "${WV_TEST_HOT_ZONE_ROOT:-}" ] && [ -n "${_HZ_ROOT:-}" ] || return 0
+    local t=""
+    case "${OSTYPE:-}" in
+        darwin*) t=$(_hz_tmpdir_base TMPDIR) ;;
+        msys*|cygwin*|win32*) t=$(_hz_tmpdir_base TEMP) ;;
+    esac
+    # The temp-directory zone, or the bash-dedup lock base (wv-b3cb72), whose
+    # parent <root>/tmp a suite that never made the Linux zones may not have.
+    if { [ -n "$t" ] && [ "$1" = "${_HZ_ROOT}${t}/weave-${UID}" ]; } \
+        || [ "$1" = "${_HZ_ROOT}/tmp/weave-bash-locks-${UID}" ]; then
+        [ -d "${1%/*}" ] || ( umask 077 && mkdir -p -- "${1%/*}" ) 2>/dev/null || true
+    fi
 }
 
 # hot_zone_ensure <path> — create <path> for use. Under a guarded base, the
@@ -793,15 +1136,17 @@ hot_zone_ensure() {
         return $?
     fi
     _hot_zone_pair "$base"
+    _hot_zone_test_tmpdir_parent "$base"
     problem=$(_hot_zone_mkdir "$base" "$_HZ_ALIAS_TARGET")
     if [ -n "$problem" ]; then
         hot_zone_report_problem "$base" "$problem"
         return 1
     fi
-    # The legacy directory in use and no neutral name yet: add the alias, so
-    # the next resolution reaches this directory by the neutral name. Best
-    # effort; whatever is there instead, including an alias another process
-    # created first, is judged when it is resolved.
+    # The zone's other name absent: link it here. Beside the neutral directory
+    # it is the legacy fence link (wv-97d68a); beside a legacy directory, the
+    # neutral alias. Best effort; whatever is there instead, including a link
+    # another process created first, is judged when it is resolved. A neutral
+    # alias never gets a link here: its legacy directory exists.
     if [ -n "$_HZ_ALIAS_NAME" ] && [ ! -e "$_HZ_ALIAS_NAME" ] && [ ! -L "$_HZ_ALIAS_NAME" ]; then
         _hot_zone_symlink "$base" "$_HZ_ALIAS_NAME" || true
     fi
@@ -843,13 +1188,18 @@ resolve_hot_zone() {
 
     local repo_root="${1:-}" uid="${UID}"
     local weave_dir="${WEAVE_DIR:-${WV_PROJECT_DIR:-$PWD}/.weave}"
+    # The test root prefixes the temp-directory zone too, as it prefixes the
+    # Linux zones: without it a suite on macOS or Windows that isolates its
+    # zones still resolved the per-user zone a live session uses (wv-19572f).
     case "${OSTYPE:-}" in
         linux*) ;;
         darwin*)
-            echo "${TMPDIR:-/tmp}/weave-${uid}"
+            _hot_zone_tmp_names
+            echo "${_HZ_ROOT}$(_hz_tmpdir_base TMPDIR)/weave-${uid}"
             return 0 ;;
         msys*|cygwin*|win32*)
-            echo "${TEMP:-/tmp}/weave-${uid}"
+            _hot_zone_tmp_names
+            echo "${_HZ_ROOT}$(_hz_tmpdir_base TEMP)/weave-${uid}"
             return 0 ;;
         *)
             echo "$weave_dir"
@@ -940,33 +1290,12 @@ resolve_repo_hot_zone() {
 }
 
 resolve_unix_clock_parts() {
-    local epoch_ns=""
-    local epoch_sec=""
-    local epoch_subsec=""
-    local split=0
-
-    epoch_ns=$(date +%s%N 2>/dev/null || echo "")
-    if [[ "$epoch_ns" =~ ^[0-9]{10,}$ ]]; then
-        split=$(( ${#epoch_ns} - 9 ))
-        epoch_sec="${epoch_ns:0:split}"
-        epoch_subsec="${epoch_ns:split:9}"
-        printf '%s %s\n' "$epoch_sec" "$epoch_subsec"
+    local _ucp_ns
+    if wv_now ns _ucp_ns; then
+        printf '%s %s\n' "${_ucp_ns:0:${#_ucp_ns}-9}" "${_ucp_ns:${#_ucp_ns}-9}"
         return 0
     fi
-
-    if command -v python3 >/dev/null 2>&1; then
-        epoch_ns=$(python3 -c 'import time; print(time.time_ns())' 2>/dev/null || echo "")
-        if [[ "$epoch_ns" =~ ^[0-9]{10,}$ ]]; then
-            split=$(( ${#epoch_ns} - 9 ))
-            epoch_sec="${epoch_ns:0:split}"
-            epoch_subsec="${epoch_ns:split:9}"
-            printf '%s %s\n' "$epoch_sec" "$epoch_subsec"
-            return 0
-        fi
-    fi
-
-    epoch_sec=$(date +%s 2>/dev/null || echo "0")
-    printf '%s %09d\n' "$epoch_sec" 0
+    printf '%s %09d\n' "$(date +%s 2>/dev/null || echo 0)" 0
 }
 
 resolve_delta_filename_prefix() {

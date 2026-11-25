@@ -47,7 +47,7 @@ setup_test_env() {
 }
 
 strip_ansi() {
-    sed 's/\x1b\[[0-9;]*m//g'
+    LC_ALL=C sed $'s/\e\\[[0-9;]*m//g'
 }
 
 # NORMALIZE FIRST, THEN MATCH ON A HERESTRING -- never `echo "$x" | strip_ansi |

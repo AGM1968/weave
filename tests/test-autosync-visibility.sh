@@ -56,7 +56,7 @@ mapfile -t invocations < <(
         | grep -vE '\bauto_sync "\$@"'
 )
 
-raw_passthrough=$(grep -rc '^[[:space:]]*auto_sync "\$@"' "$ROOT/scripts/cmd/wv-cmd-data.sh")
+raw_passthrough=$(grep -c '^[[:space:]]*auto_sync "\$@"' "$ROOT/scripts/cmd/wv-cmd-data.sh")
 check "exactly two guarded wrappers invoke auto_sync directly" "2" "$raw_passthrough"
 
 if [ "${#invocations[@]}" -eq 0 ]; then

@@ -18,9 +18,9 @@ trap 'rm -rf "$TMP"' EXIT
 
 echo "=== one authority ==="
 contract=$(jq -r '.fields.risk_level.value.enum | sort | join(" ")' "$ROOT/contracts/node-field-registry-v1.json")
-cli=$(bash -c '. "$1/scripts/lib/wv-validate.sh" >/dev/null 2>&1; printf "%s\n" $VALID_RISK_LEVELS' _ "$ROOT" | sort | paste -sd' ')
-writer=$(grep -oE '^RISK_LEVELS = \{[^}]*\}' "$ROOT/scripts/lib/wv-delta.sh" | grep -oE '"[a-z]+"' | tr -d '"' | sort | paste -sd' ')
-replayer=$(grep -oE '^RISK_LEVELS = \{[^}]*\}' "$ROOT/scripts/lib/wv-delta-v2-replay.py" | grep -oE '"[a-z]+"' | tr -d '"' | sort | paste -sd' ')
+cli=$(bash -c '. "$1/scripts/lib/wv-validate.sh" >/dev/null 2>&1; printf "%s\n" $VALID_RISK_LEVELS' _ "$ROOT" | sort | paste -sd' ' -)
+writer=$(grep -oE '^RISK_LEVELS = \{[^}]*\}' "$ROOT/scripts/lib/wv-delta.sh" | grep -oE '"[a-z]+"' | tr -d '"' | sort | paste -sd' ' -)
+replayer=$(grep -oE '^RISK_LEVELS = \{[^}]*\}' "$ROOT/scripts/lib/wv-delta-v2-replay.py" | grep -oE '"[a-z]+"' | tr -d '"' | sort | paste -sd' ' -)
 [ -n "$contract" ] && [ "$cli" = "$contract" ] && ok "the CLI enum is the contract's ($contract)" ||
     bad "the CLI enum is the contract's" "contract=[$contract] cli=[$cli]"
 [ "$writer" = "$contract" ] && ok "the Delta v2 writer enforces the contract's enum" ||
@@ -43,11 +43,11 @@ else
     ok "no procedure or skill restates the risk_level value list"
 fi
 _usage_out=$(cd "$TMP" && "$WV" add 2>&1 || true)
-usage_set=$(grep -oE -- '--risks=[a-z|]+' <<< "$_usage_out" | sed -n 1p | sed 's/--risks=//' | tr '|' '\n' | sort | paste -sd' ')
+usage_set=$(grep -oE -- '--risks=[a-z|]+' <<< "$_usage_out" | sed -n 1p | sed 's/--risks=//' | tr '|' '\n' | sort | paste -sd' ' -)
 [ "$usage_set" = "$contract" ] && ok "wv add usage names the contract's set" ||
     bad "wv add usage names the contract's set" "usage=[$usage_set]"
 _help_out=$("$WV" add --help 2>&1 || true)
-help_set=$(grep -oE 'risk_level, one of: [a-z, ]+' <<< "$_help_out" | sed 's/risk_level, one of: //' | tr ',' '\n' | tr -d ' ' | grep . | sort | paste -sd' ')
+help_set=$(grep -oE 'risk_level, one of: [a-z, ]+' <<< "$_help_out" | sed 's/risk_level, one of: //' | tr ',' '\n' | tr -d ' ' | grep . | sort | paste -sd' ' -)
 [ "$help_set" = "$contract" ] && ok "wv add --help names the contract's set" ||
     bad "wv add --help names the contract's set" "help=[$help_set]"
 

@@ -143,7 +143,7 @@ setup_test_env
 
 journal_begin "ship" '{"id":"wv-1234"}'
 
-assert_equals "1" "$(wc -l < "$_WV_JOURNAL_FILE")" \
+assert_equals "1" "$(( $(wc -l < "$_WV_JOURNAL_FILE") ))" \
     "journal_begin writes one line"
 
 line=$(head -1 "$_WV_JOURNAL_FILE")
@@ -161,7 +161,7 @@ assert_equals "1" "${_WV_IN_JOURNAL:-0}" \
 # --- Test 3: journal_step records pending step ---
 journal_step 1 "done" '{"id":"wv-1234"}'
 
-assert_equals "2" "$(wc -l < "$_WV_JOURNAL_FILE")" \
+assert_equals "2" "$(( $(wc -l < "$_WV_JOURNAL_FILE") ))" \
     "journal_step appends one line"
 
 line=$(tail -1 "$_WV_JOURNAL_FILE")
@@ -191,7 +191,7 @@ line=$(tail -1 "$_WV_JOURNAL_FILE")
 assert_contains "$line" '"event":"end"' \
     "journal_end records end event"
 
-total_lines=$(wc -l < "$_WV_JOURNAL_FILE")
+total_lines=$(( $(wc -l < "$_WV_JOURNAL_FILE") ))
 assert_equals "6" "$total_lines" \
     "Complete ship op = 6 lines (begin + 2×step/complete + end)"
 
@@ -271,9 +271,9 @@ journal_begin "ship" '{"id":"wv-aaaa"}'
 journal_step 1 "done"
 # crash here
 
-lines_before=$(wc -l < "$_WV_JOURNAL_FILE")
+lines_before=$(( $(wc -l < "$_WV_JOURNAL_FILE") ))
 journal_clean
-lines_after=$(wc -l < "$_WV_JOURNAL_FILE")
+lines_after=$(( $(wc -l < "$_WV_JOURNAL_FILE") ))
 
 # After clean: should only have the incomplete op's events (2 lines: begin + step)
 assert_equals "2" "$lines_after" \
@@ -293,7 +293,7 @@ journal_end
 
 journal_clean
 
-assert_equals "0" "$(wc -c < "$_WV_JOURNAL_FILE")" \
+assert_equals "0" "$(( $(wc -c < "$_WV_JOURNAL_FILE") ))" \
     "journal_clean truncates when all ops complete"
 
 # --- Test 14: Multiple complete ops + one incomplete ---
@@ -371,11 +371,11 @@ assert_equals "" "${_WV_IN_JOURNAL:-}" \
 # set -u that second end died on the unset op variables, so `wv sync` exited 1
 # after a successful dump whenever the caller had files staged.
 
-_je_lines=$(wc -l < "$WV_HOT_ZONE/ops.journal" 2>/dev/null || echo 0)
+_je_lines=$(( $(wc -l < "$WV_HOT_ZONE/ops.journal" 2>/dev/null || echo 0) ))
 _je_rc=0
 ( set -u; journal_end ) || _je_rc=$?
 assert_equals "0" "$_je_rc" "journal_end with no open operation succeeds under set -u"
-assert_equals "$_je_lines" "$(wc -l < "$WV_HOT_ZONE/ops.journal" 2>/dev/null || echo 0)" \
+assert_equals "$_je_lines" "$(( $(wc -l < "$WV_HOT_ZONE/ops.journal" 2>/dev/null || echo 0) ))" \
     "...and appends nothing"
 
 _sync_repo="$TEST_DIR/sync-repo"

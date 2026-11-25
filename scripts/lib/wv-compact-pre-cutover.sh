@@ -80,12 +80,14 @@ _pc_has_commit_hook() {
 _pc_take_exclusive() {
     _PC_DIR=$(wv_maint_dir)
     [ -n "$_PC_DIR" ] || { _pc_fail "the project is not a git checkout"; return 1; }
-    command -v flock >/dev/null 2>&1 || { _pc_fail "flock is unavailable"; return 1; }
     (umask 077 && mkdir -p "$_PC_DIR/windows") || return 1
-    local fd
+    local fd lrc=0
     exec {fd}>>"$_PC_DIR/lock" || return 1
-    if ! flock -x -n "$fd"; then
+    # wv_lock_fd: flock(1), else python3 fcntl (wv-7faa60).
+    wv_lock_fd "$fd" -x 0 || lrc=$?
+    if [ "$lrc" -ne 0 ]; then
         exec {fd}>&-
+        [ "$lrc" -ne 2 ] || { _pc_fail "no file-lock mechanism (neither flock(1) nor python3)"; return 1; }
         _pc_fail "the maintenance lock is held by another process ($_PC_DIR/lock): a sync, publish or capture window is in progress"
         return 1
     fi
@@ -230,7 +232,7 @@ _pc_scratch_load() {
     wv_lineage_seq_base "$side/hot/brain.db" "$side/.weave/deltas" > "$side/seq_base" || return 1
     # The lost-write report the load printed, one entry per indented line.
     awk '/lost a conflict on the same field/ {on = 1; next} on && /^    / {print; next} {on = 0}' \
-        "$side/load.err" | sed 's/\x1b\[[0-9;]*m//g' > "$side/lost_writes"
+        "$side/load.err" | LC_ALL=C sed $'s/\e\\[[0-9;]*m//g' > "$side/lost_writes"
 }
 
 # _pc_equivalence SOURCE CANDIDATES_TSV SCRATCH -- load the source tree with and
@@ -496,7 +498,7 @@ _pc_restore() {
         fi
     done < "$entries"
     local n
-    n=$(wc -l < "$entries"); rm -f "$entries"
+    n=$(( $(wc -l < "$entries") )); rm -f "$entries"
     [ "$bad" -eq 0 ] || { _pc_fail "restore verification failed"; return 1; }
     echo -e "${GREEN}✓${NC} Restored $n file(s) from $source; they are staged. The causal identity changes back when you commit." >&2
 }
@@ -517,8 +519,10 @@ cmd_compact_pre_cutover() {
     done
     _PC_TOP=$(git -C "${WV_PROJECT_DIR:-$(dirname "$WEAVE_DIR")}" rev-parse --show-toplevel 2>/dev/null) \
         || { _pc_fail "the project is not a git checkout"; return 1; }
-    _PC_REL=$(realpath --relative-to="$_PC_TOP" "$WEAVE_DIR")
-    case "$_PC_REL" in ..*|/*) _pc_fail "$WEAVE_DIR is outside the checkout"; return 1 ;; esac
+    # wv_relpath fails for a path outside the checkout; realpath --relative-to
+    # is GNU-only and on macOS left _PC_REL empty, past this check (wv-e7426f).
+    _PC_REL=$(wv_relpath "$_PC_TOP" "$WEAVE_DIR") || { _pc_fail "$WEAVE_DIR is outside the checkout"; return 1; }
+    case "$_PC_REL" in ''|..*|/*) _pc_fail "$WEAVE_DIR is outside the checkout"; return 1 ;; esac
 
     _pc_take_exclusive || return 1
     case "$mode" in
@@ -579,7 +583,7 @@ _pc_run() {
         while [ -e "$_PC_PAUSE_FILE" ]; do sleep 0.1; done
     fi
     local n_cand n_listed
-    n_cand=$(wc -l < "$scratch/candidates.tsv"); n_listed=$(wc -l < "$scratch/listed")
+    n_cand=$(( $(wc -l < "$scratch/candidates.tsv") )); n_listed=$(( $(wc -l < "$scratch/listed") ))
     echo "Candidates: $n_cand pre-cutover v1 delta(s), unchanged since marker commit ${marker_commit:0:12}." >&2
     if [ "$n_listed" -gt 0 ]; then
         echo "Not candidates ($n_listed): header-less v1 deltas added or changed after the marker; the loader skips them, they stay:" >&2

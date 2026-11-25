@@ -3,7 +3,9 @@
 set -euo pipefail
 export WV_TEST_SUITE=1
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-T=$(mktemp -d)
+# Canonical from the start: the allocator returns physical paths, and macOS
+# TMPDIR (/var/folders) is a symlink to /private/var (wv-e6ca42).
+T=$(mktemp -d); T=$(cd "$T" && pwd -P)
 trap 'rm -rf "$T"' EXIT
 mkdir -p "$T/bin" "$T/fallback" "$T/explicit root"
 printf 'unrelated\n' > "$T/explicit root/brain.db"
@@ -38,7 +40,7 @@ rc=0; bash "$allocator" >"$T/refused" 2>"$T/error" || rc=$?
 check test "$rc" -ne 0
 check test ! -s "$T/refused"
 check grep -q 'insufficient capacity before expensive work' "$T/error"
-check test "$(find "$WV_SCRATCH_ROOT" -mindepth 1 -maxdepth 1 -type d | wc -l)" -eq 0
+check test "$(( $(find "$WV_SCRATCH_ROOT" -mindepth 1 -maxdepth 1 -type d | wc -l) ))" -eq 0
 export FIXTURE_FREE_KB=40
 c=$(env -u WV_SCRATCH_ROOT bash "$allocator" 2>"$T/report")
 check test "$(dirname "$c")" = "$TMPDIR"

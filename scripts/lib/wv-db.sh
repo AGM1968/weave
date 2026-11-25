@@ -4,6 +4,20 @@
 # Sourced by: wv entry point (after wv-config.sh)
 # Dependencies: wv-config.sh (for WV_DB, WV_HOT_ZONE, WEAVE_DIR, etc.)
 
+# db_remove_file <path>... -- remove scratch database files with their WAL,
+# shared-memory and rollback companions. A .backup of the live WAL database is
+# itself in WAL mode, and Apple's SQLite keeps -wal and -shm after the last
+# connection closes (persistent WAL), so removing only the main file leaves
+# them behind on macOS (wv-7551b6). Never for the live database: that one
+# changes only through SQLite (wv-f241fa).
+db_remove_file() {
+    local f
+    for f in "$@"; do
+        [ -n "$f" ] || continue
+        rm -f -- "$f" "$f-wal" "$f-shm" "$f-journal"
+    done
+}
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Database Initialization
 # ═══════════════════════════════════════════════════════════════════════════
@@ -33,6 +47,62 @@ db_stamp_repo_owner() {
     chmod 600 "$owner_file" 2>/dev/null || true
 }
 
+# db_require_fts5 — refuse when the sqlite3 on PATH has no FTS5 (wv-649510).
+# The schema needs it: without it init reported success over a database whose
+# FTS tables and sync triggers were never created, every write then failed on
+# 'no such table: main.nodes_fts', and doctor called the index corrupt. The
+# probe creates an FTS5 table in a scratch in-memory database; compile options
+# are the wrong test (a build can carry FTS5 without ENABLE_FTS5 reported, and
+# the option says nothing about the binary that will run the schema). The
+# result is remembered per process, and per hot zone in .fts5-ok keyed by the
+# sqlite3 path, so a zone probes once per sqlite3 and a PATH change re-probes.
+db_require_fts5() {
+    local sq seen=""
+    sq=$(command -v sqlite3 2>/dev/null) || sq=""
+    if [ -z "$sq" ]; then
+        echo "wv: sqlite3 is not on PATH; Weave needs sqlite3 with FTS5." >&2
+        return 1
+    fi
+    [ "${_WV_FTS5_OK:-}" = "$sq" ] && return 0
+    [ -n "${WV_HOT_ZONE:-}" ] && { IFS= read -r seen < "$WV_HOT_ZONE/.fts5-ok"; } 2>/dev/null
+    if [ "$seen" != "$sq" ]; then
+        _wv_fts5_probe "$sq" || return 1
+    fi
+    _WV_FTS5_OK=$sq
+    _wv_fts5_remember
+}
+
+# _wv_fts5_probe <sqlite3 path> — create an FTS5 table in memory, or refuse
+# naming the sqlite3 and the remedy.
+_wv_fts5_probe() {
+    sqlite3 :memory: "CREATE VIRTUAL TABLE wv_fts5_probe USING fts5(a);" >/dev/null 2>&1 && return 0
+    echo "wv: $1 has no FTS5 module; Weave's search index needs it." >&2
+    echo "    Put a sqlite3 built with FTS5 first on PATH: on macOS /usr/bin/sqlite3 has it" >&2
+    echo "    (or brew install sqlite and use \$(brew --prefix sqlite)/bin); on Linux the" >&2
+    echo "    distribution sqlite3 package has it." >&2
+    return 1
+}
+
+# _wv_fts5_remember — record this process's probe in the hot zone, when the
+# zone exists and holds no record yet or a different one.
+_wv_fts5_remember() {
+    local m="${WV_HOT_ZONE:-}/.fts5-ok" seen=""
+    [ -n "${WV_HOT_ZONE:-}" ] && [ -d "$WV_HOT_ZONE" ] || return 0
+    { IFS= read -r seen < "$m"; } 2>/dev/null
+    [ "$seen" = "$_WV_FTS5_OK" ] || printf '%s\n' "$_WV_FTS5_OK" > "$m" 2>/dev/null || true
+}
+
+# _db_init_schema_complete — the new database opens and has the core table and
+# both search indexes; otherwise say so and fail (wv-b98794, wv-649510).
+_db_init_schema_complete() {
+    local objs
+    objs=$(sqlite3 -cmd ".timeout 5000" "$WV_DB" "SELECT (SELECT COUNT(*) FROM nodes) >= 0,
+        (SELECT COUNT(*) FROM sqlite_master WHERE name IN ('nodes_fts','chunks_fts'));" 2>/dev/null) || objs=""
+    [ "$objs" = "1|2" ] && return 0
+    echo "wv: could not create the Weave database at $WV_DB (schema incomplete: ${objs:-unreadable})" >&2
+    return 1
+}
+
 db_init() {
     # Security: hot zone may be under /dev/shm or /tmp (shared-mount parents).
     # Create 700/600 so other local users cannot read the graph. `umask 077`
@@ -46,6 +116,9 @@ db_init() {
     # and read-ish paths like `wv health`, `wv status`, and session-start
     # hooks. Auto-creating the repo's .weave directory here would opt
     # uninitialized repositories into Weave just by inspecting them.
+    # Refused before any file exists: a schema half-built without FTS5 is worse
+    # than no database (wv-649510).
+    db_require_fts5 || return 1
     local prev_umask
     prev_umask=$(umask)
     umask 077
@@ -55,6 +128,7 @@ db_init() {
     fi
     chmod 700 "$WV_HOT_ZONE" 2>/dev/null || true
     umask "$prev_umask"
+    _wv_fts5_remember  # the probe above ran before the zone existed
     validate_hot_size
     # A fresh file may reuse a removed file's inode: its schema stamp is not
     # evidence of anything (wv-048429).
@@ -296,11 +370,10 @@ EOF
     _policy_trigger_sql | sqlite3 "$WV_DB" 2>/dev/null || true
     # The heredoc's own status is not the test: on a SQLite without FTS5 its FTS
     # statements fail while the rest succeeds. What must hold is a database that
-    # opens and has the core table (wv-b98794).
-    if ! sqlite3 -cmd ".timeout 5000" "$WV_DB" "SELECT COUNT(*) FROM nodes;" >/dev/null 2>&1; then
-        echo "wv: could not create the Weave database at $WV_DB" >&2
-        return 1
-    fi
+    # opens and has the core table (wv-b98794) and both search indexes, which
+    # FTS5 builds (wv-649510): a success printed over a schema missing them
+    # left every write failing.
+    _db_init_schema_complete || return 1
     # Writer lineage lives in a migration rather than the schema heredoc above so
     # that a fresh database and a migrated one produce identical CREATE TABLE
     # text — see db_migrate_lineage for why that matters to state.sql.
@@ -467,6 +540,7 @@ MIGRATE
 # entry point is a module the suites cannot reach.
 _WV_DB_SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$_WV_DB_SRC_DIR/wv-db-lineage.sh"
+declare -F wv_lock_fd >/dev/null || source "$_WV_DB_SRC_DIR/wv-lock.sh"
 
 # db_tombstone_sql KIND ID [LINEAGE_SEQ] [LINEAGE_ACTOR] — SQL for a cross-machine
 # deletion tombstone (epic delta-causality, wv-0d5e07). Called by wv delete and
@@ -557,14 +631,7 @@ db_write_tombstones() {
 # Migrate to add FTS5 full-text search table (Phase 2.1).
 # Safe to run repeatedly — creates only if not exists.
 db_migrate_fts5() {
-    # Check if FTS5 is available in this SQLite build
-    local fts5_available
-    fts5_available=$(sqlite3 "$WV_DB" "SELECT sqlite_compileoption_used('ENABLE_FTS5');" 2>/dev/null || echo "0")
-    
-    if [ "$fts5_available" != "1" ]; then
-        # FTS5 not available, skip silently
-        return 0
-    fi
+    db_require_fts5 || return 1
 
     # wv-92b72c: an index built before alias joined it has three columns, and
     # CREATE ... IF NOT EXISTS below would keep it -- and would keep three-column
@@ -634,9 +701,7 @@ MIGRATE
 # Weighted 2× in cmd_search relative to node title (text) matches.
 # Safe to run repeatedly — CREATE IF NOT EXISTS guards + backfill skips existing rows.
 db_migrate_fts5_learning() {
-    local fts5_available
-    fts5_available=$(sqlite3 "$WV_DB" "SELECT sqlite_compileoption_used('ENABLE_FTS5');" 2>/dev/null || echo "0")
-    [ "$fts5_available" != "1" ] && return 0
+    db_require_fts5 || return 1
 
     sqlite3 "$WV_DB" <<'MIGRATE' 2>/dev/null || true
 CREATE VIRTUAL TABLE IF NOT EXISTS nodes_learning_fts USING fts5(
@@ -1127,8 +1192,7 @@ MIGRATE
 # Migrate to add chunks table + FTS5 + sync triggers for semantic search.
 # Safe to run repeatedly — CREATE IF NOT EXISTS throughout.
 db_migrate_chunks() {
-    local fts5_available
-    fts5_available=$(sqlite3 "$WV_DB" "SELECT sqlite_compileoption_used('ENABLE_FTS5');" 2>/dev/null || echo "0")
+    db_require_fts5 || return 1
 
     sqlite3 "$WV_DB" <<'MIGRATE' 2>/dev/null || true
 CREATE TABLE IF NOT EXISTS chunks (
@@ -1144,8 +1208,7 @@ CREATE TABLE IF NOT EXISTS chunks (
 CREATE INDEX IF NOT EXISTS idx_chunks_file ON chunks(file);
 MIGRATE
 
-    if [ "$fts5_available" = "1" ]; then
-        sqlite3 "$WV_DB" <<'MIGRATE_FTS' 2>/dev/null || true
+    sqlite3 "$WV_DB" <<'MIGRATE_FTS' 2>/dev/null || true
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
     content,
     file UNINDEXED,
@@ -1172,7 +1235,6 @@ CREATE TRIGGER IF NOT EXISTS chunks_au AFTER UPDATE ON chunks BEGIN
     VALUES (new.id, new.content, new.file, new.line_start, new.line_end);
 END;
 MIGRATE_FTS
-    fi
 }
 
 # Rebuild FTS5 index from existing nodes (for migration or repair).
@@ -1191,16 +1253,11 @@ MIGRATE_FTS
 #     idempotent: CREATE IF NOT EXISTS + backfill from nodes.metadata) is the
 #     repair that actually fixed this in production.
 db_reindex_fts5() {
-    db_ensure
-
-    # Check if FTS5 is available
-    local fts5_available
-    fts5_available=$(sqlite3 "$WV_DB" "SELECT sqlite_compileoption_used('ENABLE_FTS5');" 2>/dev/null || echo "0")
-
-    if [ "$fts5_available" != "1" ]; then
-        echo "Error: FTS5 not available in this SQLite build" >&2
-        return 1
-    fi
+    # Checked: an unreadable graph must not be reported as indexed (wv-90083c).
+    # The compile-option probe this replaced failed on such a graph and hid
+    # the unchecked call (wv-649510).
+    db_ensure || return 1
+    db_require_fts5 || return 1
 
     echo "Rebuilding FTS5 index..." >&2
 
@@ -1251,7 +1308,7 @@ db_rebuild_fts() {
 # A load that restores into the live file keeps the inode and clears the memo.
 _wv_db_ensure_key() {
     local ino
-    ino=$(stat -c %i "$WV_DB" 2>/dev/null || stat -f %i "$WV_DB" 2>/dev/null) || return 1
+    ino=$(wv_stat ino "$WV_DB") || return 1
     printf '%s|%s' "$WV_DB" "$ino"
 }
 
@@ -1263,7 +1320,7 @@ _wv_db_ensure_key() {
 # the stamp. Fails (prints nothing) when any input cannot be read.
 _wv_db_schema_stamp() {
     local ino schema
-    ino=$(stat -c %i "$WV_DB" 2>/dev/null || stat -f %i "$WV_DB" 2>/dev/null) || return 1
+    ino=$(wv_stat ino "$WV_DB") || return 1
     [ -f "$_WV_DB_SRC_DIR/wv-db.sh" ] && [ -f "$_WV_DB_SRC_DIR/wv-db-lineage.sh" ] || return 1
     schema=$(sqlite3 -cmd ".timeout 5000" "$WV_DB" \
         "SELECT type, name, tbl_name, COALESCE(sql, '') FROM sqlite_master ORDER BY type, name;" 2>/dev/null) \
@@ -1287,7 +1344,8 @@ _wv_db_stamp_current() {
 
 # _wv_db_schema_missing — print each schema object the migrations create that is
 # absent (type:name, one per line); empty output means complete. The FTS objects
-# are expected only where SQLite has FTS5, as their migrations skip otherwise.
+# are always expected: FTS5 is required (wv-649510), and the fts column only
+# marks which objects it builds.
 # The migrations swallow their own sqlite3 errors (2>/dev/null || true), so this
 # is the only evidence that they all took effect: a stamp written over one that
 # failed certified the gap to every later process (wv-e90d62).
@@ -1304,8 +1362,7 @@ _wv_db_schema_missing() {
             ('table:chunks_fts', 1), ('trigger:chunks_ai', 1),
             ('trigger:chunks_ad', 1), ('trigger:chunks_au', 1))
         SELECT key FROM want
-        WHERE (fts = 0 OR sqlite_compileoption_used('ENABLE_FTS5'))
-          AND key NOT IN (SELECT type || ':' || name FROM sqlite_master)
+        WHERE key NOT IN (SELECT type || ':' || name FROM sqlite_master)
         ORDER BY key;" 2>/dev/null || echo "unreadable"
 }
 
@@ -1333,6 +1390,39 @@ wv_require_graph() {
     return 1
 }
 
+# _wv_db_adopt_global — copy a pre-v1.2 global hot zone database (one DB for
+# all repos at <base>/brain.db) to this repo's per-repo path and migrate it;
+# succeeds only when it did.
+_wv_db_adopt_global() {
+    # Migration: detect pre-v1.2 global hot zone layout
+    # Old: /dev/shm/weave/brain.db (single DB for all repos)
+    # New: /dev/shm/weave/<hash>/brain.db (per-repo namespace)
+    local old_global_db="${_WV_BASE_HOT_ZONE}/brain.db"
+    if [ -z "$WV_DB_CUSTOM" ] && [ -f "$old_global_db" ] && [ "$old_global_db" != "$WV_DB" ]; then
+        local old_nodes
+        old_nodes=$(sqlite3 -cmd ".timeout 5000" "$old_global_db" "SELECT COUNT(*) FROM nodes;" 2>/dev/null || echo "0")
+        if [ "$old_nodes" -gt 0 ] 2>/dev/null; then
+            echo -e "${YELLOW}Found pre-v1.2 global database: $old_global_db ($old_nodes nodes)${NC}" >&2
+            echo -e "${YELLOW}Migrating to per-repo path: $WV_DB${NC}" >&2
+            if hot_zone_ensure "${WV_DB%/*}" && cp "$old_global_db" "$WV_DB" 2>/dev/null; then
+                echo -e "${GREEN}✓ Migrated $old_nodes nodes to $WV_DB${NC}" >&2
+                echo -e "${YELLOW}Old database kept at $old_global_db — remove manually when ready${NC}" >&2
+                # Run schema migrations on the copied DB
+                db_migrate_edges
+                db_migrate_edge_type_enum
+                db_migrate_alias
+                db_migrate_virtual_columns
+                db_migrate_fts5
+                _WV_DB_READY=$(_wv_db_ensure_key) || _WV_DB_READY=""
+                return 0
+            else
+                echo -e "${RED}Migration failed — continuing with normal init${NC}" >&2
+            fi
+        fi
+    fi
+    return 1
+}
+
 db_ensure() {
     # Per-process fast path (wv-3d6ed0). Without it every db_query re-ran the
     # migration probes below, each its own sqlite3, at ~220ms per query; the
@@ -1343,33 +1433,13 @@ db_ensure() {
         && [ "$_WV_DB_READY" = "$(_wv_db_ensure_key)" ]; then
         return 0
     fi
+    # Every command reaches the graph through here, so every command refuses
+    # a sqlite3 without FTS5 rather than failing later on a trigger
+    # (wv-649510). Remembered per zone; no sqlite3 call once probed.
+    db_require_fts5 || { _wv_db_ensure_failed; return 1; }
     if [ ! -f "$WV_DB" ]; then
-        # Migration: detect pre-v1.2 global hot zone layout
-        # Old: /dev/shm/weave/brain.db (single DB for all repos)
-        # New: /dev/shm/weave/<hash>/brain.db (per-repo namespace)
-        local old_global_db="${_WV_BASE_HOT_ZONE}/brain.db"
-        if [ -z "$WV_DB_CUSTOM" ] && [ -f "$old_global_db" ] && [ "$old_global_db" != "$WV_DB" ]; then
-            local old_nodes
-            old_nodes=$(sqlite3 -cmd ".timeout 5000" "$old_global_db" "SELECT COUNT(*) FROM nodes;" 2>/dev/null || echo "0")
-            if [ "$old_nodes" -gt 0 ] 2>/dev/null; then
-                echo -e "${YELLOW}Found pre-v1.2 global database: $old_global_db ($old_nodes nodes)${NC}" >&2
-                echo -e "${YELLOW}Migrating to per-repo path: $WV_DB${NC}" >&2
-                if hot_zone_ensure "${WV_DB%/*}" && cp "$old_global_db" "$WV_DB" 2>/dev/null; then
-                    echo -e "${GREEN}✓ Migrated $old_nodes nodes to $WV_DB${NC}" >&2
-                    echo -e "${YELLOW}Old database kept at $old_global_db — remove manually when ready${NC}" >&2
-                    # Run schema migrations on the copied DB
-                    db_migrate_edges
-                    db_migrate_edge_type_enum
-                    db_migrate_alias
-                    db_migrate_virtual_columns
-                    db_migrate_fts5
-                    _WV_DB_READY=$(_wv_db_ensure_key) || _WV_DB_READY=""
-                    return 0
-                else
-                    echo -e "${RED}Migration failed — continuing with normal init${NC}" >&2
-                fi
-            fi
-        fi
+        # A pre-v1.2 global hot zone database, copied to this repo's path.
+        _wv_db_adopt_global && return 0
 
         if [ -z "$WV_DB_CUSTOM" ] && [ -f "$WEAVE_DIR/state.sql" ]; then
             # State exists on disk but DB is missing (reboot, new machine)
@@ -1420,25 +1490,25 @@ db_ensure() {
         return 0
     fi
 
+    # Taken through wv_lock_fd (flock(1), else python3 fcntl): without flock(1)
+    # migrations ran unlocked, so racing processes migrated at once (wv-7faa60).
+    # Closing the fd releases it.
     local schema_lock="$WV_HOT_ZONE/.schema.lock"
-    if command -v flock >/dev/null 2>&1; then
-        exec {schema_lock_fd}>"$schema_lock"
-        flock -w 10 "$schema_lock_fd" || {
-            echo -e "${RED}Error: timed out waiting for Weave schema migration lock${NC}" >&2
-            exec {schema_lock_fd}>&-
-            _wv_db_ensure_failed
-            return 1
-        }
-        # Check again under the lock (ultrareview #4574): processes that raced
-        # at a cold start all found no stamp and queued here; the first one
-        # migrated and stamped, so the rest have nothing left to do.
-        if _wv_db_stamp_current; then
-            flock -u "$schema_lock_fd" 2>/dev/null || true
-            exec {schema_lock_fd}>&-
-            _WV_DB_READY=$(_wv_db_ensure_key) || _WV_DB_READY=""
-            _wv_db_size_check
-            return 0
-        fi
+    exec {schema_lock_fd}>"$schema_lock"
+    wv_lock_fd "$schema_lock_fd" -x 10 || {
+        echo -e "${RED}Error: could not take the Weave schema migration lock (busy over 10s, or no lock mechanism)${NC}" >&2
+        exec {schema_lock_fd}>&-
+        _wv_db_ensure_failed
+        return 1
+    }
+    # Check again under the lock (ultrareview #4574): processes that raced
+    # at a cold start all found no stamp and queued here; the first one
+    # migrated and stamped, so the rest have nothing left to do.
+    if _wv_db_stamp_current; then
+        exec {schema_lock_fd}>&-
+        _WV_DB_READY=$(_wv_db_ensure_key) || _WV_DB_READY=""
+        _wv_db_size_check
+        return 0
     fi
 
     # Existing hot-zone databases pass through db_ensure rather than db_init or
@@ -1447,10 +1517,7 @@ db_ensure() {
     # Failure is explicit: continuing would leave sync and commit-refs unable to
     # persist, and the lock must be released before returning to the caller.
     if ! db_migrate_lineage; then
-        if command -v flock >/dev/null 2>&1; then
-            flock -u "$schema_lock_fd" 2>/dev/null || true
-            exec {schema_lock_fd}>&-
-        fi
+        exec {schema_lock_fd}>&-
         return 1
     fi
     db_migrate_edge_type_enum
@@ -1478,10 +1545,7 @@ db_ensure() {
         rm -f "$WV_DB.ensured.$$" "$WV_DB.ensured" 2>/dev/null || true
     fi
 
-    if command -v flock >/dev/null 2>&1; then
-        flock -u "$schema_lock_fd" 2>/dev/null || true
-        exec {schema_lock_fd}>&-
-    fi
+    exec {schema_lock_fd}>&-
     _WV_DB_READY=$(_wv_db_ensure_key) || _WV_DB_READY=""
     _wv_db_size_check
 }
@@ -1520,7 +1584,7 @@ _wv_db_size_check() {
     [ -z "${_WV_SIZE_CHECKED:-}" ] && [ -f "$WV_DB" ] && [ -z "${WV_DISABLE_AUTOPRUNE:-}" ] || return 0
     export _WV_SIZE_CHECKED=1
     local db_size graph_bytes limit_mb
-    db_size=$(stat -c%s "$WV_DB" 2>/dev/null || stat -f%z "$WV_DB" 2>/dev/null || echo 0)
+    db_size=$(wv_stat size "$WV_DB" || echo 0)
     # The graph is part of the file, so a file under the limit needs no query.
     [ "$db_size" -gt "$WV_MAX_DB_SIZE" ] 2>/dev/null || return 0
     graph_bytes=$(_wv_db_graph_bytes "$db_size")

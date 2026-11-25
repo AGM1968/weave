@@ -52,7 +52,7 @@ add_in() {  # add_in <dir> <wv add args...> -> the new id (no early-exit pipe un
 cell() {
     local label="$1" rule="$2" decision="$3" bypass="$4" before
     shift 4
-    before=$(wc -l < "$WV_ATTEMPT_JOURNAL")
+    before=$(( $(wc -l < "$WV_ATTEMPT_JOURNAL") ))
     "$@" > "$TMP/last.out" 2>&1 < /dev/null
     if tail -n +"$((before + 1))" "$WV_ATTEMPT_JOURNAL" | jq -se --arg r "$rule" --arg d "$decision" --arg b "$bypass" '
         [.[] | select(.event == "call_started") | .call_id] as $calls
@@ -152,7 +152,7 @@ echo "=== delegation ==="
 # batch runs each line as its own wv call: the verdict belongs to that child
 # call (with batch as parent_call_id), never to the batch call.
 n=$(active "batch delegation probe")
-before=$(wc -l < "$WV_ATTEMPT_JOURNAL")
+before=$(( $(wc -l < "$WV_ATTEMPT_JOURNAL") ))
 echo "done $n" | w batch >/dev/null 2>&1
 if tail -n +"$((before + 1))" "$WV_ATTEMPT_JOURNAL" | jq -se '
     (map(select(.event=="call_started" and .operation=="batch")) | first | .call_id) as $batch
@@ -231,7 +231,7 @@ cell "--acknowledge-upstream-fork records the ownership override" owned_override
 
 echo "=== every event is schema-valid and inside the denominator ==="
 if python3 "$ROOT/tests/lib/journal-validate.py" "$WV_ATTEMPT_JOURNAL" 2>"$TMP/schema.err"; then
-    ok "all $(wc -l < "$WV_ATTEMPT_JOURNAL") events validate against the attempt-journal schema"
+    ok "all $(( $(wc -l < "$WV_ATTEMPT_JOURNAL") )) events validate against the attempt-journal schema"
 else
     bad "all events validate against the attempt-journal schema" "$(head -3 "$TMP/schema.err")"
 fi

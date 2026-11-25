@@ -1556,6 +1556,60 @@ else
 fi
 rm -f "$V2DIR"/000000999990-*.json "$V2DIR"/000000999991-*.json
 
+# wv-20c98c: two clones claim one node at ONE lineage (the canary of wv-52a95a).
+# The v2 replay applies the first actor's write and refuses the second's; the
+# second's v1 SQL twin, whose guard breaks a same-lineage tie by actor name,
+# then applied it anyway: the graph held the refused value while the warning
+# said the other was kept. Now the v1 replay is fenced, and the losing side is
+# told its own write lost.
+FSEQ=99999993
+python3 - "$V2DIR" "$TGT" "$FSEQ" <<'PY'
+import hashlib, json, pathlib, sys, uuid
+out, tgt, seq = pathlib.Path(sys.argv[1]), sys.argv[2], int(sys.argv[3])
+def canonical(v):
+    if v is None: return "null"
+    if isinstance(v, bool): return "true" if v else "false"
+    if isinstance(v, int): return str(v)
+    if isinstance(v, str): return json.dumps(v, ensure_ascii=False, separators=(",", ":"))
+    if isinstance(v, list): return "[" + ",".join(canonical(x) for x in v) + "]"
+    if isinstance(v, dict): return "{" + ",".join(canonical(str(k)) + ":" + canonical(v[k]) for k in sorted(v)) + "}"
+    raise TypeError(type(v).__name__)
+for actor, value in (("canary-a", "side a"), ("canary-b", "side b")):
+    doc = {"format": "weave.delta.v2", "operation_id": str(uuid.uuid5(uuid.NAMESPACE_URL, "same-lineage-" + actor)),
+           "actor_id": actor, "actor_sequence": seq, "canonicalization": "weave.canonical-json.v1",
+           "payload": {"entity": {"kind": "node", "id": tgt}, "lineage": {"seq": seq, "actor": actor},
+                       "mutation": {"kind": "node_patch",
+                                    "fields": {"text": {"expected": "dispatch target", "value": value}}}}}
+    doc["operation_sha256"] = hashlib.sha256(canonical(doc).encode()).hexdigest()
+    (out / f"{seq:012d}-{actor}-{doc['operation_id']}.json").write_text(canonical(doc) + "\n")
+PY
+V1F="$(dirname "$V2DIR")/1899999999-000000000-000000-canary-b-1.sql"
+printf '%s\n' "/* weave-lineage seq=$FSEQ actor=canary-b */" \
+    "UPDATE nodes SET text='side b', lineage_seq=$FSEQ, lineage_actor='canary-b' WHERE id='$TGT' AND (nodes.lineage_seq = 0 OR $FSEQ > nodes.lineage_seq OR ($FSEQ = nodes.lineage_seq AND 'canary-b' > nodes.lineage_actor));" > "$V1F"
+for who in canary-a canary-b; do
+    rm -rf "$HOT"
+    sl_err=$(cd "$REPO" && WV_HOT_ZONE="$HOT" WV_AUTO_CHECKPOINT=0 WV_AGENT_ID="$who" "$ROOT/scripts/wv" load 2>&1 >/dev/null)
+    sl_text=$(sqlite3 "$HOT/brain.db" "SELECT text FROM nodes WHERE id='$TGT';" 2>/dev/null)
+    [ "$sl_text" = "side a" ] \
+        && ok "same-lineage fork, loaded as $who: the graph keeps the value v2 kept, not v1's re-application (wv-20c98c)" \
+        || bad "same-lineage fork, loaded as $who: the graph keeps the value v2 kept (got '$sl_text')"
+    if grep -q "lost a conflict on the same field" <<< "$sl_err" && grep -qF -- "$TGT text" <<< "$sl_err"; then
+        ok "...and names the lost write ($who)"
+    else
+        bad "...and names the lost write ($who) (stderr: ${sl_err:0:300})"
+    fi
+    if [ "$who" = canary-b ]; then
+        grep -qF -- "This checkout's own write lost on: $TGT (actor canary-b)" <<< "$sl_err" \
+            && ok "...and tells the losing checkout its own write lost" \
+            || bad "...and tells the losing checkout its own write lost (stderr: ${sl_err:0:400})"
+    else
+        grep -qF -- "This checkout's own write lost" <<< "$sl_err" \
+            && bad "...but the winning checkout is not told it lost" \
+            || ok "...but the winning checkout is not told it lost"
+    fi
+done
+rm -f "$V2DIR"/000000"$FSEQ"-*.json "$V1F"
+
 # Hard failure: a corrupt v2 op rolls back and, under strict, fails the load.
 printf '{"format":"weave.delta.v2","garbage":true}\n' > "$V2DIR/000000999998-corrupt.json"
 rm -rf "$HOT"
@@ -1566,6 +1620,61 @@ rm -rf "$HOT"
 lax_rc=0
 (cd "$REPO" && WV_HOT_ZONE="$HOT" WV_AUTO_CHECKPOINT=0 "$ROOT/scripts/wv" load >/dev/null 2>&1) || lax_rc=$?
 [ "$lax_rc" -eq 0 ] && ok "without strict, a corrupt v2 op warns but the load still succeeds" || bad "without strict, a corrupt v2 op warns but the load still succeeds (rc=$lax_rc)"
+
+# wv-1446ed: strict scoped to new operations. Whole strict aborts on any
+# historical conflict, so on a real catalog it never reached a new one.
+SC="$TMP/strict-scope"; mkdir -p "$SC/ops"
+sqlite3 "$SC/g.db" "CREATE TABLE nodes (id TEXT PRIMARY KEY, text TEXT NOT NULL, status TEXT DEFAULT 'todo',
+    metadata JSON DEFAULT '{}', alias TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP, lineage_actor TEXT NOT NULL DEFAULT '', lineage_seq INTEGER NOT NULL DEFAULT 0);
+  CREATE TABLE edges (source TEXT, target TEXT, type TEXT, weight REAL, context TEXT, created_at DATETIME,
+    lineage_actor TEXT NOT NULL DEFAULT '', lineage_seq INTEGER NOT NULL DEFAULT 0);
+  INSERT INTO nodes(id, text, lineage_actor, lineage_seq) VALUES ('wv-5c0901', 'now', 'snap', 50);"
+python3 - "$SC/ops" <<'PY'
+import hashlib, json, pathlib, sys, uuid
+out = pathlib.Path(sys.argv[1])
+def canonical(v):
+    if v is None: return "null"
+    if isinstance(v, bool): return "true" if v else "false"
+    if isinstance(v, int): return str(v)
+    if isinstance(v, str): return json.dumps(v, ensure_ascii=False, separators=(",", ":"))
+    if isinstance(v, list): return "[" + ",".join(canonical(x) for x in v) + "]"
+    if isinstance(v, dict): return "{" + ",".join(canonical(str(k)) + ":" + canonical(v[k]) for k in sorted(v)) + "}"
+    raise TypeError(type(v).__name__)
+for name, seq, expected, value in (("old", 10, "long ago", "older"), ("new", 50, "stale", "other clone")):
+    doc = {"format": "weave.delta.v2", "operation_id": str(uuid.uuid5(uuid.NAMESPACE_URL, "scope-" + name)),
+           "actor_id": "other", "actor_sequence": seq, "canonicalization": "weave.canonical-json.v1",
+           "payload": {"entity": {"kind": "node", "id": "wv-5c0901"}, "lineage": {"seq": seq, "actor": "other"},
+                       "mutation": {"kind": "node_patch", "fields": {"text": {"expected": expected, "value": value}}}}}
+    doc["operation_sha256"] = hashlib.sha256(canonical(doc).encode()).hexdigest()
+    (out / f"{seq:012d}-{name}.json").write_text(canonical(doc) + "\n")
+PY
+RP="$ROOT/scripts/lib/wv-delta-v2-replay.py"
+check() { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1 (expected '$2', got '$3')"; fi; }
+sc_run() { cp "$SC/g.db" "$SC/run.db"; python3 "$RP" "$SC/run.db" "$@" > "$SC/out.json" 2>/dev/null; echo "$?"; }
+check "a historical conflict aborts whole strict" "2" "$(sc_run --strict "$SC/ops/000000000010-old.json")"
+check "...but not strict scoped to the snapshot (wv-1446ed)" "0" "$(sc_run --strict --strict-since snapshot "$SC/ops/000000000010-old.json")"
+check "a concurrent write at the snapshot's lineage aborts scoped strict" "2" \
+    "$(sc_run --strict --strict-since snapshot "$SC/ops/000000000010-old.json" "$SC/ops/000000000050-new.json")"
+check "...naming it alone as refused" "000000000050-new.json" \
+    "$(jq -r '[.results[] | select(.strict_refused) | .path | split("/")[-1]] | join(",")' "$SC/out.json")"
+check "an explicit lineage scopes it too" "0" "$(sc_run --strict --strict-since 51 "$SC/ops/000000000010-old.json" "$SC/ops/000000000050-new.json")"
+check "a scope that is neither a seq nor 'snapshot' is misuse" "2" "$(sc_run --strict --strict-since soon "$SC/ops/000000000010-old.json")"
+
+# A failed strict load puts back the graph the hot zone held (wv-1446ed): a
+# sentinel table written after a good load (wv load flushes nodes into
+# state.sql first, so a node edit would survive either way) survives a strict
+# load that aborts.
+rm -rf "$HOT"
+(cd "$REPO" && WV_HOT_ZONE="$HOT" WV_AUTO_CHECKPOINT=0 "$ROOT/scripts/wv" load >/dev/null 2>&1)
+sqlite3 "$HOT/brain.db" "CREATE TABLE _preload_sentinel(x); INSERT INTO _preload_sentinel VALUES ('pre-load sentinel');"
+printf '{"format":"weave.delta.v2","garbage":true}\n' > "$V2DIR/000000999997-corrupt.json"
+sr_err=$(cd "$REPO" && WV_HOT_ZONE="$HOT" WV_AUTO_CHECKPOINT=0 WV_DELTA_V2_STRICT=1 "$ROOT/scripts/wv" load 2>&1 >/dev/null) || true
+check "a strict load that aborts keeps the graph the hot zone held before it" "pre-load sentinel" \
+    "$(sqlite3 "$HOT/brain.db" "SELECT x FROM _preload_sentinel;" 2>/dev/null)"
+grep -qF -- "The hot zone holds the graph it held before this load" <<< "$sr_err" \
+    && ok "...and says so" || bad "...and says so (stderr: ${sr_err:0:300})"
+rm -f "$V2DIR/000000999997-corrupt.json"
 
 echo "Results: $pass/$run passed"
 [ "$pass" -eq "$run" ]

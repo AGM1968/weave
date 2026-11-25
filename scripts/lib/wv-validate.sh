@@ -11,8 +11,15 @@
 generate_id() {
     # Hash-based ID: wv-xxxxxx (6 hex chars from sha256 of timestamp + random)
     # v1.2+: 6 chars = 16M namespace. Legacy 4-char IDs remain valid.
-    local seed="$(date +%s%N)$$${RANDOM}"
-    local hash=$(echo -n "$seed" | sha256sum | cut -c1-6)
+    # EPOCHREALTIME (bash 5) keeps sub-second entropy where BSD date prints
+    # %N literally. No hash is a refusal, never the id 'wv-' (wv-ed3eac).
+    local seed hash
+    seed="${EPOCHREALTIME:-$(date +%s)}$$${RANDOM}${RANDOM}"
+    hash=$(printf '%s' "$seed" | sha256sum 2>/dev/null | cut -c1-6)
+    if [[ ! "$hash" =~ ^[0-9a-f]{6}$ ]]; then
+        echo "wv: cannot generate a node id: no sha256 tool (sha256sum or shasum) produced a digest" >&2
+        return 1
+    fi
     echo "wv-$hash"
 }
 

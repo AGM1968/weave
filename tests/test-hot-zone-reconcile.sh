@@ -41,6 +41,10 @@ export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# The product's md5sum (wv-resolve-runtime.sh, side-effect free): the repo hash a
+# product path is keyed on, the same on macOS, which has no md5sum(1) (wv-ef5621).
+# shellcheck disable=SC1091  # resolved at run time
+source "$ROOT/scripts/lib/wv-resolve-runtime.sh"
 WV="$ROOT/scripts/wv"
 RESOLVER="$ROOT/scripts/lib/wv-resolve-runtime.sh"
 

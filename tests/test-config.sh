@@ -107,11 +107,12 @@ rc=0
 bad=$(WV_CONFIG_DIR="$bad_cfg" "$WV" config set WV_REFUSAL_TEST value 2>&1) || rc=$?
 assert_eq "1" "$rc" "set propagates config directory refusal"
 assert_not_contains "$bad" "effective next invocation" "refused set does not announce success"
-# /proc refuses regular temporary-file creation, including for root.
+# A directory under a regular file refuses temporary-file creation, including
+# for root, on every host (macOS has no /proc, wv-f8e26d).
 before_config=$(cat "$TMPCFG/config.env")
 for operation in set unset; do
     rc=0
-    bad=$(TMPDIR=/proc "$WV" config "$operation" WV_DELTA_RETAIN_DAYS 21 2>&1) || rc=$?
+    bad=$(TMPDIR="$TMPCFG/config.env/tmp" "$WV" config "$operation" WV_DELTA_RETAIN_DAYS 21 2>&1) || rc=$?
     assert_eq "1" "$rc" "$operation propagates config temporary-file refusal"
     assert_contains "$bad" "cannot create temporary config file" "$operation reaches temporary-file refusal"
     assert_not_contains "$bad" "✓" "$operation refuses success announcement"

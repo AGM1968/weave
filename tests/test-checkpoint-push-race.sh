@@ -2,6 +2,8 @@
 # "done" is an argument to the wv helpers below, never the loop keyword.
 # shellcheck disable=SC1010
 # Suite-driven wv calls are tagged test so call-stats retro reads can exclude them.
+# shellcheck source=tests/lib/sed-inplace.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/sed-inplace.sh"  # sed -i is GNU-only (wv-076a98)
 export WV_CALL_SOURCE=test
 # A checkpoint never rewrites a commit a push is publishing (wv-13db30) or
 # published while the tracking ref fell behind (wv-8258e5).
@@ -106,13 +108,13 @@ git -c core.hooksPath=/dev/null push -q origin main 2>/dev/null
 at=$(git rev-parse HEAD); graph_write; sync_checkpoint
 check "after a completed push a new checkpoint builds on the pushed commit" \
     "$(git merge-base --is-ancestor "$at" HEAD && echo kept || echo rewritten)" "kept"
-nodes_before=$(wc -l < .weave/nodes.jsonl)
+nodes_before=$(( $(wc -l < .weave/nodes.jsonl) ))  # BSD wc pads (wv-2dbe9e)
 check "every graph node survives the checkpoints" "$(wv list --json 2>/dev/null | jq 'length')" "$nodes_before"
 
 . "$ROOT/scripts/lib/wv-checkpoint-ci.sh"
 REC=$(wv_push_inflight_file "$PWD")
 # age_record — every recorded push becomes ten days old, as on the gpu clone
-age_record() { sed -i -E 's/^[0-9]+ /'"$(( $(date +%s) - 864000 ))"' /' "$REC"; }
+age_record() { sed_inplace -E 's/^[0-9]+ /'"$(( $(date +%s) - 864000 ))"' /' "$REC"; }
 
 echo "=== a failed push's record never ages out (wv-8258e5) ==="
 checkpoint "auto-checkpoint 11:00"; stuck=$(git rev-parse HEAD)

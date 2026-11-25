@@ -29,6 +29,8 @@ it cannot write is a warning, never a change to the command's status; the
 caller then has no monotonic reading and says so.
 """
 
+from __future__ import annotations
+
 import argparse
 from collections.abc import Callable
 import ctypes
@@ -168,6 +170,15 @@ def signal_group(root: int, sig: signal.Signals) -> None:
     except ProcessLookupError:
         # Cancellation can arrive before the child establishes its session.
         os.kill(root, sig)
+    except PermissionError:
+        # macOS refuses killpg (EPERM) once every member of the group has
+        # exited and only the unreaped root zombie is left, so a command that
+        # finished ended as status 2 (wv-5ab927). That group needs no signal;
+        # a live member this process may not signal is still a refusal.
+        if any(
+            row[2] == str(root) and not row[3].startswith("Z") for row in process_table()
+        ):
+            raise
 
 
 def watch_group(root: int, label: str, bound: int, cancelled: Callable[[], int]) -> int:

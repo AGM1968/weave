@@ -29,13 +29,13 @@ check "the CLI edge types are the contract's, in order" \
     "$(lib 'echo $VALID_EDGE_TYPES')" "$(jq -r '.types | keys_unsorted | join(" ")' "$CONTRACT")"
 for tool in weave_link weave_unlink; do
     mcp=$(awk -v t="name: \"$tool\"" 'index($0, t) {f=1} f && /enum: \[/ {e=1; next} e && /\]/ {exit} e' "$ROOT/mcp/src/index.ts" |
-        grep -oE '"[a-z_]+"' | tr -d '"' | paste -sd' ')
+        grep -oE '"[a-z_]+"' | tr -d '"' | paste -sd' ' -)
     check "the MCP $tool edge types are the contract's" "$mcp" "$(jq -r '.types | keys_unsorted | join(" ")' "$CONTRACT")"
 done
 contract=$(jq -r '[.common[].id, (.types[].invariants[].id)] | unique | join(" ")' "$CONTRACT")
-sql=$(lib 'wv_edge_violations_sql "SELECT 1, 2, 3"' | grep -oE "^SELECT '[a-z_]+'" | grep -oE "'[a-z_]+'" | tr -d "'" | sort -u | paste -sd' ')
+sql=$(lib 'wv_edge_violations_sql "SELECT 1, 2, 3"' | grep -oE "^SELECT '[a-z_]+'" | grep -oE "'[a-z_]+'" | tr -d "'" | sort -u | paste -sd' ' -)
 check "the query checks exactly the contract's invariants" "$sql" "$contract"
-hints=$(sed -n '/^_link_explain_violation()/,/^}/p' "$ROOT/scripts/cmd/wv-cmd-graph.sh" | grep -oE '^ +[a-z_]+\)' | tr -d ' )' | sort -u | paste -sd' ')
+hints=$(sed -n '/^_link_explain_violation()/,/^}/p' "$ROOT/scripts/cmd/wv-cmd-graph.sh" | grep -oE '^ +[a-z_]+\)' | tr -d ' )' | sort -u | paste -sd' ' -)
 check "wv link explains every invariant it can refuse by" "$hints" "$contract"
 
 R="$TMP/repo"; mkdir -p "$R" "$TMP/cfg"

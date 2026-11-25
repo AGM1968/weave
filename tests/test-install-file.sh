@@ -192,7 +192,7 @@ eval "$(sed -n '/^repo_hooks_refresh_allowed() {/,/^}/p' "$INSTALL_SH")"
 mkdir -p "$TEST_DIR/fakehome"
 _allowed() { if ( HOME="$1" repo_hooks_refresh_allowed ) 2>/dev/null; then echo yes; else echo no; fi; }
 assert_equals "no" "$(_allowed "$TEST_DIR/fakehome")" "repo_hooks_refresh_allowed: a sandboxed HOME may not touch the repo's hooks"
-_real_home=$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f6)
+_real_home=$(python3 -I -c 'import os, pwd; print(pwd.getpwuid(os.getuid()).pw_dir)' 2>/dev/null)  # getent is not on macOS (wv-412db3)
 if [ -n "$_real_home" ] && [ -d "$_real_home" ]; then
     assert_equals "yes" "$(_allowed "$_real_home")" "repo_hooks_refresh_allowed: the account's real HOME may"
     ln -s "$_real_home" "$TEST_DIR/homelink"

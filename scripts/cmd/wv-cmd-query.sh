@@ -109,11 +109,13 @@ _query_parse_predicate() {
         return 0
     fi
 
-    # key OP value
-    local k op v
-    k=$(printf '%s' "$raw"  | sed -n 's/^\([A-Za-z_][A-Za-z0-9_.]*\)\(>=\|<=\|!=\|=\|>\|<\).*$/\1/p')
-    op=$(printf '%s' "$raw" | sed -n 's/^[A-Za-z_][A-Za-z0-9_.]*\(>=\|<=\|!=\|=\|>\|<\).*$/\1/p')
-    v=$(printf '%s' "$raw"  | sed -n "s/^[A-Za-z_][A-Za-z0-9_.]*\(>=\|<=\|!=\|=\|>\|<\)//p")
+    # key OP value. An ERE through bash [[ =~ ]]: \| alternation in a basic
+    # sed regex is a GNU extension that BSD sed reads literally (wv-06c7a1).
+    local k="" op="" v=""
+    local _kov_re='^([A-Za-z_][A-Za-z0-9_.]*)(>=|<=|!=|=|>|<)(.*)$'
+    if [[ "$raw" =~ $_kov_re ]]; then
+        k="${BASH_REMATCH[1]}" op="${BASH_REMATCH[2]}" v="${BASH_REMATCH[3]}"
+    fi
     if [ -n "$k" ] && [ -n "$op" ] && [ -n "$v" ]; then
         local col; col=$(_query_resolve_key "$k") || return 1
         case "$op" in

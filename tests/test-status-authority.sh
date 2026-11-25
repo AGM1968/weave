@@ -21,9 +21,9 @@ trap 'rm -rf "$TMP"' EXIT
 echo "=== one authority ==="
 contract=$(jq -r '.fields.status.value.enum | sort | join(" ")' "$ROOT/contracts/node-field-registry-v1.json")
 schema=$(jq -r '."$defs".status_value.enum | sort | join(" ")' "$ROOT/contracts/delta-operation-v2.schema.json")
-cli=$(bash -c '. "$1/scripts/lib/wv-validate.sh" >/dev/null 2>&1; printf "%s\n" $VALID_STATUSES' _ "$ROOT" | sort | paste -sd' ')
-writer=$(grep -oE '^STATUSES = \{[^}]*\}' "$ROOT/scripts/lib/wv-delta.sh" | grep -oE '"[a-z-]+"' | tr -d '"' | sort | paste -sd' ')
-replayer=$(grep -oE '^STATUSES = \{[^}]*\}' "$ROOT/scripts/lib/wv-delta-v2-replay.py" | grep -oE '"[a-z-]+"' | tr -d '"' | sort | paste -sd' ')
+cli=$(bash -c '. "$1/scripts/lib/wv-validate.sh" >/dev/null 2>&1; printf "%s\n" $VALID_STATUSES' _ "$ROOT" | sort | paste -sd' ' -)
+writer=$(grep -oE '^STATUSES = \{[^}]*\}' "$ROOT/scripts/lib/wv-delta.sh" | grep -oE '"[a-z-]+"' | tr -d '"' | sort | paste -sd' ' -)
+replayer=$(grep -oE '^STATUSES = \{[^}]*\}' "$ROOT/scripts/lib/wv-delta-v2-replay.py" | grep -oE '"[a-z-]+"' | tr -d '"' | sort | paste -sd' ' -)
 [ -n "$contract" ] && [ "$schema" = "$contract" ] && ok "the Delta v2 schema's status enum is the contract's ($contract)" ||
     bad "the Delta v2 schema's status enum is the contract's" "contract=[$contract] schema=[$schema]"
 [ "$writer" = "$contract" ] && ok "the Delta v2 writer enforces the contract's enum" ||

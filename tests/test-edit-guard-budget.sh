@@ -18,6 +18,10 @@ export WV_CALL_SOURCE=test
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# shellcheck disable=SC1091  # resolved at run time
+source "$REPO_ROOT/scripts/lib/wv-lock.sh"  # flock(1) is util-linux; macOS has none (wv-412db3)
+# shellcheck disable=SC1091  # resolved at run time
+source "$REPO_ROOT/scripts/lib/wv-resolve-runtime.sh"  # wv_now: BSD date may print %N literally (wv-43082a)
 REAL_WV="$REPO_ROOT/scripts/wv"
 HOOK="$REPO_ROOT/.claude/hooks/pre-action.sh"
 
@@ -65,17 +69,17 @@ fresh() { rm -rf "$HZ/run_cache" "$HZ"/owners/*/.context_checked_* 2>/dev/null; 
 # guard -- run the hook; sets RC, MS (wall time) and ERR.
 guard() {
     local t0 t1
-    t0=$(date +%s%N)
+    t0=$(wv_now ns)
     printf '%s' "$PAYLOAD" | bash "$HOOK" > /dev/null 2> "$T/err"
     RC=$?
-    t1=$(date +%s%N)
+    t1=$(wv_now ns)
     MS=$(( (t1 - t0) / 1000000 ))
     ERR=$(cat "$T/err")
 }
 # hold_schema_lock -- hold the migration lock and drop the stamp that lets a
 # wv call skip it, as a load or a fresh migration does.
 hold_schema_lock() {
-    ( exec 9>"$HZ/.schema.lock"; flock -x 9; exec sleep 60 ) &
+    ( exec 9>"$HZ/.schema.lock"; wv_lock_fd 9 -x 10; exec sleep 60 ) &
     HOLDER=$!
     sleep 0.3
     rm -f "$HZ/brain.db.ensured"
@@ -141,7 +145,7 @@ out=$(PATH="$T/bin" WV="$T/slow" WV_PTU_WAIT_BUDGET_MS=1000 bash -c '
     printf "#!/bin/sh\nexec sleep 30\n" > "$WV"; chmod +x "$WV"
     command -v timeout >/dev/null && { echo "timeout still on PATH"; exit 0; }
     source "$1/scripts/lib/wv-hook-common.sh"
-    t0=$(date +%s%N); _hc_wv list; rc=$?; t1=$(date +%s%N)
+    t0=$(wv_now ns); _hc_wv list; rc=$?; t1=$(wv_now ns)
     echo "rc=$rc ms=$(( (t1 - t0) / 1000000 ))"' _ "$REPO_ROOT" 2>&1)
 case "$out" in
     rc=124\ ms=*) ms=${out##*ms=}

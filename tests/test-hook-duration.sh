@@ -40,11 +40,17 @@ unset -f hook_duration_ms
 # shellcheck source=scripts/lib/wv-clock.sh
 source "$ROOT/scripts/lib/$hook"
 check "$hook: defines hook_duration_ms" declare -F hook_duration_ms
-now=$(date +%s%N)
+# wv_now validates the reading and falls back to a portable clock, so the
+# timing cases run on every host instead of skipping where date has no %N
+# (wv-43082a).
+# shellcheck source=scripts/lib/wv-resolve-runtime.sh
+source "$ROOT/scripts/lib/wv-resolve-runtime.sh"
+now=$(wv_now ns) || now=""
 if ! declare -F hook_duration_ms >/dev/null; then
     :
-elif [[ "$now" == *[!0-9]* ]]; then
-    echo "  (nanosecond date unavailable; timing cases skipped)"
+elif ! [[ "$now" =~ ^[0-9]{19,}$ ]]; then
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} $hook: no nanosecond clock (wv_now ns gave '$now')"
 else
     past=$(hook_duration_ms "$((now - 2000000000))")
     check "$hook: a start 2s ago reports about 2000ms (got $past)" \

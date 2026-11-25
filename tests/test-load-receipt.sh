@@ -86,6 +86,14 @@ cp -r "$REPO_ROOT/scripts" "$T/newer"
 printf '\n# a newer loader\n' >> "$T/newer/cmd/wv-cmd-data.sh"
 check "a different loader: not current" not lib_at "$T/newer" wv_receipt_current "$WEAVE_DIR" "$DB"
 check "...and the same one still is" lib wv_receipt_current "$WEAVE_DIR" "$DB"
+# Each digest is checked on its own: one {256} bound is refused by BSD regcomp
+# (RE_DUP_MAX 255), which failed every receipt on a Mac (wv-b2e048).
+h64=$(printf 'a%.0s' {1..64})
+check "four 64-hex digests are accepted" lib _wv_receipt_digests_ok "$h64" "$h64" "$h64" "$h64"
+check "...a 63-hex one is refused" not lib _wv_receipt_digests_ok "$h64" "${h64%a}" "$h64" "$h64"
+check "...a 65-hex one is refused" not lib _wv_receipt_digests_ok "$h64" "$h64" "${h64}a" "$h64"
+check "...an uppercase one is refused" not lib _wv_receipt_digests_ok "$h64" "$h64" "$h64" "${h64^^}"
+check "...63+65 does not pass as 128" not lib _wv_receipt_digests_ok "${h64%a}" "${h64}a" "$h64" "$h64"
 
 echo "--- a sync renews only what it published itself ---"
 # The receipt the publish found must name the catalog before it, and the

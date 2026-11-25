@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 # Test-only staging primitive; it never modifies the source .weave directory.
 
+# wv_rename_new and the hash stand-ins (wv-0bcb09, wv-7d7d41); a caller
+# sourcing this file alone gets them from beside it (no side effects on source).
+if ! declare -F wv_rename_new >/dev/null; then
+    # shellcheck source=/dev/null
+    . "${BASH_SOURCE[0]%/*}/wv-resolve-runtime.sh"
+fi
+
 wv_checkpoint_generation_stage() {
     local weave="$1" stage="$2" generation="$3"
     local state="$weave/state.sql" root="$weave/deltas"
@@ -55,7 +62,7 @@ wv_checkpoint_generation_stage() {
     jq -n --arg generation "$generation" --arg state "$state_hash" --arg manifest "$manifest_hash" \
       '{format:"weave.checkpoint-stage.v1",state:"staged",generation:$generation,state_sha256:$state,manifest_sha256:$manifest}' > "$tmp/journal.json" || { rm -rf "$tmp"; rm -f "$catalog"; rmdir "$lock"; return 1; }
     rm -rf "$work" || { rm -rf "$tmp"; rm -f "$catalog"; rmdir "$lock"; return 1; }
-    if ! mv -T "$tmp" "$target"; then
+    if ! wv_rename_new "$tmp" "$target"; then
         rm -rf "$tmp"; rm -f "$catalog"; rmdir "$lock"; return 1
     fi
     rm -f "$catalog"

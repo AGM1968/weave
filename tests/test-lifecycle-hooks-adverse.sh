@@ -31,6 +31,10 @@ unset WV_AUTO_CHECKPOINT
 # ADVERSE_ROOT runs another tree's routine under this test (e.g. a scratch
 # export of an older commit, to show the test fails there).
 ROOT="${ADVERSE_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+# wv_stat / wv_date_fmt: GNU and BSD behind one call (wv-resolve-runtime.sh, side-effect free).
+# shellcheck disable=SC1091  # resolved at run time
+source "$ROOT/scripts/lib/wv-resolve-runtime.sh"
+source "$ROOT/tests/lib/bounded.sh"  # timeout(1) is GNU-only; macOS has none (wv-412db3)
 WV="$ROOT/scripts/wv"
 HOOKS="$ROOT/.claude/hooks"
 TEST_DIR=$(mktemp -d)
@@ -98,7 +102,7 @@ run_timed() {
     local budget="$1" out="$2" start end
     shift 2
     start=$(date +%s)
-    timeout "$((budget + 30))" "$@" >"$out" 2>/dev/null || true
+    bounded "$((budget + 30))" "$@" >"$out" 2>/dev/null || true
     end=$(date +%s)
     printf '%s\n' "$((end - start))"
 }
@@ -167,11 +171,12 @@ in_repo() {
         GIT_TERMINAL_PROMPT=0 "$@")
 }
 # exec + setsid: the background job IS the new process group's leader, so the
-# kill reaches the whole group, as a host's does.
+# kill reaches the whole group, as a host's does. The session comes from
+# python3's os.setsid(): util-linux setsid(1) is not on macOS (wv-412db3).
 # shellcheck disable=SC2016  # $1, $2 are bash -c positional arguments
 (cd "$repo" && exec env WV_PROJECT_DIR="$repo" CLAUDE_PROJECT_DIR="$repo" WEAVE_DIR="$repo/.weave" \
     WV_HOT_ZONE="$hot" WV_DB="$hot/brain.db" WV_CONFIG_DIR="$cfg" WV_AGENT_ID="adverse-cut" \
-    setsid bash -c 'printf "%s" "$1" | "$2" hook dispatch --event=SessionStart --format=host >/dev/null 2>&1' \
+    python3 -I -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' bash -c 'printf "%s" "$1" | "$2" hook dispatch --event=SessionStart --format=host >/dev/null 2>&1' \
     _ "$(payload_for SessionStart cut)" "$WV") &
 cut_pid=$!
 for _ in $(seq 1 100); do
@@ -191,7 +196,7 @@ check "the next SessionStart summary reports it" has "$next_out" "Hooks: unfinis
 
 # ── wv work's stale-operation auto-clear is reported, not silent ─────────────
 printf '{"event":"begin","op":"sync","op_id":"stale1","args":{},"ts":"%s"}\n' \
-    "$(date -u -d '2 hours ago' +%Y-%m-%dT%H:%M:%SZ)" > "$hot/ops.journal"
+    "$(wv_date_fmt -u "$(( $(date +%s) - 7200 ))" +%Y-%m-%dT%H:%M:%SZ)" > "$hot/ops.journal"
 node=$(in_repo "$WV" list --json 2>/dev/null | jq -r '.[0].id // empty')
 work_err=$(in_repo "$WV" work "$node" 2>&1 >/dev/null || true)
 check "wv work names the operation it cleared" has "$work_err" "Cleared an unfinished operation older than 30 min: sync started"

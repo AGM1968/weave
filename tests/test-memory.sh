@@ -246,8 +246,19 @@ test_remember_recall_ready_and_render() {
 
     assert_equals "$TEST_DIR/.codex/weave.json" "$(printf '%s' "$render_json" | jq -r '.path')" "render reports target path"
     assert_equals "weave-graph" "$rendered_authority" "render marks graph as memory authority"
-    assert_equals "./scripts/wv memory recall --agent=all --json" "$rendered_command" "render uses agent-agnostic graph recall"
+    # The fixture has no scripts/wv, so it is a consumer: the command names the
+    # installed binary, as init-repo writes it (wv-dce969, wv-12e1a6).
+    # shellcheck disable=SC2016  # the expected text contains a literal $ reference
+    assert_equals '$HOME/.local/bin/wv memory recall --agent=all --json' "$rendered_command" "render uses agent-agnostic graph recall (consumer: installed wv)"
     assert_equals "1" "$rendered_count" "render writes active memory entries"
+    # A source checkout (scripts/wv beside scripts/lib/wv-config.sh) keeps its own.
+    mkdir -p "$TEST_DIR/scripts/lib"
+    printf '#!/bin/sh\n' > "$TEST_DIR/scripts/wv"; chmod +x "$TEST_DIR/scripts/wv"
+    : > "$TEST_DIR/scripts/lib/wv-config.sh"
+    "$WV" memory render --agent=codex --path="$TEST_DIR/.codex/weave.json" --json >/dev/null
+    assert_equals "./scripts/wv memory recall --agent=all --json" "$(jq -r '.memory.recall.command' "$TEST_DIR/.codex/weave.json")" \
+        "render uses agent-agnostic graph recall (source checkout: its own scripts/wv)"
+    rm -rf "$TEST_DIR/scripts"
 
     printf '%s\n' "# Weave Workflow Reference" > "$TEST_DIR/WORKFLOW.md"
     local workflow_json workflow_block_count
@@ -819,7 +830,7 @@ test_memory_supersede() {
     local task
     local add_out
     add_out=$("$WV" add "not a memory" --standalone --force 2>&1)
-    task=$(sed -nE 's/^✓ (wv-[0-9a-f]{6}): .*/\1/;T;p;q' <<< "$add_out")
+    task=$(sed -nE '/^✓ (wv-[0-9a-f]{6}): /{s/^✓ (wv-[0-9a-f]{6}): .*/\1/p;q;}' <<< "$add_out")
     assert_equals "1" "$("$WV" remember "x" --supersedes="$task" >/dev/null 2>&1; echo $?)" \
         "a non-memory node cannot be superseded"
     assert_equals "1" "$("$WV" remember "x" --supersedes=not-an-id >/dev/null 2>&1; echo $?)" \
@@ -977,6 +988,7 @@ test_memory_graduate() {
     sqlite3 "$WV_DB" "UPDATE nodes SET metadata=json_set(metadata,'\$.mem_status','candidate') WHERE id='$c';"
     printf '%s\n' '---' 'id: house' 'description: house procedure' 'fallback: "wv guide --procedure=house"' \
         'adapters: [claude]' 'visibility: local' 'claude_skill: house' '---' '# House' > .weave/procedures/house.md
+    # shellcheck disable=SC2016  # $X is an ast-grep metavariable, written literally
     printf '%s\n' 'id: rule' 'language: bash' 'severity: warning' 'message: m' 'rule:' '  pattern: rm -rf $X' > .weave/patterns/rule.yaml
     printf '%s\n' 'id: other' 'language: bash' 'rule:' '  pattern: x' > .weave/patterns/broken.yaml
     printf '# Lessons\n' > docs/lessons.md

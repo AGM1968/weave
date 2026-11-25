@@ -231,7 +231,7 @@ has_b=$(echo "$obs_nodes" | python3 -c "import sys,json; nodes=json.load(sys.std
 assert "Observer has Agent A's node" '[ "$has_a" = "yes" ]' "Agent A node present"
 assert "Observer has Agent B's node" '[ "$has_b" = "yes" ]' "Agent B node present"
 # Verify deltas exist on disk (propagated via git)
-obs_delta_count=$(find "$OBSERVER_DIR/.weave/deltas" -name '*.sql' 2>/dev/null | wc -l)
+obs_delta_count=$(( $(find "$OBSERVER_DIR/.weave/deltas" -name '*.sql' 2>/dev/null | wc -l) ))
 assert "Observer has delta files from both agents" '[ "$obs_delta_count" -ge 2 ]' "at least 2 deltas (got: $obs_delta_count)"
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -342,8 +342,8 @@ assert "Idempotent: node count unchanged after re-load" '[ "$node_count_before" 
 echo ""
 echo "--- Agent ID in filenames ---"
 
-a_deltas=$(find "$AGENT_A_DIR/.weave/deltas" -name '*-agentA.sql' | wc -l)
-b_deltas=$(find "$AGENT_B_DIR/.weave/deltas" -name '*-agentB.sql' | wc -l)
+a_deltas=$(( $(find "$AGENT_A_DIR/.weave/deltas" -name '*-agentA.sql' | wc -l) ))
+b_deltas=$(( $(find "$AGENT_B_DIR/.weave/deltas" -name '*-agentB.sql' | wc -l) ))
 
 assert "Agent A deltas have agentA suffix" '[ "$a_deltas" -gt 0 ]' "at least 1 agentA delta"
 assert "Agent B deltas have agentB suffix" '[ "$b_deltas" -gt 0 ]' "at least 1 agentB delta"
@@ -406,7 +406,7 @@ sqlite3 "$WV_DB" "UPDATE nodes SET updated_at=datetime('now','-72 hours') WHERE 
 if command -v warp-session >/dev/null 2>&1; then
     warp-session reset "$WV_DB" 2>/dev/null || true
 fi
-delta_before=$(find "$PRUNE_DIR/.weave/deltas" -name '*.sql' -size +0c 2>/dev/null | wc -l)
+delta_before=$(( $(find "$PRUNE_DIR/.weave/deltas" -name '*.sql' -size +0c 2>/dev/null | wc -l) ))
 
 # Remove sync throttle stamp to allow auto_sync to fire
 rm -f "$PRUNE_DIR/hot/.last_sync" 2>/dev/null
@@ -415,11 +415,11 @@ rm -f "$PRUNE_DIR/hot/.last_sync" 2>/dev/null
 $WV prune --age=48h 2>/dev/null
 
 # Check for new delta files with DELETE
-delta_after=$(find "$PRUNE_DIR/.weave/deltas" -name '*.sql' -size +0c 2>/dev/null | wc -l)
+delta_after=$(( $(find "$PRUNE_DIR/.weave/deltas" -name '*.sql' -size +0c 2>/dev/null | wc -l) ))
 delete_count=0
 if [ "$delta_after" -gt "$delta_before" ]; then
     # Check newest deltas for DELETE statements
-    delete_count=$(find "$PRUNE_DIR/.weave/deltas" -name '*.sql' -newer "$WV_DB" -exec grep -l "DELETE" {} \; 2>/dev/null | wc -l)
+    delete_count=$(( $(find "$PRUNE_DIR/.weave/deltas" -name '*.sql' -newer "$WV_DB" -exec grep -l "DELETE" {} \; 2>/dev/null | wc -l) ))
 fi
 
 assert "No new deltas with DELETE after prune" '[ "$delete_count" -eq 0 ]' "0 deltas with DELETE (got: $delete_count)"

@@ -374,6 +374,15 @@ class HotZoneConflictError(RuntimeError):
     """
 
 
+def _tmpdir_base() -> str:
+    """$TMPDIR (default /tmp) without a trailing slash, as bash's _hz_tmpdir_base.
+
+    macOS sets TMPDIR to /var/folders/.../T/; joining it as written gave
+    .../T//weave-<uid>, which failed every prefix check (wv-4ccc98).
+    """
+    return os.environ.get("TMPDIR", "/tmp").rstrip("/") or "/"
+
+
 def _hot_zone_root() -> str:
     """The WV_TEST_HOT_ZONE_ROOT prefix bash's _hot_zone_tmp_names applies."""
     test_root = os.environ.get("WV_TEST_HOT_ZONE_ROOT", "")
@@ -385,9 +394,11 @@ def _hot_zone_root() -> str:
 def _tmp_zone_names(uid: int) -> tuple[str, str]:
     """The /tmp zone's neutral and legacy names (wv-95bddf).
 
-    Until every host runs a version that knows the neutral name, the legacy
-    directory stays the physical one and the neutral name is at most a
-    symlink to it. See _hot_zone_tmp_names in wv-resolve-runtime.sh.
+    Fresh, the neutral name is the real directory and the legacy name a fence
+    symlink to it (wv-97d68a); an existing real legacy directory with the
+    neutral name as its alias is adopted as it stands. Python only resolves;
+    bash's hot_zone_ensure creates. See _hot_zone_tmp_names in
+    wv-resolve-runtime.sh.
     """
     root = _hot_zone_root()
     return f"{root}/tmp/weave-hotzone-{uid}", f"{root}/tmp/weave-codex-{uid}"
@@ -445,9 +456,11 @@ def _linux_hot_zones(uid: int) -> tuple[list[str], bool]:
                 conflict = _zone_populated(legacy)
         else:
             zones = [neutral]
-    elif os.path.lexists(legacy):
+    elif os.path.lexists(legacy) and not os.path.islink(legacy):
         zones = [legacy]
     else:
+        # Neither, or only a legacy fence link whose directory is gone: bash
+        # creates the neutral directory (wv-97d68a).
         zones = [neutral]
     root = _hot_zone_root()
     return zones + [f"{root}/dev/shm/weave", f"{root}/tmp/weave-{uid}"], conflict
@@ -465,7 +478,9 @@ def _runtime_hot_zone_base(uid: int | None, rhash: str) -> str:
     if uid is None:
         return "/tmp/weave"
     if sys.platform == "darwin":
-        return f"{os.environ.get('TMPDIR', '/tmp')}/weave-{uid}"
+        # The test root prefixes the temp-directory zone as it prefixes the
+        # Linux zones, as bash does: one isolation knob on every OS (wv-19572f).
+        return f"{_hot_zone_root()}{_tmpdir_base()}/weave-{uid}"
     zones, tmp_conflict = _linux_hot_zones(uid)
     if not rhash:
         return zones[0]
@@ -532,10 +547,12 @@ def _hot_zone_bases(uid: int | None) -> list[str]:
     if uid is not None:
         bases += [f"/tmp/weave-hotzone-{uid}", f"/tmp/weave-codex-{uid}", f"/tmp/weave-{uid}"]
         if sys.platform == "darwin":
-            bases.append(f"{os.environ.get('TMPDIR', '/tmp')}/weave-{uid}")
+            bases.append(f"{_tmpdir_base()}/weave-{uid}")
     if uid is not None and os.environ.get("WV_TEST_HOT_ZONE_ROOT"):
         root = _hot_zone_root()
         bases += [*_tmp_zone_names(uid), f"{root}/dev/shm/weave", f"{root}/tmp/weave-{uid}"]
+        if root and sys.platform == "darwin":
+            bases.append(f"{root}{_tmpdir_base()}/weave-{uid}")  # wv-19572f
     test_base = os.environ.get("WV_TEST_HOT_ZONE_BASE", "")
     if os.environ.get("WV_TEST_MODE") == "1" and test_base.startswith("/"):
         bases.append(test_base)

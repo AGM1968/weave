@@ -5,6 +5,28 @@
 # Allows graph-state-only commits and WIP checkpoints through.
 #
 # Skip with: git commit --no-verify (or WV_SKIP_PRECOMMIT=1)
+# wv bash guard (wv-7257a8): bash >= 4 or a clear refusal. Identical in every executed entry point; master: scripts/lib/wv-bash-guard.sh.
+_wv_bash_guard() {
+    if [ -n "${WV_TEST_BASH_TOO_OLD:-}" ] && [ "${WV_TEST_MODE:-}" != 1 ]; then echo "wv: WV_TEST_BASH_TOO_OLD needs WV_TEST_MODE=1; ignoring it." >&2; fi
+    if [ "${BASH_VERSINFO[0]:-0}" -ge 4 ] && ! { [ "${WV_TEST_MODE:-}" = 1 ] && [ "${WV_TEST_BASH_TOO_OLD:-}" = 1 ]; }; then
+        unset WV_BASH_REEXEC
+        return 0
+    fi
+    local b
+    if [ -z "${WV_BASH_REEXEC:-}" ] && [ -f "$0" ]; then
+        for b in ${WV_BASH:-} /opt/homebrew/bin/bash /usr/local/bin/bash /usr/bin/bash /bin/bash; do
+            # shellcheck disable=SC2016  # the child bash expands it
+            if [ -x "$b" ] && [ "$("$b" -c 'echo "${BASH_VERSINFO[0]}"' 2>/dev/null)" -ge 4 ] 2>/dev/null; then
+                WV_BASH_REEXEC=1 WV_TEST_BASH_TOO_OLD='' exec "$b" "$0" "$@"
+            fi
+        done
+    fi
+    echo "wv: $0 needs bash 4 or newer but is running under bash ${BASH_VERSION:-unknown}." >&2
+    echo "    On macOS /bin/bash is 3.2: install a newer one (brew install bash) or set WV_BASH to it." >&2
+    exit 1
+}
+_wv_bash_guard "$@"
+# end wv bash guard
 
 hook_progress() {
     [ "${WV_HOOK_PROGRESS:-1}" = "0" ] && return 0
@@ -26,15 +48,19 @@ hook_progress() {
 # temporary index holding the working change, so a refusal costs seconds
 # instead of a gate run. It judges as for a commit, except that it reports a
 # missing claim instead of refusing, runs only the selected light suites
-# measured at WV_GATE_PREFLIGHT_FAST_S seconds or less unless
-# WV_GATE_PREFLIGHT_SUITES=1, records no gate measurement, never enters
+# measured at WV_GATE_PREFLIGHT_FAST_S seconds or less, or light and unmeasured,
+# unless WV_GATE_PREFLIGHT_SUITES=1, records no gate measurement, never enters
 # recovery, and ends after the candidate lanes without binding a commit.
 # Read once and unset, so a suite that tests this hook does not inherit it;
 # the copies this hook runs itself (HEAD's, each lane's) are handed it.
-_PC_PREFLIGHT=${WV_GATE_PREFLIGHT:-0}
-_PC_PREFLIGHT_SUITES=${WV_GATE_PREFLIGHT_SUITES:-0}
-_PC_PREFLIGHT_FAST_S=${WV_GATE_PREFLIGHT_FAST_S:-20}
-unset WV_GATE_PREFLIGHT WV_GATE_PREFLIGHT_SUITES WV_GATE_PREFLIGHT_FAST_S
+# A function, not body lines (ruling (c), wv-3ce219): it sets the globals once.
+_pc_take_preflight_env() {
+    _PC_PREFLIGHT=${WV_GATE_PREFLIGHT:-0}
+    _PC_PREFLIGHT_SUITES=${WV_GATE_PREFLIGHT_SUITES:-0}
+    _PC_PREFLIGHT_FAST_S=${WV_GATE_PREFLIGHT_FAST_S:-20}
+    unset WV_GATE_PREFLIGHT WV_GATE_PREFLIGHT_SUITES WV_GATE_PREFLIGHT_FAST_S
+}
+_pc_take_preflight_env
 _pc_preflight() { [ "$_PC_PREFLIGHT" = 1 ]; }
 
 # PROTECTED DISPATCHER (S2a, wv-1f98b6; boundary rule 3, wv-ecf877). Where HEAD
@@ -312,7 +338,7 @@ else
 fi
 if [ -n "$_PC_LIB_DIR" ]; then
     source "$_PC_LIB_DIR/wv-validate.sh" 2>/dev/null || true
-    source "$_PC_LIB_DIR/wv-config.sh" 2>/dev/null || true
+    source "$_PC_LIB_DIR/wv-config.sh" || true  # stderr kept: its python floor refusal (wv-892318) must be seen
     source "$_PC_LIB_DIR/wv-checkpoint-ci.sh" 2>/dev/null || true
     # Repo-declared shellcheck scope (wv-7608e6); its absence is checked where
     # a repository has declared one, never assumed away.
@@ -332,7 +358,9 @@ done
 # The frozen candidate (wv-8e34cd), found the same way and required the same
 # way: without it the gate would read whatever the index holds at each step.
 # The per-checkout gate lock (wv-c5500d) likewise, and the clock (wv-b17a85).
-for _pc_lib in wv-gate-snapshot.sh wv-gate-hold.sh wv-clock.sh; do
+# The test-line advisory (wv-1163f5) is optional: _pc_gate_finish checks for it.
+# wv-lock.sh: the lanes' shellcheck lock (wv-7bd071).
+for _pc_lib in wv-gate-snapshot.sh wv-gate-hold.sh wv-clock.sh wv-test-ratchet.sh wv-lock.sh; do
     for _pc_cand in "${_pc_lib_cands[@]}"; do
         if [ -n "$_pc_cand" ] && [ -f "$_pc_cand/$_pc_lib" ]; then
             # shellcheck source=/dev/null
@@ -618,13 +646,14 @@ if grep -Fxq '.weave/nodes.jsonl' <<< "$STAGED_FILES" \
             echo "✗ memory parity: could not materialise the frozen graph and projections — refusing" >&2
             exit 1
         fi
-        if ! _pc_external_dir tests/test-memory-projection-parity.sh; then
+        if ! _pc_external_dir tests/test-memory-projection-parity.sh tests/lib/sed-inplace.sh; then
             _pc_external_drop; rm -rf "$_pc_memory_dir"
             echo "✗ memory parity: could not copy the parity checker for this check — refusing" >&2
             exit 1
         fi
         _pc_memory_rc=0
-        bash "$_PC_EXT_DIR/tests/test-memory-projection-parity.sh" --subject "$_pc_memory_dir" || _pc_memory_rc=$?
+        # "$BASH": the guarded hook's bash>=4; a bare bash is PATH's, 3.2 on macOS (wv-f7fe9f)
+        "$BASH" "$_PC_EXT_DIR/tests/test-memory-projection-parity.sh" --subject "$_pc_memory_dir" || _pc_memory_rc=$?
         _pc_external_drop
         rm -rf "$_pc_memory_dir"
         if [ "$_pc_memory_rc" -ne 0 ]; then
@@ -679,9 +708,9 @@ fi
 # (wv-b17a85), the estimate it announced, the suites it selected, and how it
 # ended -- on success and on every failure path alike.
 export WV_GATE_PHASE=pre-commit
-WV_GATE_ID="pc-$(date +%s%N 2>/dev/null || date +%s)-$$"
+WV_GATE_ID="pc-$(wv_now ns 2>/dev/null || date +%s)-$$"
 export WV_GATE_ID
-_pc_gate_t0=$(date +%s%N 2>/dev/null || echo 0)
+_pc_gate_t0=$(wv_now ns 2>/dev/null || echo 0)
 wv_clock_ms _pc_gate_c0 _pc_gate_k0 2>/dev/null || _pc_gate_k0=unknown
 _pc_gate_pressure0=$(gate_pressure_totals 2>/dev/null)
 _pc_gate_suites=""
@@ -689,6 +718,8 @@ _pc_gate_estimate_ms=""
 _pc_gate_finish() {
     local rc=$? ms=0 clock=unknown
     wv_clock_since ms clock "${_pc_gate_c0:-}" "$_pc_gate_k0" 2>/dev/null || clock=unknown
+    # Advisory only (wv-1163f5): it reports and never changes the gate's exit.
+    ! command -v wv_test_line_advisory >/dev/null 2>&1 || wv_test_line_advisory >&2 || true
     "$WV" test-record gate --gate --exit="$rc" --duration="$ms" --clock="$clock" \
         --execution-mode="${WV_GATE_EXECUTION_MODE:-}" \
         --suite-modes="$(gate_pool_suite_modes "$_pc_gate_suites")" \
@@ -697,6 +728,7 @@ _pc_gate_finish() {
         --lanes="${_GATE_LANES_RUNS:-}" --lanes-ms="${_GATE_LANES_MS:-}" \
         --lanes-started-ms="$([ -z "${_GATE_LANES_T0:-}" ] || _pc_ns_to_ms "$_GATE_LANES_T0" 2>/dev/null)" \
         --pressure-start="$_pc_gate_pressure0" --pressure-end="$(gate_pressure_totals 2>/dev/null)" \
+        --tree="${WV_GATE_TREE:-}" \
         >/dev/null 2>&1 || true
     wv_gate_hold_release 2>/dev/null || true
     return "$rc"
@@ -1096,7 +1128,7 @@ if [ "${#STAGED_PY_FILES[@]}" -gt 0 ] || [ -n "$STAGED_QUALITY_RULES" ]; then
         # is ignored.
         if ! WV_GATE_SLOT_STAMP="$_pc_pytest_work/slot" \
             gate_run_bounded "focused pytest" "${WV_GATE_TIMEOUT:-1800}" \
-            env -u WV_CALL_LOG -u WV_GATE_LANE_JOBS -u WV_GATE_SLOTS -u WV_GATE_SLOT_STAMP -u WV_GATE_SLOT_STOP -u WV_SCRATCH_ROOT \
+            env -u WV_CALL_LOG -u WV_GATE_LANE_JOBS -u WV_GATE_SLOTS -u WV_GATE_SLOT_STAMP -u WV_GATE_SLOT_STOP -u WV_SCRATCH_ROOT -u WV_GATE_KEEP_GOING \
             -u GIT_INDEX_FILE -u GIT_DIR -u GIT_WORK_TREE -u GIT_PREFIX -u GIT_COMMON_DIR \
             -u GIT_OBJECT_DIRECTORY -u GIT_ALTERNATE_OBJECT_DIRECTORIES -u GIT_NAMESPACE \
             "${_pc_pytest_command[@]}"; then
@@ -1322,12 +1354,13 @@ if command -v shellcheck >/dev/null 2>&1; then
         # peaks at 1.6 GB, so two lanes took an 8 GB host to 2.6 GB free
         # (wv-cb632d). gate_lanes_run names one lock for its lanes in
         # WV_GATE_SC_LOCK (read as _PC_SC_LOCK): each lane still runs all of
-        # its shellcheck runs itself, one lane at a time. Without the lock (the
-        # protected pass, which ends before lanes start, or a host without
-        # flock) the run is as before.
+        # its shellcheck runs itself, one lane at a time, waiting as long as the
+        # lane may run. Without the lock (the protected pass, which ends before
+        # lanes start) the run is as before. wv_lock_run (wv-lock.sh) locks with
+        # or without flock(1); a lock it cannot take fails the lint (wv-7bd071).
         _pc_sc_lock=()
-        [ -n "$_PC_SC_LOCK" ] && command -v flock >/dev/null 2>&1 \
-            && _pc_sc_lock=(flock "$_PC_SC_LOCK")
+        [ -n "$_PC_SC_LOCK" ] \
+            && _pc_sc_lock=(wv_lock_run "$_PC_SC_LOCK" -x "${WV_GATE_LANE_TIMEOUT:-7200}")
         for _pc_sc_n in "${!_pc_sc_keys[@]}"; do
             _pc_sc_k=${_pc_sc_keys[$_pc_sc_n]}
             _pc_sc_group=()
@@ -1582,13 +1615,13 @@ if [ "$_pc_leak_hit" = true ] && _pc_tracked_at_head_or_index build-release.sh \
         echo "✗ release leak guard: could not materialise the staged index — refusing to commit unchecked tests" >&2
         exit 1
     fi
-    if ! _pc_external_dir build-release.sh tests/lib/release-leak-pattern.ere tests/test-shipped-test-refs.sh; then
+    if ! _pc_external_dir build-release.sh tests/lib/release-leak-pattern.ere tests/test-shipped-test-refs.sh tests/lib/sed-inplace.sh; then
         _pc_external_drop; rm -rf "$_pc_leak_dir"
         echo "✗ release leak guard: could not copy the release policy for this check — refusing to commit unchecked tests" >&2
         exit 1
     fi
     _pc_leak_rc=0
-    bash "$_PC_EXT_DIR/tests/test-shipped-test-refs.sh" --scan "$_pc_leak_dir" \
+    "$BASH" "$_PC_EXT_DIR/tests/test-shipped-test-refs.sh" --scan "$_pc_leak_dir" \
         --policy "$_PC_EXT_DIR" || _pc_leak_rc=$?
     _pc_external_drop
     rm -rf "$_pc_leak_dir"
@@ -1606,7 +1639,7 @@ if [ -n "$_pc_files_csv" ]; then
     # not found" and the hook -- which does not run under set -e -- would carry
     # on and pass with no suite run (found by ultrareview follow-up).
     if ! command -v run_hook_suites >/dev/null 2>&1 || ! command -v gate_pool_estimates >/dev/null 2>&1 \
-        || ! command -v gate_pool_launch_order >/dev/null 2>&1 || ! command -v gate_pool_require_present >/dev/null 2>&1 \
+        || ! command -v gate_pool_launch_order >/dev/null 2>&1 || ! command -v gate_pool_require_present >/dev/null 2>&1 || ! command -v gate_pool_preflight_select >/dev/null 2>&1 \
         || ! command -v wv_clock_since >/dev/null 2>&1; then
         echo "✗ Weave pre-commit: the suite pool (wv-gate-pool.sh) was not found — refresh with $(_pc_refresh_cmd)" >&2
         exit 1
@@ -1678,13 +1711,11 @@ if [ -n "$_pc_files_csv" ]; then
             hook_progress "no Weave pre-push gate installed — running heavy-tier suites here: $_pc_heavy"
         fi
     fi
-    # A preflight runs, by default, only the light suites the gate has
-    # measured as quick; WV_GATE_PREFLIGHT_SUITES=1 runs every light one.
+    # A preflight runs, by default, the light suites measured as quick and
+    # every light one not yet measured (gate_pool_preflight_select, wv-f4e3d2);
+    # WV_GATE_PREFLIGHT_SUITES=1 runs every light one.
     if _pc_preflight && [ "$_PC_PREFLIGHT_SUITES" != 1 ]; then
-        _pc_light_all=$(jq 'length' <<< "$_pc_suites_json" 2>/dev/null || echo 0)
-        _pc_suites_json=$(jq -c --argjson s "$_PC_PREFLIGHT_FAST_S" \
-            '[.[] | select((.last_cost_s // 0) > 0 and .last_cost_s <= $s)]' <<< "$_pc_suites_json" 2>/dev/null || echo '[]')
-        hook_progress "preflight: $(jq 'length' <<< "$_pc_suites_json") of $_pc_light_all selected light suite(s) are measured at ${_PC_PREFLIGHT_FAST_S}s or less and run; --suites runs them all"
+        _pc_suites_json=$(gate_pool_preflight_select "$_pc_suites_json" "$_PC_PREFLIGHT_FAST_S")
     fi
     _pc_light_count=$(printf '%s' "$_pc_suites_json" | jq 'length' 2>/dev/null || echo 0)
     if [ "${_pc_suite_count:-0}" -gt 0 ] && [ "${_pc_light_count:-0}" -eq 0 ] && _pc_preflight; then

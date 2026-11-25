@@ -20,6 +20,7 @@ export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls
 export WV_CALL_SOURCE=test
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/lib/bounded.sh"  # timeout(1) is GNU-only; macOS has none (wv-f8e26d)
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 WV="$ROOT/scripts/wv"
 
@@ -42,9 +43,10 @@ env WV_HOT_ZONE="$T/hot" WV_DB="$T/hot/brain.db" WV_PROJECT_DIR="$REPO" WV_CONFI
 
 LOG="$T/db-ensure.log"
 unreadable() {  # unreadable <wv args...>: run against a hot zone that cannot be created
-    env WV_TEST_MODE=1 WV_TEST_HOT_ZONE_ROOT="$T/no/such/root" WV_TEST_DB_ENSURE_LOG="$LOG" \
+    # bounded is a shell function, so env goes inside it: env cannot run a function.
+    bounded 60 env WV_TEST_MODE=1 WV_TEST_HOT_ZONE_ROOT="$T/no/such/root" WV_TEST_DB_ENSURE_LOG="$LOG" \
         WV_PROJECT_DIR="$REPO" WV_CONFIG_DIR="$T/cfg" WV_AUTO_SYNC=0 WV_AUTO_CHECKPOINT=0 \
-        timeout 60 "$WV" "$@" </dev/null >"$T/out" 2>"$T/err"
+        "$WV" "$@" </dev/null >"$T/out" 2>"$T/err"
 }
 
 echo "a command that cannot read the graph does not report one"

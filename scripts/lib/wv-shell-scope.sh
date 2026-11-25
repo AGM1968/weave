@@ -66,8 +66,10 @@ wv_shell_scope_select() {
     done
     if [ "${#candidates[@]}" -gt 0 ]; then
         # One awk over every candidate's first line; ./ keeps a name that
-        # starts with '-' from reading as an option.
-        mapfile -d '' -t shebang < <(cd "$root" && printf './%s\0' "${candidates[@]}" | xargs -0 awk '
+        # starts with '-' from reading as an option. LC_ALL=C: BSD awk aborts
+        # on a byte invalid in a UTF-8 locale, and candidates include binary
+        # files (wv-27b2f5).
+        mapfile -d '' -t shebang < <(cd "$root" && printf './%s\0' "${candidates[@]}" | LC_ALL=C xargs -0 awk '
             FNR == 1 { if ($0 ~ /^#!.*[\/ \t](ba|da|k)?sh([ \t]|$)/) printf "%s%c", substr(FILENAME, 3), 0; nextfile }')
         wait "$!" || return 1
         selected+=("${shebang[@]}")

@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+: "${WV_BSD_SHIM_REAL:=${0%/*}/../real}"  # env -i drops the export; this stand-in sits in bin/ beside real/ (wv-43082a)
+# BSD script stand-in (wv-f8e26d): script [-aeFkqr] [-t time] [file [command ...]].
+# There is no -c: the command follows the file as separate words, so the
+# util-linux form 'script -qec CMD FILE' fails with 'illegal option -- c'.
+# The BSD form is emulated on util-linux script, which takes the command as
+# one -c string.
+usage() { echo "usage: script [-aeFkqr] [-t time] [file [command ...]]" >&2; exit 1; }
+gnu=()
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --) shift; break ;;
+        -t) shift; [ "$#" -gt 0 ] || usage; shift; continue ;;
+        -*)
+            opts=${1#-}
+            while [ -n "$opts" ]; do
+                o=${opts:0:1}; opts=${opts:1}
+                case "$o" in
+                    a) gnu+=(-a) ;; q) gnu+=(-q) ;; e|F|k|r) ;;
+                    *) echo "script: illegal option -- $o" >&2; usage ;;
+                esac
+            done ;;
+        *) break ;;
+    esac
+    shift
+done
+file=${1:-typescript}
+[ "$#" -eq 0 ] || shift
+# BSD returns the command's status, as util-linux does with -e.
+if [ "$#" -gt 0 ]; then
+    exec "$WV_BSD_SHIM_REAL/script" "${gnu[@]}" -e -c "$(printf '%q ' "$@")" "$file"
+fi
+exec "$WV_BSD_SHIM_REAL/script" "${gnu[@]}" -e "$file"

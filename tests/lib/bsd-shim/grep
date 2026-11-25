@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+: "${WV_BSD_SHIM_REAL:=${0%/*}/../real}"  # env -i drops the export; this stand-in sits in bin/ beside real/ (wv-43082a)
+# BSD grep stand-in (wv-418760): no -P.
+#   - -Z is not --null: BSD grep -Z reads its input as compressed (zgrep), so
+#     on plain files grep -lZ prints newline-terminated names and an xargs -0
+#     after it gets every name as one argument (Mac run 44980809555,
+#     test-workflow-surfaces, wv-0a8d84). The stand-in drops Z from short
+#     option clusters; --null works on both and passes through.
+args=() opts=1 want_arg=0
+for a in "$@"; do
+    if [ "$want_arg" -eq 1 ]; then args+=("$a"); want_arg=0; continue; fi
+    if [ "$opts" -eq 1 ]; then
+        case "$a" in
+            --) opts=0 ;;
+            --perl-regexp) echo "grep: unrecognized option '--perl-regexp'" >&2; exit 2 ;;
+            --*) ;;
+            -*P*) echo "grep: invalid option -- P" >&2; exit 2 ;;
+            -e | -f) want_arg=1 ;;
+            -[A-Za-z]*Z*)
+                a="-${a#-}"; a="${a//Z/}"
+                [ "$a" = - ] && continue ;;
+        esac
+    fi
+    args+=("$a")
+done
+exec "$WV_BSD_SHIM_REAL/grep" "${args[@]}"

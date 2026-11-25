@@ -56,7 +56,8 @@ out=$(policy "$T/small")
 out=$(policy "$T/small" --refresh)
 [ "$(jq -r '.policy + "|" + (.cached|tostring)' <<< "$out")" = "LOW|false" ] \
     && ok "--refresh recomputes and replaces the cache" || bad "--refresh recomputes and replaces the cache" "$out"
-touch -d "2 hours ago" "$T/big/.weave/.context_policy"
+# mtime two hours back through python: touch -d is GNU-only (wv-f6b909).
+python3 -I -c 'import os, sys, time; t = time.time() - 7200; os.utime(sys.argv[1], (t, t))' "$T/big/.weave/.context_policy"
 out=$(policy "$T/big")
 [ "$(jq -r '.cached|tostring' <<< "$out")" = "false" ] \
     && ok "a cache older than an hour is recomputed" || bad "a cache older than an hour is recomputed" "$out"

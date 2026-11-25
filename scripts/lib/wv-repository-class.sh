@@ -217,8 +217,11 @@ wv_repository_require_owned() {
     echo "  no repository scaffolding was written" >&2
     echo "  inspect: wv repo-class --json" >&2
     echo "  classify locally: wv repo-class set owned|vendored-upstream" >&2
-    [ "$WV_REPO_AUTO_CLASS" != "vendored-upstream" ] || \
-        echo "  owned forks require: wv repo-class set owned --acknowledge-upstream-fork" >&2
+    # The same test wv_repository_class_set refuses an owned override by: any
+    # automatic class but owned needs the flag, so a mirror, fork or offline
+    # clone with an unverifiable remote is told it too (wv-bd5115).
+    [ "$WV_REPO_AUTO_CLASS" = "owned" ] || \
+        echo "  owning it requires: wv repo-class set owned --acknowledge-upstream-fork (only if this repository is intentionally owned)" >&2
     return 1
 }
 

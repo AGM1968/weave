@@ -218,7 +218,7 @@ wv_stop_guard() (
     if [ -n "$_WV" ]; then
         # `list --status=active --json` (db_query_json) carries updated_at;
         # `query --format=json` (json-v2) strips timestamps for leanness.
-        IDLE_NODES=$("$_WV" list --status=active --json 2>/dev/null | jq -r --argjson cutoff "$(date -d '30 minutes ago' +%s 2>/dev/null || date -v-30M +%s 2>/dev/null || echo 0)" \
+        IDLE_NODES=$("$_WV" list --status=active --json 2>/dev/null | jq -r --argjson cutoff "$(( $(date +%s) - 1800 ))" \
             '.[] | select(.updated_at != null) | select((.updated_at | strptime("%Y-%m-%d %H:%M:%S") | mktime) < $cutoff) | "  \(.id): \(.text[:60])"' 2>/dev/null || true)
         if [ -n "$IDLE_NODES" ]; then
             echo "Note: active node(s) with no update in >30 min — possible abandoned work:" >&2

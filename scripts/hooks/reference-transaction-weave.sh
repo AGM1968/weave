@@ -22,6 +22,28 @@
 # earlier process with the same pid and is dropped. Hooks can be bypassed
 # (--no-verify, core.hooksPath); this binds the gate's own admission, nothing
 # more.
+# wv bash guard (wv-7257a8): bash >= 4 or a clear refusal. Identical in every executed entry point; master: scripts/lib/wv-bash-guard.sh.
+_wv_bash_guard() {
+    if [ -n "${WV_TEST_BASH_TOO_OLD:-}" ] && [ "${WV_TEST_MODE:-}" != 1 ]; then echo "wv: WV_TEST_BASH_TOO_OLD needs WV_TEST_MODE=1; ignoring it." >&2; fi
+    if [ "${BASH_VERSINFO[0]:-0}" -ge 4 ] && ! { [ "${WV_TEST_MODE:-}" = 1 ] && [ "${WV_TEST_BASH_TOO_OLD:-}" = 1 ]; }; then
+        unset WV_BASH_REEXEC
+        return 0
+    fi
+    local b
+    if [ -z "${WV_BASH_REEXEC:-}" ] && [ -f "$0" ]; then
+        for b in ${WV_BASH:-} /opt/homebrew/bin/bash /usr/local/bin/bash /usr/bin/bash /bin/bash; do
+            # shellcheck disable=SC2016  # the child bash expands it
+            if [ -x "$b" ] && [ "$("$b" -c 'echo "${BASH_VERSINFO[0]}"' 2>/dev/null)" -ge 4 ] 2>/dev/null; then
+                WV_BASH_REEXEC=1 WV_TEST_BASH_TOO_OLD='' exec "$b" "$0" "$@"
+            fi
+        done
+    fi
+    echo "wv: $0 needs bash 4 or newer but is running under bash ${BASH_VERSION:-unknown}." >&2
+    echo "    On macOS /bin/bash is 3.2: install a newer one (brew install bash) or set WV_BASH to it." >&2
+    exit 1
+}
+_wv_bash_guard "$@"
+# end wv bash guard
 
 state=${1:-}
 dir=$(git rev-parse --git-path weave-gate 2>/dev/null) || dir=""
@@ -56,8 +78,11 @@ while read -r _old new _ref; do
 done <<< "$input"
 
 # The transaction that published (or failed to publish) the commit ends the
-# record; others in the same process (AUTO_MERGE and the like) leave it.
-if [ "$state" != prepared ] && [ "$published" = true ]; then
-    rm -f "$rec"
+# record; others in the same process (AUTO_MERGE and the like) leave it. Only
+# a terminal state ends it: newer git (2.56.1 seen) runs this hook in a
+# "preparing" state before "prepared", and ending the record there left
+# "prepared" with none, so every commit passed unchecked (wv-412db3).
+if [ "$published" = true ]; then
+    case "$state" in committed|aborted) rm -f "$rec" ;; esac
 fi
 exit 0

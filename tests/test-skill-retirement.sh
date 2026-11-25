@@ -137,5 +137,56 @@ check "the edited retired copy is kept" "present" "$(present "$R/.claude/skills/
 has   "init-repo names the removal" "ship-it: retired skill removed" "$out"
 has   "init-repo names what it kept and why" "resolve-refs: retired skill kept" "$out"
 
+echo "=== D. retired repository hooks (wv-96b61e) ==="
+# The last shipped context-guard.sh, or stand-in bytes in the release projection.
+printf '#!/bin/bash\n# stand-in shipped context-guard.sh\n' > "$T/context-guard.sh"
+HPROV="$T/hook-provenance.txt"
+printf '%s hook:context-guard.sh\n' "$(sha256sum "$T/context-guard.sh" | cut -d' ' -f1)" > "$HPROV"
+if [ "$standin" = 1 ]; then cat "$HPROV" >> "$I/config/skill-provenance.txt"; fi
+H="$T/d/hooks"; mkdir -p "$H" "$T/d2/hooks" "$T/d3/hooks"
+cp "$T/context-guard.sh" "$H/context-guard.sh"
+printf '#!/bin/bash\n' > "$H/session-start-context.sh"          # not retired
+out=$(wv_retire_hook_copies "$H" "$HPROV")
+check "an unedited shipped hook is removed" "absent" "$(present "$H/context-guard.sh")"
+has   "its removal is reported" "context-guard.sh: retired hook removed" "$out"
+check "a hook that is not retired is never touched" "present" "$(present "$H/session-start-context.sh")"
+{ cat "$T/context-guard.sh"; echo "# local edit"; } > "$T/d2/hooks/context-guard.sh"
+out=$(wv_retire_hook_copies "$T/d2/hooks" "$HPROV")
+check "an edited hook is kept" "present" "$(present "$T/d2/hooks/context-guard.sh")"
+has   "and reported" "context-guard.sh: retired hook kept - it differs" "$out"
+cp "$T/context-guard.sh" "$T/d3/hooks/context-guard.sh"
+out=$(wv_retire_hook_copies "$T/d3/hooks" "$T/no-such-provenance.txt")
+check "no provenance list: an unedited hook is kept (fail closed)" "present" "$(present "$T/d3/hooks/context-guard.sh")"
+# A skill entry with the same bytes does not prove a hook copy.
+printf '%s context-guard.sh\n' "$(sha256sum "$T/context-guard.sh" | cut -d' ' -f1)" > "$T/skill-named.txt"
+wv_retire_hook_copies "$T/d3/hooks" "$T/skill-named.txt" >/dev/null
+check "bytes listed without the hook: prefix do not count" "present" "$(present "$T/d3/hooks/context-guard.sh")"
+
+# A consumer that tracks both hooks, as an rc.18 consumer did.
+for kind in unedited edited; do
+    R="$T/hooks-$kind"
+    mkdir -p "$R/.claude/hooks" && git -C "$R" init -q && git -C "$R" config commit.gpgsign false
+    cp "$T/context-guard.sh" "$R/.claude/hooks/context-guard.sh"
+    [ "$kind" = edited ] && echo "# local edit" >> "$R/.claude/hooks/context-guard.sh"
+    git -C "$R" add -A && git -C "$R" -c user.email=t@t -c user.name=t commit -qm tracked
+done
+# Each consumer is its own repository with its own hot zone.
+wvin() { local r="$1"; shift; (cd "$r" && WV_HOT_ZONE="$r.hot" WV_DB="$r.hot/brain.db" "$ROOT/scripts/wv" "$@"); }
+R="$T/hooks-edited"
+out=$(wvin "$R" doctor 2>&1)
+has   "doctor names a retired hook as retired" "retired by Weave, no longer run: context-guard.sh" "$out"
+has   "with its removal command" "git rm .claude/hooks/context-guard.sh" "$out"
+check "and never as missing" "0" "$(grep -c 'context-guard.sh (missing)' <<< "$out")"
+out=$(wvin "$T/hooks-unedited" init-repo --agent=claude --update 2>&1); rc=$?
+check "init-repo --update succeeds (unedited)" "0" "$rc"
+check "init-repo --update removes the unedited retired hook" "absent" "$(present "$T/hooks-unedited/.claude/hooks/context-guard.sh")"
+has   "and says so" "context-guard.sh: retired hook removed" "$out"
+out=$(wvin "$R" init-repo --agent=claude --update 2>&1); rc=$?
+check "init-repo --update succeeds (edited)" "0" "$rc"
+check "init-repo --update keeps the edited retired hook" "present" "$(present "$R/.claude/hooks/context-guard.sh")"
+has   "with a note" "context-guard.sh: retired hook kept - it differs" "$out"
+out=$(wvin "$T/hooks-unedited" doctor 2>&1)
+check "after removal doctor reports no retired hook" "0" "$(grep -c 'retired by Weave' <<< "$out")"
+
 echo "Results: $pass/$run passed"
 [ "$pass" -eq "$run" ]

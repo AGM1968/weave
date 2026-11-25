@@ -13,6 +13,7 @@ set -uo pipefail
 export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/lib/bounded.sh"  # timeout(1) is GNU-only; macOS has none (wv-f8e26d)
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 WV="$ROOT/scripts/wv"
 
@@ -27,6 +28,10 @@ skip() { echo -e "  ~ skipped: $1"; }
 
 TEST_DIR=$(mktemp -d /tmp/wv-attempt-journal-XXXXXX)
 trap 'rm -rf "$TEST_DIR"' EXIT
+# A path under a regular file cannot be created, for root too, on every host
+# (macOS has no /proc, wv-f8e26d).
+: > "$TEST_DIR/regular"
+NOWHERE="$TEST_DIR/regular/nowhere"
 export WEAVE_DIR="$TEST_DIR/.weave"
 export WV_HOT_ZONE="$TEST_DIR/hot"
 # config.env is sourced with `set -a` every invocation and beats an ambient
@@ -123,7 +128,7 @@ WV_EVIDENCE_MODE=1 "$WV" status >/dev/null 2>"$TEST_DIR/nopath.err"
 check "evidence mode without a journal path fails the call" "1" "$?"
 grep -q "requires WV_ATTEMPT_JOURNAL" "$TEST_DIR/nopath.err" \
   && ok "and says why" || bad "and says why" "$(cat "$TEST_DIR/nopath.err")"
-WV_EVIDENCE_MODE=1 WV_ATTEMPT_JOURNAL=/proc/nowhere/attempts.jsonl "$WV" status >/dev/null 2>"$TEST_DIR/unwritable.err"
+WV_EVIDENCE_MODE=1 WV_ATTEMPT_JOURNAL=$NOWHERE/attempts.jsonl "$WV" status >/dev/null 2>"$TEST_DIR/unwritable.err"
 check "evidence mode with an unwritable journal fails the call" "1" "$?"
 grep -q "attempt journal write failed" "$TEST_DIR/unwritable.err" \
   && ok "and names the path it could not write" || bad "and names the path it could not write" ""
@@ -132,7 +137,7 @@ check "evidence mode with a writable journal runs normally" "0" "$?"
 
 # Analytics stays opt-in and best-effort: an unwritable CALL LOG must not fail a
 # call, or enabling analytics would change evidence semantics.
-WV_CALL_LOG=/proc/nowhere/calls.jsonl "$WV" status >/dev/null 2>&1
+WV_CALL_LOG=$NOWHERE/calls.jsonl "$WV" status >/dev/null 2>&1
 check "an unwritable analytics call log does not fail the call" "0" "$?"
 
 # SCHEMA. Every event validates against contracts/attempt-journal-v1.schema.json,
@@ -346,14 +351,14 @@ check "the verdict names the invariant it protects" "yes" \
 # FAIL CLOSED IS THE EMITTER'S. A gate cannot discard a failed verdict write,
 # because the emitter ends the call itself -- the regression being pinned is a
 # call site that wrote `2>/dev/null || true` and lost the decisive event.
-verdict_rc=$(WV_EVIDENCE_MODE=1 WV_ATTEMPT_JOURNAL=/proc/nowhere/attempts.jsonl bash -c '
+verdict_rc=$(WV_EVIDENCE_MODE=1 WV_ATTEMPT_JOURNAL=$NOWHERE/attempts.jsonl bash -c '
     . "'"$ROOT"'/scripts/lib/wv-attempt-journal.sh"
     wv_attempt_context c1 "" t1 test /repo add "" mutation_attempt "[]" sha256:x schema "null"
     wv_attempt_emit policy_verdict rule=r decision=deny would_violate_invariant=yes
     echo REACHED' 2>/dev/null; echo "rc=$?")
 check "a verdict that cannot be written ends the call" "rc=1" "$verdict_rc"
 check "no call site discards an emitter failure" "" \
-  "$(grep -rn 'wv_attempt_emit' "$ROOT/scripts" | grep -E '\|\| *true|2>/dev/null' || true)"
+  "$(grep -rnI 'wv_attempt_emit' "$ROOT/scripts" | grep -E '\|\| *true|2>/dev/null' || true)"
 
 # ── call identity under nesting ───────────────────────────────────────────────
 #
@@ -394,8 +399,8 @@ printf 'nested\n' > nested.txt; git add nested.txt >/dev/null 2>&1
 env -u GIT_CONFIG_COUNT -u GIT_CONFIG_KEY_0 -u GIT_CONFIG_VALUE_0 \
     WV_ATTEMPT_JOURNAL="$JOURNAL" "$WV" quick "nested identity probe" >/dev/null 2>&1
 git config --unset core.hooksPath
-distinct_ids=$(jq -r 'select(.event=="call_started") | .call_id' < "$JOURNAL" | sort -u | wc -l)
-started=$(jq -r 'select(.event=="call_started") | .call_id' < "$JOURNAL" | wc -l)
+distinct_ids=$(( $(jq -r 'select(.event=="call_started") | .call_id' < "$JOURNAL" | sort -u | wc -l) ))
+started=$(( $(jq -r 'select(.event=="call_started") | .call_id' < "$JOURNAL" | wc -l) ))
 # Asserted, not assumed: if the hook did not run there is one call and every
 # identity claim below is vacuously true.
 check "the fixture actually nested a call inside a call" "2" "$started"
@@ -427,7 +432,7 @@ for sibling in 1 2 3; do
       "$WV" status >/dev/null 2>&1 ) &
 done
 wait
-sibling_ids=$(jq -r 'select(.event=="call_started") | .call_id' < "$JOURNAL" | sort -u | wc -l)
+sibling_ids=$(( $(jq -r 'select(.event=="call_started") | .call_id' < "$JOURNAL" | sort -u | wc -l) ))
 sibling_parents=$(jq -r 'select(.event=="call_started") | .parent_call_id' < "$JOURNAL" | sort -u | paste -sd, -)
 check "concurrent siblings each mint their own identity" "3" "$sibling_ids"
 check "and all name the same parent" "sibling-parent" "$sibling_parents"
@@ -447,7 +452,7 @@ killed=$!
 # Kill once the call has journaled its start, not after a fixed delay: under
 # load (parallel gate lanes) the call had not started within 2s and no journal
 # existed (wv-c9d6b7). Bounded, so a call that never journals fails here.
-timeout 60 bash -c 'until grep -qs "\"call_started\"" "$1"; do sleep 0.1; done' _ "$JOURNAL"
+bounded 60 bash -c 'until grep -qs "\"call_started\"" "$1"; do sleep 0.1; done' _ "$JOURNAL"
 check "the call journaled its start before the kill" "0" "$?"
 kill -9 "$killed" 2>/dev/null
 check "...and was still running when killed" "0" "$?"
@@ -494,10 +499,12 @@ check "elapsed_ms is not negative when the wall clock steps back" "yes" "$([ -n 
 check "...and the journal still validates" "0" "$(python3 "$ROOT/tests/lib/journal-validate.py" "$JOURNAL" >/dev/null 2>&1; echo $?)"
 rm -rf "$SHIM"
 : > "$JOURNAL"
-read -r u0 _ < /proc/uptime
+# A monotonic reading in ms on every host (macOS has no /proc/uptime, wv-f8e26d).
+mono_ms() { python3 -c 'import time; print(int(time.monotonic() * 1000))'; }
+u0=$(mono_ms)
 WV_ATTEMPT_JOURNAL="$JOURNAL" "$WV" add "duration probe" --standalone >/dev/null 2>&1
-read -r u1 _ < /proc/uptime
-outer=$(( (${u1/./} - ${u0/./}) * 10 + 20 ))
+u1=$(mono_ms)
+outer=$(( u1 - u0 + 20 ))
 el=$(jq -r 'select(.event=="call_completed") | .elapsed_ms' < "$JOURNAL" | tail -1)
 check "elapsed_ms measures the call: positive and within the outer measurement" "yes" \
     "$([ -n "$el" ] && [ "$el" -gt 0 ] && [ "$el" -le "$outer" ] && echo yes || echo "no ($el vs $outer)")"

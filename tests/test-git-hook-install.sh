@@ -160,7 +160,9 @@ merge_repo "$TMP/drv-missing" '.weave/state.sql merge=ours -diff' '.weave/deltas
 row=$(doctor_merge "$TMP/drv-missing")
 has "an unregistered driver is a warning naming each one" "names merge driver(s) with no git config driver: ours, theirs, wv-trails;" "$row"
 case "$row" in *union*|*commented*) bad "built-in and commented rules are not reported" "$row" ;; *) ok "built-in and commented rules are not reported" ;; esac
-has "the fix outside Weave's source checkout is init-repo" "Fix: wv init-repo --update" "$row"
+# The fix is one git config line for the missing drivers, the same in every
+# checkout (wv-d24a69); tests/test-merge-driver-fresh-clone.sh runs it.
+has "the fix is one git config line for the missing drivers" "Fix: git config merge.ours.driver 'true' && git config merge.theirs.driver 'cp %B %A' && git config merge.wv-trails.driver" "$row"
 wv_register_merge_drivers "$TMP/drv-missing" "$TMP/merge-trails.py"
 has "registered drivers pass" "✓ merge drivers: every merge driver .gitattributes names is registered" "$(doctor_merge "$TMP/drv-missing")"
 check "registration sets the trails driver to the given script" "python3 '$TMP/merge-trails.py' %O %A %B" \

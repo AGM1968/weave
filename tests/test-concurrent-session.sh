@@ -245,7 +245,7 @@ fi
 # names another repo.
 write_session s-live "$FAKE_PID" "$TEST_DIR/other-repo"
 write_session s-stale "$FAKE_PID" "$TEST_DIR/repo"
-touch -d '1 hour ago' "$SS/s-stale/inuse.$FAKE_PID.lock"
+python3 -I -c 'import os, sys; t = float(sys.argv[1]); os.utime(sys.argv[2], (t, t))' "$(( $(date +%s) - 3600 ))" "$SS/s-stale/inuse.$FAKE_PID.lock"  # touch -d is GNU-only (wv-f6b909)
 if lock_flags; then
     check "a stale lock whose pid was reused by a copilot working in another repo is not flagged" false
 else

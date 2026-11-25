@@ -165,41 +165,56 @@ rm -f .shellcheckrc; clean
 # wv-cb632d: candidate lanes run this hook at once, and shellcheck on a large
 # suite peaks at 1.6 GB, so lanes take turns through the lock gate_lanes_run
 # names. Each lane still lints in full; a finding is still refused.
-echo "lanes take turns at shellcheck (wv-cb632d)"
-if command -v flock >/dev/null 2>&1; then
-    L="$T/sc.lock"
-    real_sc=$(command -v shellcheck)
-    # A shellcheck that records whether the lock variable reached it.
-    # ...and when each run of it started, so waiting is judged by order, not by
-    # comparing two wall times a loaded host stretches (wv-9ba563).
-    printf '#!/bin/sh\necho "${WV_GATE_SC_LOCK-unset}" >> %q\ndate +%%s%%N >> %q\nexec %q "$@"\n' \
-        "$T/sc-env" "$T/sc-start" "$real_sc" > "$T/bin/shellcheck"
-    chmod +x "$T/bin/shellcheck"
-    printf '#!/bin/bash\necho ok2\n' > scripts/x.sh; git add scripts/x.sh
-    precommit WV_GATE_SC_LOCK="$L"
-    check "(control) with the lock free the lane's shellcheck passes" "0" "$RC"
-    : > "$T/sc-start"
-    # The holder stamps its release as the last thing it does under the lock.
-    flock "$L" sh -c 'sleep 3; date +%s%N > "$1"' _ "$T/released" & holder=$!
+echo "lanes take turns at shellcheck (wv-cb632d, wv-7bd071)"
+# The lock goes through scripts/lib/wv-lock.sh: flock(1), else python3 fcntl on
+# the same fd. Both mechanisms are checked here, the python one forced through
+# WV_TEST_LOCK_MECH, so the path a host without util-linux takes (macOS) runs
+# on Linux too; neither may be skipped.
+# shellcheck disable=SC1091  # resolved from ROOT at run time
+source "$ROOT/scripts/lib/wv-lock.sh"
+L="$T/sc.lock"
+real_sc=$(command -v shellcheck)
+# A shellcheck that records whether the lock variable reached it.
+# ...and when each run of it started, so waiting is judged by order, not by
+# comparing two wall times a loaded host stretches (wv-9ba563).
+# Stamps are python3 time_ns: BSD date has no %N (wv-7bd071).
+printf '#!/bin/sh\necho "${WV_GATE_SC_LOCK-unset}" >> %q\npython3 -I -c "import time; print(time.time_ns())" >> %q\nexec %q "$@"\n' \
+    "$T/sc-env" "$T/sc-start" "$real_sc" > "$T/bin/shellcheck"
+chmod +x "$T/bin/shellcheck"
+printf '#!/bin/bash\necho ok2\n' > scripts/x.sh; git add scripts/x.sh
+precommit WV_GATE_SC_LOCK="$L"
+check "(control) with the lock free the lane's shellcheck passes" "0" "$RC"
+# sc_lock_waits <label> [env...] -- another lane holds the lock (taken through
+# wv_lock_fd under the same env); the hook's shellcheck must start only after
+# the holder stamps its release, the last thing it does under the lock.
+sc_lock_waits() {
+    local label=$1 first_sc released holder kv
+    shift
+    : > "$T/sc-start"; rm -f "$T/released"
+    ( for kv in "$@"; do export "${kv?}"; done; exec 7>>"$L"; wv_lock_fd 7 -x 10 || exit 1; sleep 3; python3 -I -c 'import time; print(time.time_ns())' > "$T/released" ) & holder=$!
     sleep 0.3
-    precommit WV_GATE_SC_LOCK="$L"
+    precommit WV_GATE_SC_LOCK="$L" "$@"
     wait "$holder"
     first_sc=$(awk 'NR == 1 || $1 < m { m = $1 } END { print m }' "$T/sc-start"); released=$(cat "$T/released" 2>/dev/null)
-    check "with the lock held by another lane, the shellcheck waits for it, then passes" "0 yes" \
+    check "with the lock held by another lane ($label), the shellcheck waits for it, then passes" "0 yes" \
         "$RC $([ -n "$first_sc" ] && [ -n "$released" ] && [ "$first_sc" -ge "$released" ] && echo yes \
             || echo "no (shellcheck started ${first_sc:-never}, lock released ${released:-never})")"
-    : > "$T/sc-env"
-    precommit WV_GATE_SC_LOCK="$L"
-    check "...and the lock variable reaches no process the hook starts" "unset" "$(sort -u "$T/sc-env")"
-    clean
-    plant scripts/x.sh; precommit WV_GATE_SC_LOCK="$L"
-    check "a finding is still refused under the lock" "1" "$RC"
-    has "...by shellcheck" "$OUT" "SC2046"
-    clean
-    rm -f "$T/bin/shellcheck"
-else
-    echo "  (flock unavailable: the hook runs shellcheck unserialised, as before)"
-fi
+}
+sc_lock_waits "default mechanism"
+sc_lock_waits "python3 fcntl, as without flock(1)" WV_TEST_MODE=1 WV_TEST_LOCK_MECH=python
+: > "$T/sc-env"
+precommit WV_GATE_SC_LOCK="$L"
+check "...and the lock variable reaches no process the hook starts" "unset" "$(sort -u "$T/sc-env")"
+# No mechanism at all: the lint fails rather than running unlocked.
+precommit WV_GATE_SC_LOCK="$L" WV_TEST_MODE=1 WV_TEST_LOCK_MECH=none
+check "with no lock mechanism the lane's shellcheck fails, never runs unlocked" "1" "$RC"
+has "...saying why" "$OUT" "no file-lock mechanism"
+clean
+plant scripts/x.sh; precommit WV_GATE_SC_LOCK="$L"
+check "a finding is still refused under the lock" "1" "$RC"
+has "...by shellcheck" "$OUT" "SC2046"
+clean
+rm -f "$T/bin/shellcheck"
 
 echo ""
 echo "test-shellcheck-gate: $pass/$run passed"

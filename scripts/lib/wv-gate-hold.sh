@@ -187,16 +187,22 @@ wv_gate_hold_status() {
 # leftover record reads as nothing.
 wv_gate_hold_foreign_status() {
     local root="${1:-.}" common own rec holder
+    if ! declare -F wv_realpath_missing >/dev/null; then
+        # shellcheck source=/dev/null
+        [ -r "$_WV_GATE_HOLD_DIR/wv-resolve-runtime.sh" ] && . "$_WV_GATE_HOLD_DIR/wv-resolve-runtime.sh" 2>/dev/null
+    fi
     common=$(git -C "$root" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || {
         common=$(git -C "$root" rev-parse --git-common-dir 2>/dev/null) || return 0
         case "$common" in /*) ;; *) common="$(cd "$root" && pwd)/$common" ;; esac
     }
     own=$(cd "$root" 2>/dev/null && _wv_gate_hold_path weave-gate.holder.json) || own=""
     case "$own" in '' | /*) ;; *) own="$(cd "$root" && pwd)/$own" ;; esac
-    own=$(realpath -m "$own" 2>/dev/null || printf '%s' "$own")
+    # wv_realpath_missing, not realpath -m: macOS has no -m, and the raw
+    # fallback made /var and /private/var spellings of one record differ (wv-e7426f).
+    own=$(wv_realpath_missing "$own" 2>/dev/null || printf '%s' "$own")
     for rec in "$common/weave-gate.holder.json" "$common"/worktrees/*/weave-gate.holder.json; do
         [ -f "$rec" ] || continue
-        [ "$(realpath -m "$rec" 2>/dev/null || printf '%s' "$rec")" != "$own" ] || continue
+        [ "$(wv_realpath_missing "$rec" 2>/dev/null || printf '%s' "$rec")" != "$own" ] || continue
         holder=$(cat "$rec" 2>/dev/null) || continue
         if [ -n "$holder" ] && _wv_gate_hold_alive "$holder"; then
             printf '%s\n' "$holder"

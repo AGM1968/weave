@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Suite-driven wv calls are tagged test so call-stats retro reads can exclude them.
+# shellcheck source=tests/lib/sed-inplace.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/sed-inplace.sh"  # sed -i is GNU-only (wv-076a98)
 export WV_CALL_SOURCE=test
 # test-pattern-audit-check7.sh — Tests for pattern-audit Check 7
 #
@@ -124,7 +126,7 @@ assert_contains "$C7_COUNT"  "1"    "JSON counts exactly the one bad tail"
 
 echo "--- Check 7: clean fixture passes ---"
 # shellcheck disable=SC2016  # the sed script rewrites literal shell source
-sed -i 's/^    \[ -n "$x" \] \&\& echo "$x"$/    if [ -n "$x" ]; then echo "$x"; fi/' "$TEST_DIR/scripts/fixture.sh"
+sed_inplace 's/^    \[ -n "$x" \] \&\& echo "$x"$/    if [ -n "$x" ]; then echo "$x"; fi/' "$TEST_DIR/scripts/fixture.sh"
 AUDIT_OUT2=$("$WV" pattern-audit 2>&1 | grep 'Check 7' || true)
 assert_contains "$AUDIT_OUT2" "Check 7 PASS" "Check 7 passes after the tail is converted to if/fi"
 

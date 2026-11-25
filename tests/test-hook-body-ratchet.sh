@@ -84,7 +84,7 @@ check "above it, advisory: a warning only" "warn" "$(verdict 11 10 advisory | cu
 
 echo "the hook"
 ceiling=$(sed -n 's/^ceiling=\([0-9][0-9]*\)$/\1/p' "$CEILING_FILE")
-mode=$(sed -n 's/^mode=\(advisory\|enforced\)$/\1/p' "$CEILING_FILE")
+mode=$(sed -nE 's/^mode=(advisory|enforced)$/\1/p' "$CEILING_FILE")
 check "the ceiling file declares a ceiling and a mode" "yes" \
     "$([ -n "$ceiling" ] && [ -n "$mode" ] && echo yes)"
 if [ -n "$ceiling" ] && [ -n "$mode" ]; then

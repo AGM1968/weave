@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+: "${WV_BSD_SHIM_REAL:=${0%/*}/../real}"  # env -i drops the export; this stand-in sits in bin/ beside real/ (wv-43082a)
+# BSD wc stand-in (wv-418760): each count is right-aligned in a field of 8,
+# also when reading stdin, so "$(wc -l < f)" carries leading blanks.
+out=$("$WV_BSD_SHIM_REAL/wc" "$@") || exit $?
+while IFS= read -r line; do
+    read -ra f <<<"$line"; s=""
+    for x in "${f[@]}"; do
+        if [[ "$x" =~ ^[0-9]+$ ]] && [ -z "${name:-}" ]; then s+=$(printf '%8s' "$x"); else s+=" $x"; name=1; fi
+    done
+    unset name; printf '%s\n' "$s"
+done <<<"$out"

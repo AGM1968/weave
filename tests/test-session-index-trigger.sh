@@ -125,7 +125,7 @@ check "...one build in all" "1" "$(calls | grep -c . || true)"
 echo "=== a stale lock does not block forever ==="
 : > "$STUB_LOG"
 new_zone "$TMP/z6"
-mkdir "$TMP/z6/.code_index.lock"; touch -d '20 minutes ago' "$TMP/z6/.code_index.lock"
+mkdir "$TMP/z6/.code_index.lock"; python3 -I -c 'import os, sys; t = float(sys.argv[1]); os.utime(sys.argv[2], (t, t))' "$(( $(date +%s) - 1200 ))" "$TMP/z6/.code_index.lock"  # touch -d is GNU-only (wv-f6b909)
 has "a lock older than ten minutes is cleared" "Code index: empty" "$(refresh "$TMP/z6")"
 settle "$TMP/z6"
 

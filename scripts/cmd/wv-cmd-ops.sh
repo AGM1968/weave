@@ -158,42 +158,50 @@ cmd_mcp_status() {
         _mcp_record "node" "fail" "not found"
     fi
 
-    # 2. MCP server built (check installed path, then repo root)
-    local lib_dir="${WV_LIB_DIR:-$HOME/.local/lib/weave}"
-    local repo_mcp="$REPO_ROOT/mcp/dist/index.js"
+    # 2. MCP server built (check installed path, then repo root). The bundle,
+    # health and version helpers live with doctor's check, which shares them.
+    declare -F _mcp_server_bundle >/dev/null || _wv_autoload doctor
     local mcp_js=""
-    if [ -f "$lib_dir/mcp/dist/index.js" ]; then
-        mcp_js="$lib_dir/mcp/dist/index.js"
-        _mcp_record "server built" "pass" "$mcp_js"
-    elif [ -f "$repo_mcp" ]; then
-        mcp_js="$repo_mcp"
-        _mcp_record "server built" "pass" "$mcp_js (local dev)"
+    if mcp_js=$(_mcp_server_bundle); then
+        case "$mcp_js" in
+            "${REPO_ROOT:-/nonexistent}/mcp/dist/index.js") _mcp_record "server built" "pass" "$mcp_js (local dev)" ;;
+            *) _mcp_record "server built" "pass" "$mcp_js" ;;
+        esac
     else
+        mcp_js=""
         _mcp_record "server built" "fail" "not found — run install.sh --with-mcp"
     fi
 
     # 3. Server loadable (verify dist exists and has content — can't require() as it starts stdio)
     if [ -n "$mcp_js" ]; then
         local mcp_size
-        mcp_size=$(wc -c < "$mcp_js" 2>/dev/null || echo "0")
+        mcp_size=$(( $(wc -c < "$mcp_js" 2>/dev/null || echo "0") ))
         if [ "$mcp_size" -gt 1000 ] 2>/dev/null; then
             _mcp_record "server dist" "pass" "$(( mcp_size / 1024 ))KB bundle"
         else
             _mcp_record "server dist" "warn" "bundle looks too small (${mcp_size}B)"
         fi
 
-        local startup_json startup_rc startup_status startup_scope startup_tools startup_agent
-        startup_rc=0
-        startup_json=$(node "$mcp_js" --scope=lite --health-check 2>/dev/null) || startup_rc=$?
-        startup_rc=${startup_rc:-0}
-        if [ "$startup_rc" -eq 0 ] && command -v jq >/dev/null 2>&1 && printf '%s' "$startup_json" | jq -se 'length == 1 and (.[0] | .schema == "weave-mcp-startup.v1")' >/dev/null 2>&1; then
+        local startup_json startup_status startup_scope startup_tools startup_agent verdict hrc=0
+        startup_json=$(_mcp_server_health "$mcp_js") || hrc=$?
+        if [ "$hrc" -eq 0 ]; then
             startup_status=$(printf '%s' "$startup_json" | jq -r '.status')
             startup_scope=$(printf '%s' "$startup_json" | jq -r '.scope')
             startup_tools=$(printf '%s' "$startup_json" | jq -r '.tools')
             startup_agent=$(printf '%s' "$startup_json" | jq -r '.agent_id // "unset"')
             _mcp_record "startup health" "pass" "status=${startup_status} scope=${startup_scope} tools=${startup_tools} agent=${startup_agent}"
+            verdict=$(_mcp_version_verdict "$(printf '%s' "$startup_json" | jq -r '.version // empty')")
+            _mcp_record "server version" "${verdict%%$'\t'*}" "${verdict#*$'\t'}"
         else
             _mcp_record "startup health" "warn" "structured health-check unavailable — run: node $mcp_js --scope=lite --health-check"
+            # A server that exits without a valid handshake (one too old to
+            # know the flag) fails with the rebuild remedy; one that does not
+            # answer in time fails with the retry remedy. Neither passes.
+            if [ "$hrc" -eq 2 ]; then
+                _mcp_record "server version" "fail" "version not confirmed: the health check took longer than $(_mcp_health_timeout)s; re-run wv mcp-status (or raise WV_MCP_HEALTH_TIMEOUT on a loaded machine)"
+            elif command -v node >/dev/null 2>&1; then
+                _mcp_record "server version" "fail" "the server did not answer the version handshake under CLI ${WV_VERSION}; rebuild it: ./install.sh --with-mcp (needs npm beside node), then restart the MCP client"
+            fi
         fi
     fi
 
@@ -203,9 +211,12 @@ cmd_mcp_status() {
     if [ -f "$repo_root/.vscode/mcp.json" ]; then
         _mcp_check_vscode_config "$repo_root/.vscode/mcp.json" ".vscode/mcp.json"
         has_vscode=true
-    elif [ -f "$repo_root/.mcp.json" ]; then
-        _mcp_check_vscode_config "$repo_root/.mcp.json" ".mcp.json"
-        has_vscode=true
+    fi
+    # The root .mcp.json is Claude Code's file and must use "mcpServers";
+    # Claude Code rejects the VS Code "servers" shape (wv-d1ef4b).
+    if [ -f "$repo_root/.mcp.json" ] && command -v jq >/dev/null 2>&1 \
+        && jq -e 'has("servers") and (has("mcpServers") | not)' "$repo_root/.mcp.json" >/dev/null 2>&1; then
+        _mcp_record "root .mcp.json" "warn" "VS Code \"servers\" shape, which Claude Code rejects; VS Code reads .vscode/mcp.json — run wv init-repo --agent=copilot --update to remove a Weave-written copy"
     fi
     if [ -f "$repo_root/.claude/settings.local.json" ]; then
         if grep -q "mcpServers" "$repo_root/.claude/settings.local.json" 2>/dev/null; then
@@ -225,7 +236,9 @@ cmd_mcp_status() {
     if ! per_scope=$(_mcp_scope_statuses "$contract_path" "$process_lines"); then
         # Said out loud. Reporting "no server visible" here would be a claim
         # about this machine's servers made without ever reading the contract
-        # that names them.
+        # that names them. per_scope is null, not [] (unknown, not empty):
+        # left unset it printed "per_scope":} and the JSON did not parse.
+        per_scope=null
         _mcp_record "server processes" "fail" \
             "MCP contract unavailable — reinstall weave (expected ${WV_LIB_DIR:-\$WV_LIB_DIR}/mcp/contract.json); scope status cannot be determined"
     else
@@ -337,12 +350,21 @@ EOF
         return 0
     fi
 
-    # Collect JSONL paths (most recent N per dir, sorted by mtime)
+    # Collect JSONL paths (most recent N per dir, sorted by mtime). ls -t, not
+    # find -printf (GNU-only, wv-8ea297); a listing that fails is an error,
+    # not "no sessions".
     local jsonl_list=""
     for dir in "${session_dirs[@]}"; do
-        local found
-        found=$(find "$dir" -maxdepth 1 -name "*.jsonl" -printf "%T@ %p\n" 2>/dev/null \
-            | sort -rn | head -"$sessions_n" | awk '{print $2}')
+        local found f
+        local -a jsonl=()
+        for f in "$dir"/*.jsonl; do [ -f "$f" ] && jsonl+=("$f"); done
+        [ "${#jsonl[@]}" -gt 0 ] || continue
+        # Not one pipeline: head closing early would fail ls with SIGPIPE.
+        if ! found=$(ls -1t -- "${jsonl[@]}"); then
+            echo "Error: could not list the session files in $dir" >&2
+            return 1
+        fi
+        found=$(head -n "$sessions_n" <<<"$found")
         [ -n "$found" ] && jsonl_list="$jsonl_list"$'\n'"$found"
     done
     jsonl_list=$(printf '%s' "$jsonl_list" | grep -v '^$')
@@ -354,7 +376,7 @@ EOF
 
     # Write path list to a temp file so the Python heredoc can use stdin cleanly
     local _cache_tmp
-    _cache_tmp=$(mktemp /tmp/wv-cache-XXXXXX.txt)
+    _cache_tmp=$(mktemp /tmp/wv-cache-XXXXXX)  # Xs last: BSD mktemp fills only trailing Xs (wv-afe960)
     echo "$jsonl_list" > "$_cache_tmp"
     # shellcheck disable=SC2064
     trap "rm -f '$_cache_tmp'" RETURN
@@ -616,7 +638,7 @@ cmd_init_repo() {
 # Falls back to wv-update for release-binary users (no local clone).
 # ═══════════════════════════════════════════════════════════════════════════
 cmd_self_update() {
-    local source_path_file="$HOME/.config/weave/source-path"
+    local source_path_file="${WV_CONFIG_DIR:-$HOME/.config/weave}/source-path"
     local wv_update_bin
     wv_update_bin=$(command -v wv-update 2>/dev/null || echo "$HOME/.local/bin/wv-update")
 
@@ -642,7 +664,7 @@ cmd_self_update() {
 # cmd_uninstall — Remove installed wv files via install.sh --uninstall
 # ═══════════════════════════════════════════════════════════════════════════
 cmd_uninstall() {
-    local source_path_file="$HOME/.config/weave/source-path"
+    local source_path_file="${WV_CONFIG_DIR:-$HOME/.config/weave}/source-path"
 
     if [ -f "$source_path_file" ]; then
         local src_root; src_root=$(cat "$source_path_file" 2>/dev/null || echo "")
@@ -653,7 +675,7 @@ cmd_uninstall() {
     fi
 
     # Fallback: download install.sh from GitHub and run --uninstall
-    local tmp_installer; tmp_installer=$(mktemp /tmp/wv-install-XXXXXX.sh)
+    local tmp_installer; tmp_installer=$(mktemp /tmp/wv-install-XXXXXX)  # Xs last: BSD mktemp (wv-afe960)
     echo "Downloading install.sh from GitHub..."
     if curl -sSL "https://raw.githubusercontent.com/AGM1968/weave/main/install.sh" -o "$tmp_installer"; then
         bash "$tmp_installer" --uninstall "$@"

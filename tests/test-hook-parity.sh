@@ -17,6 +17,10 @@ export WV_CALL_SOURCE=test
 export WV_AGENT_ID=test-hook-parity-agent
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# The product's md5sum (wv-resolve-runtime.sh, side-effect free): the repo hash a
+# product path is keyed on, the same on macOS, which has no md5sum(1) (wv-ef5621).
+# shellcheck disable=SC1091  # resolved at run time
+source "$ROOT/scripts/lib/wv-resolve-runtime.sh"
 WV="$ROOT/scripts/wv"
 TEST_DIR=$(mktemp -d)
 trap 'cd /tmp; rm -rf "$TEST_DIR"' EXIT
@@ -181,9 +185,12 @@ _copy() {
     (cd "$dir/repo" && C="$dir" eval "$1") >/dev/null 2>&1 || true
     printf '%s\n' "$dir"
 }
-# The Bash dedup lock directory: the hash of the repository path with echo's
-# trailing newline, as every hook computes it.
-_locks() { printf '/tmp/weave-bash-locks-%s/%s' "$(id -u)" "$(echo "$1/repo" | md5sum | cut -c1-8)"; }
+# The Bash dedup lock directory, derived as the hooks derive it: git's
+# physical toplevel, not the path as written (wv-b3cb72; on macOS /tmp and
+# $TMPDIR run through /private, and the planted lock was never seen).
+# shellcheck source=tests/lib/dedup-locks.sh
+. "$ROOT/tests/lib/dedup-locks.sh"
+_locks() { dedup_lock_dir "$1/repo"; }
 # _plant_lock <copy> -- the lock a first, still-running `make check` holds.
 # 700 like the hook makes it: a fixture base left 775 by the umask is refused (wv-80be32).
 _plant_lock() { (umask 077 && mkdir -p "$(_locks "$1")") && printf '%s\npending\nmake check\n' "$(date +%s)" > "$(_locks "$1")/make-build.lock"; }

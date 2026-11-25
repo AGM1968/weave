@@ -61,11 +61,18 @@ printf '%s\n' '.weave/state.sql merge=ours -diff' '.weave/nodes.jsonl merge=ours
     '.weave/edges.jsonl merge=ours -diff' '.weave/breadcrumbs.md merge=ours' \
     '.weave/causal-cutover merge=ours -diff' \
     '.weave/deltas/**/*.sql merge=theirs' '.weave/deltas/**/*.json merge=theirs' > "$T/A/.gitattributes"
+# And the runtime ignores it writes into .gitignore: machine-local files such as
+# .weave/.applied_deltas are never graph state, and the re-projection commits
+# graph state alone (wv-6729a0).
+( source "$ROOT/scripts/lib/wv-runtime-ignores.sh" && wv_runtime_ignores ) > "$T/A/.gitignore"
 on A wv add "seed node" --standalone >/dev/null 2>&1
 on A wv sync >/dev/null 2>&1
 G -C "$T/A" add -A >/dev/null && G -C "$T/A" commit -q -m seed && G -C "$T/A" push -q -u origin main 2>/dev/null
 G clone -q "$T/remote.git" "$T/B"
 drivers A; drivers B
+# A repository's own identity: wv recover --reproject commits with plain git, and
+# the gate's environment has no global one (only -c on G/GH, which hooks inherit).
+for side in A B; do G -C "$T/$side" config user.name t; G -C "$T/$side" config user.email t@example.com; done
 on B wv load >/dev/null 2>&1
 check "fixture: both copies at the seed" "$(G -C "$T/B" rev-parse HEAD)" "$(G -C "$T/A" rev-parse HEAD)"
 
@@ -114,6 +121,91 @@ G -C "$T/W" branch -q --set-upstream-to=origin/main wt 2>/dev/null
 check "worktree has a .git file" "$([ -f "$T/W/.git" ] && echo file)" "file"
 on W wv load >/dev/null 2>&1
 check "worktree verdict is not not_repo" "$(reason W)" "ahead_weave"
+
+# wv-6729a0: the snapshot is re-projected where git already runs, after a
+# rebase or merge, by the post-rewrite and post-merge hooks asking the graph.
+# GH runs git with hooks on; G keeps them off, so the pre-hook cases above and
+# the control below see git alone.
+GH() { git -c user.name=t -c user.email=t@example.com -c commit.gpgsign=false "$@"; }
+# pullh <side> <args>... — git pull as an operator runs it, hooks on, auto-commit allowed
+pullh() {
+    local side=$1; shift
+    ( cd "$T/$side" && WV_AUTO_CHECKPOINT=1 WV_PROJECT_DIR="$T/$side" WV_HOT_ZONE="$T/hz-$side" \
+        WV_DB="$T/hz-$side/brain.db" WV_AGENT_ID="copy-$side" GH pull -q "$@" 2>&1 )
+}
+# work <side> <text> — a node added, synced and committed as graph state
+work() {
+    on "$1" wv load >/dev/null 2>&1; on "$1" wv add "$2" --standalone >/dev/null 2>&1
+    on "$1" wv sync >/dev/null 2>&1; G -C "$T/$1" add -A .weave && G -C "$T/$1" commit -q -m "$2"
+}
+in_head() { G -C "$T/$1" show HEAD:.weave/state.sql 2>/dev/null | grep -c -- "$2"; }
+G -C "$T/B" push -q origin main 2>/dev/null; G -C "$T/A" pull -q --rebase >/dev/null 2>&1
+
+echo "Testing: a merge keeps this copy's snapshot, and the verdict sees it"
+work A "merge node from A"; G -C "$T/A" push -q origin main 2>/dev/null
+work B "merge node from B"
+G -C "$T/B" pull -q --no-rebase --no-edit >/dev/null 2>&1
+check "(the merge kept this copy's snapshot, without the merged node)" "$(in_head B 'merge node from A')" "0"
+check "verdict names the lag after a merge" "$(reason B)" "projection_lags_operations"
+prepush B >/dev/null 2>&1; check "pre-push refuses a lagging merge" "$?" "1"
+on B wv load >/dev/null 2>&1; on B wv sync >/dev/null 2>&1
+G -C "$T/B" add -A .weave && G -C "$T/B" commit -q -m "re-dump merge"
+G -C "$T/B" push -q origin main 2>/dev/null; G -C "$T/A" pull -q --rebase >/dev/null 2>&1
+
+for side in A B; do
+    for h in post-rewrite post-merge; do
+        cp "$ROOT/scripts/hooks/reproject-weave.sh" "$T/$side/.git/hooks/$h"; chmod +x "$T/$side/.git/hooks/$h"
+    done
+done
+
+echo "Testing: post-rewrite re-projects after a rebase"
+work A "hook node from A"; G -C "$T/A" push -q origin main 2>/dev/null
+work B "hook node from B"
+out=$(pullh B --rebase)
+check "the rebase is followed by a graph-state commit" "$(G -C "$T/B" log -1 --format=%s)" \
+    "chore(weave): re-project graph state after rebase [skip ci]"
+check "...on top of this copy's own commit, not amending it" "$(G -C "$T/B" log -1 --skip=1 --format=%s)" "hook node from B"
+check "...which touches graph state alone" "$(G -C "$T/B" diff --name-only HEAD~1 HEAD | grep -vc '^\.weave/')" "0"
+check "the snapshot holds this copy's node" "$([ "$(in_head B 'hook node from B')" -gt 0 ] && echo yes)" "yes"
+check "...and the other copy's" "$([ "$(in_head B 'hook node from A')" -gt 0 ] && echo yes)" "yes"
+case "$out" in *"re-projected .weave/ after rebase: 1 operation(s)"*) ok "the hook reports what it re-projected" ;;
+    *) bad "the hook reports what it re-projected" "$out" ;; esac
+check "verdict after the hook" "$(reason B)" "ahead_weave"
+prepush B >/dev/null 2>&1; check "pre-push passes with no repair by hand" "$?" "0"
+G -C "$T/B" push -q origin main 2>/dev/null
+
+echo "Testing: post-merge re-projects after a merge, and does nothing on a fast-forward"
+pullh A --rebase >/dev/null
+check "a fast-forward adds no commit" "$(G -C "$T/A" rev-list --count '@{upstream}..HEAD')" "0"
+work B "post-merge node from B"; G -C "$T/B" push -q origin main 2>/dev/null
+work A "post-merge node from A"
+out=$(pullh A --no-rebase --no-edit)
+check "the merge is followed by a graph-state commit" "$(G -C "$T/A" log -1 --format=%s)" \
+    "chore(weave): re-project graph state after merge [skip ci]"
+check "the snapshot holds the merged node" "$([ "$(in_head A 'post-merge node from B')" -gt 0 ] && echo yes)" "yes"
+check "verdict after the merge hook" "$(reason A)" "ahead_weave"
+G -C "$T/A" push -q origin main 2>/dev/null; pullh B --rebase >/dev/null
+
+echo "Testing: the hook defers, and pre-push stays the backstop"
+work A "deferred node from A"; G -C "$T/A" push -q origin main 2>/dev/null
+work B "deferred node from B"
+printf '# local edit\n' >> "$T/B/.weave/edges.jsonl"
+out=$(pullh B --rebase --autostash)
+case "$out" in *"not re-projected: the pending autostash holds .weave/ changes"*) ok "an autostash holding .weave/ changes defers it, saying why" ;;
+    *) bad "an autostash holding .weave/ changes defers it, saying why" "$out" ;; esac
+check "...and the stashed change comes back" "$(G -C "$T/B" status --porcelain -- .weave/edges.jsonl | cut -c1-2)" " M"
+check "...no commit was made" "$(G -C "$T/B" log -1 --format=%s)" "deferred node from B"
+prepush B >/dev/null 2>&1; check "pre-push still refuses the lagging snapshot" "$?" "1"
+G -C "$T/B" checkout -q -- .weave/edges.jsonl
+out=$(on B env WV_AUTO_CHECKPOINT=0 wv recover --reproject --json 2>/dev/null)
+check "WV_AUTO_CHECKPOINT=0 defers it" "$(jq -r '.action + " | " + .reason' <<< "$out")" \
+    "deferred | automatic commits are off (WV_AUTO_CHECKPOINT=0)"
+out=$(on B env WV_AUTO_CHECKPOINT=1 wv recover --reproject --json 2>/dev/null)
+check "run by hand it re-projects" "$(jq -r '.action' <<< "$out")" "reprojected"
+check "...reporting the states apart" "$(jq -c '{serialized_to_weave, c: (.git_committed_local != null)}' <<< "$out")" \
+    '{"serialized_to_weave":true,"c":true}'
+out=$(on B env WV_AUTO_CHECKPOINT=1 wv recover --reproject --json 2>/dev/null)
+check "a current snapshot is left alone" "$(jq -r '.action + " " + .verdict' <<< "$out")" "none ok"
 
 echo ""
 echo "Results: $pass/$run passed"

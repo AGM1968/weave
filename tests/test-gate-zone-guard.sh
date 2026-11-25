@@ -43,13 +43,22 @@ check() { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1" "expected [$2], got [$
 has() { if [[ "$3" == *"$2"* ]]; then ok "$1"; else bad "$1" "expected to contain [$2], got [$3]"; fi; }
 lacks() { if [[ "$3" != *"$2"* ]]; then ok "$1"; else bad "$1" "did not expect [$2] in [$3]"; fi; }
 
-T=$(mktemp -d /tmp/wv-gate-zone-guard-XXXXXX)
+# Canonical from the start: the guard reports owners by their physical path,
+# and macOS /tmp is a link into /private (wv-e6ca42).
+T=$(mktemp -d /tmp/wv-gate-zone-guard-XXXXXX); T=$(cd "$T" && pwd -P)
 trap 'rm -rf "$T"' EXIT
 uid=$(id -u)
 
 # A fake checkout holding the suites the pool runs, a stub wv for the pool's
 # ledger calls, and the zones the guard treats as live.
 FAKE="$T/checkout"; mkdir -p "$FAKE/tests" "$T/tmpdir" "$T/zones/tmp"
+# On macOS a hot zone lives under $TMPDIR, and the pool gives each suite a
+# private TMPDIR, so a suite that keeps it cannot reach the live zone at all;
+# the leak the guard watches there is a suite that points TMPDIR back at the
+# gate's own. The fixtures that stand for live-zone writers do that on darwin;
+# on Linux the line is empty (wv-19572f).
+LIVE_TMP=""
+case "${OSTYPE:-}" in darwin*) LIVE_TMP="export TMPDIR=\"$T/tmpdir\"" ;; esac
 git -C "$FAKE" init -q
 cat > "$T/wv-stub" <<'STUB'
 #!/usr/bin/env bash
@@ -63,7 +72,8 @@ chmod +x "$T/wv-stub"
 # suites), then the repository removed by the suite's own cleanup.
 cat > "$FAKE/tests/leaky.sh" <<EOF
 export WV_TEST_HOT_ZONE_ROOT="$T/zones"
-r=\$(mktemp -d)/repo; mkdir -p "\$r"; git -C "\$r" init -q
+$LIVE_TMP
+r=\$(mktemp -d "\${TMPDIR:-/tmp}/wvz.XXXXXX")/repo; mkdir -p "\$r"; git -C "\$r" init -q
 (cd "\$r" && WV_CONFIG_DIR="\$r/../cfg" "$ROOT/scripts/wv" init >/dev/null 2>&1)
 (cd "\$r" && WV_CONFIG_DIR="\$r/../cfg" "$ROOT/scripts/wv" status >/dev/null 2>&1)
 rm -rf "\${r%/repo}"
@@ -72,7 +82,8 @@ EOF
 # owner itself from the git toplevel (wv-29e416), so this is caught as well.
 cat > "$FAKE/tests/init-only.sh" <<EOF
 export WV_TEST_HOT_ZONE_ROOT="$T/zones"
-r=\$(mktemp -d)/repo; mkdir -p "\$r"; git -C "\$r" init -q
+$LIVE_TMP
+r=\$(mktemp -d "\${TMPDIR:-/tmp}/wvz.XXXXXX")/repo; mkdir -p "\$r"; git -C "\$r" init -q
 (cd "\$r" && WV_CONFIG_DIR="\$r/../cfg" "$ROOT/scripts/wv" init >/dev/null 2>&1)
 rm -rf "\${r%/repo}"
 EOF
@@ -80,13 +91,14 @@ EOF
 # so the zone stays unstamped and is not judged (wv-db641c).
 cat > "$FAKE/tests/no-repo.sh" <<EOF
 export WV_TEST_HOT_ZONE_ROOT="$T/zones"
-r=\$(mktemp -d)/scratch; mkdir -p "\$r"
+$LIVE_TMP
+r=\$(mktemp -d "\${TMPDIR:-/tmp}/wvz.XXXXXX")/scratch; mkdir -p "\$r"
 (cd "\$r" && WV_CONFIG_DIR="\$r/../cfg" "$ROOT/scripts/wv" init >/dev/null 2>&1)
 rm -rf "\${r%/scratch}"
 EOF
 # isolated: the same, with its hot zone under its own temp directory.
 cat > "$FAKE/tests/isolated.sh" <<EOF
-d=\$(mktemp -d); r="\$d/repo"; mkdir -p "\$r"; git -C "\$r" init -q
+d=\$(mktemp -d "\${TMPDIR:-/tmp}/wvz.XXXXXX"); r="\$d/repo"; mkdir -p "\$r"; git -C "\$r" init -q
 (cd "\$r" && WV_CONFIG_DIR="\$d/cfg" WV_TEST_HOT_ZONE_ROOT="\$d/zones" "$ROOT/scripts/wv" init >/dev/null 2>&1)
 rm -rf "\$d"
 EOF
@@ -98,7 +110,8 @@ EOF
 # zone was gone before the precondition looked.
 cat > "$FAKE/tests/holder.sh" <<EOF
 export WV_TEST_HOT_ZONE_ROOT="$T/zones"
-d=\$(mktemp -d); r="\$d/repo"; mkdir -p "\$r"; git -C "\$r" init -q
+$LIVE_TMP
+d=\$(mktemp -d "\${TMPDIR:-/tmp}/wvz.XXXXXX"); r="\$d/repo"; mkdir -p "\$r"; git -C "\$r" init -q
 (cd "\$r" && WV_CONFIG_DIR="\$d/cfg" "$ROOT/scripts/wv" init >/dev/null 2>&1)
 (cd "\$r" && WV_CONFIG_DIR="\$d/cfg" "$ROOT/scripts/wv" status >/dev/null 2>&1)
 z=\$(cd "\$r" && WV_CONFIG_DIR="\$d/cfg" "$ROOT/scripts/wv" hotzone db 2>/dev/null); z=\${z%/*}
@@ -115,7 +128,8 @@ EOF
 # session's suites would make one: no pool tag reaches its wv.
 cat > "$FAKE/tests/untagged.sh" <<EOF
 export WV_TEST_HOT_ZONE_ROOT="$T/zones"
-r=\$(mktemp -d)/repo; mkdir -p "\$r"; git -C "\$r" init -q
+$LIVE_TMP
+r=\$(mktemp -d "\${TMPDIR:-/tmp}/wvz.XXXXXX")/repo; mkdir -p "\$r"; git -C "\$r" init -q
 (cd "\$r" && env -u WV_GATE_POOL_TAG WV_CONFIG_DIR="\$r/../cfg" "$ROOT/scripts/wv" init >/dev/null 2>&1)
 rm -rf "\${r%/repo}"
 EOF
@@ -123,6 +137,7 @@ EOF
 REAL="$T/real-repo"; mkdir -p "$REAL"; git -C "$REAL" init -q
 cat > "$FAKE/tests/real.sh" <<EOF
 export WV_TEST_HOT_ZONE_ROOT="$T/zones"
+$LIVE_TMP
 (cd "$REAL" && WV_CONFIG_DIR="$T/real-cfg" "$ROOT/scripts/wv" init >/dev/null 2>&1)
 (cd "$REAL" && WV_CONFIG_DIR="$T/real-cfg" "$ROOT/scripts/wv" status >/dev/null 2>&1)
 EOF
@@ -146,7 +161,14 @@ gate() {
     echo "rc=$?"
 }
 
-zone_dirs() { find "$T/zones" -mindepth 3 -maxdepth 3 -type d 2>/dev/null | sort; }
+# The per-repository zone directories under the test root: <root>/tmp/weave-*/<hash>
+# on Linux, <root>$TMPDIR/weave-<uid>/<hash> on macOS (wv-19572f).
+zone_dirs() {
+    case "${OSTYPE:-}" in
+        darwin*) find "$T/zones$T/tmpdir/weave-$uid" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort ;;
+        *) find "$T/zones" -mindepth 3 -maxdepth 3 -type d 2>/dev/null | sort ;;
+    esac
+}
 # real_owned_here — real-zone directories whose owner is under this test's temp
 # directory: other processes on the host may add their own meanwhile.
 real_owned_here() {
@@ -212,7 +234,8 @@ out=$(gate init-only.sh)
 mapfile -t added < <(comm -13 <(printf '%s\n' "$zones_before") <(zone_dirs))
 check "its zone appeared" "1" "${#added[@]}"
 has "the gate fails" "rc=1" "$out"
-has "naming the directory" "${added[0]##*/}" "$out"
+_added0="${added[0]:-/none-appeared}"  # no zone appeared fails the check above, not set -u here
+has "naming the directory" "${_added0##*/}" "$out"
 has "with the vanished temp owner init recorded" "(owner $T/tmpdir/" "$out"
 
 echo "== a zone with no recorded owner is not judged (wv-db641c)"

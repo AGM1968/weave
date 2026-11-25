@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+: "${WV_BSD_SHIM_REAL:=${0%/*}/../real}"  # env -i drops the export; this stand-in sits in bin/ beside real/ (wv-43082a)
+# macOS uname stand-in (wv-418760): the kernel is Darwin.
+case "${1:-}" in
+    ""|-s) echo Darwin ;;
+    -m) echo arm64 ;;
+    *) exec "$WV_BSD_SHIM_REAL/uname" "$@" ;;
+esac

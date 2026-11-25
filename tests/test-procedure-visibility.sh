@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Procedure visibility contract: only shared procedures project into consumer
 # adapter surfaces; default is local; a sparse [local] override can only narrow.
+# shellcheck source=tests/lib/sed-inplace.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/sed-inplace.sh"  # sed -i is GNU-only (wv-076a98)
 set -euo pipefail
 export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 
@@ -23,7 +25,8 @@ mkproc() { # name adapters visibility_line
 # 1. Default (no visibility field) is local -> never projected.
 mkproc deflocal '[claude, codex, copilot]' ''
 # Default-local still needs a claude_skill to satisfy the contract validator.
-sed -i '/^adapters:/a claude_skill: wv-deflocal' "$SRC/deflocal.md"
+sed_inplace '/^adapters:/a\
+claude_skill: wv-deflocal' "$SRC/deflocal.md"
 # 2. Explicit shared -> projects everywhere.
 mkproc shared1 '[codex, copilot]' 'visibility: shared'
 # 3. Explicit local -> skipped even with adapters declared.

@@ -62,7 +62,7 @@ _doctor_repo_procedures() {
         return 0
     fi
     if [ -n "$stale" ]; then
-        _doctor_record "repo-procedures" "warn" "projection out of date in $stale — run: wv init-repo --update"
+        _doctor_record "repo-procedures" "warn" "projection out of date in $(_doctor_projection_agents "$stale") — run: wv init-repo --update (refreshes every adapter surface present)"
     else
         _doctor_record "repo-procedures" "pass" "$count repository procedure(s) valid, projections current${replaced:+; replacing package: $replaced}"
     fi

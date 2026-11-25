@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Suite-driven wv calls are tagged test so call-stats retro reads can exclude them.
+# shellcheck source=tests/lib/sed-inplace.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/sed-inplace.sh"  # sed -i is GNU-only (wv-076a98)
 export WV_CALL_SOURCE=test
 # test-install-provenance.sh — regression tests for install provenance
 #
@@ -39,6 +41,9 @@ TESTS_FAILED=0
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# wv_stat / wv_date_fmt: GNU and BSD behind one call (wv-resolve-runtime.sh, side-effect free).
+# shellcheck disable=SC1091  # resolved at run time
+source "$PROJECT_ROOT/scripts/lib/wv-resolve-runtime.sh"
 
 TEST_DIR="/tmp/wv-install-provenance-$$"
 export WV_HOT_ZONE="$TEST_DIR/hotzone"
@@ -315,11 +320,11 @@ test_install_under_live_sessions() {
     run_install
     local hook="$CONFIG_DIR/hooks/stop-check.sh" lib="$CONFIG_DIR/lib/wv-hook-common.sh"
     local hook_ino lib_ino
-    hook_ino=$(stat -c %i "$hook") lib_ino=$(stat -c %i "$lib")
+    hook_ino=$(wv_stat ino "$hook") lib_ino=$(wv_stat ino "$lib")  # GNU/BSD stat (wv-372560)
     run_install
-    assert_equals "renamed" "$([ "$(stat -c %i "$hook")" != "$hook_ino" ] && echo renamed || echo in-place)" \
+    assert_equals "renamed" "$(a=$(wv_stat ino "$hook"); [[ "$a" =~ ^[0-9]+$ && "$hook_ino" =~ ^[0-9]+$ ]] || { echo unmeasured; exit 0; }; [ "$a" != "$hook_ino" ] && echo renamed || echo in-place)" \
         "a reinstall replaces an installed hook by rename, not by rewriting it in place"
-    assert_equals "renamed" "$([ "$(stat -c %i "$lib")" != "$lib_ino" ] && echo renamed || echo in-place)" \
+    assert_equals "renamed" "$(a=$(wv_stat ino "$lib"); [[ "$a" =~ ^[0-9]+$ && "$lib_ino" =~ ^[0-9]+$ ]] || { echo unmeasured; exit 0; }; [ "$a" != "$lib_ino" ] && echo renamed || echo in-place)" \
         "a reinstall replaces an installed hook library by rename"
     assert_equals "absent" "$([ -e "$CONFIG_DIR/.install-in-progress" ] && echo present || echo absent)" \
         "the install lock is gone once the install finishes"
@@ -328,10 +333,10 @@ test_install_under_live_sessions() {
     # lock goes; a dead PID, or the installer's own child, does not wait.
     _wv_elapsed_ms() {  # _wv_elapsed_ms [env assignments...] -> ms a cheap wv call took
         local t0 t1
-        t0=$(date +%s%N)
+        t0=$(wv_now ns)  # BSD date prints %N literally (wv-99f296)
         env HOME="$HOME_DIR" WV_LIB_DIR="$LIB_DIR" WV_CONFIG_DIR="$CONFIG_DIR" "$@" \
             bash "$BIN_DIR/wv" --version >/dev/null 2>&1 || true
-        t1=$(date +%s%N)
+        t1=$(wv_now ns)
         echo $(( (t1 - t0) / 1000000 ))
     }
     local holder ms
@@ -352,10 +357,10 @@ test_install_under_live_sessions() {
         lib_file=${pair%%:*} fn=${pair##*:}
         echo "$holder" > "$CONFIG_DIR/.install-in-progress"
         ( sleep 1.5; rm -f "$CONFIG_DIR/.install-in-progress" ) & clearer=$!
-        t0=$(date +%s%N)
+        t0=$(wv_now ns)  # BSD date prints %N literally (wv-99f296)
         env -u WV_INSTALLING WV_CONFIG_DIR="$CONFIG_DIR" \
             bash -c '. "$1" >/dev/null 2>&1; "$2"' _ "$SRC/scripts/lib/$lib_file" "$fn" || true
-        t1=$(date +%s%N)
+        t1=$(wv_now ns)
         ms=$(( (t1 - t0) / 1000000 ))
         assert_equals "waited" "$([ "$ms" -ge 1200 ] && echo waited || echo "did not wait (${ms} ms)")" \
             "the $lib_file loader waits while a live installer holds the lock"
@@ -379,7 +384,7 @@ test_worktree_source_is_compared() {
     git -C "$wt" -c user.name=t -c user.email=t@example.com -c commit.gpgsign=false \
         commit -q --allow-empty -m "ahead in the worktree"
     cp "$PROV" "$saved"
-    sed -i "s|^source_path=.*|source_path=$wt|" "$PROV"
+    sed_inplace "s|^source_path=.*|source_path=$wt|" "$PROV"
     assert_equals "file" "$([ -f "$wt/.git" ] && echo file)" "the worktree's .git is a file"
     line=$(doctor_provenance_line)
     assert_contains "$line" "1 commit(s) ahead" "doctor reports the worktree source as ahead of the install"

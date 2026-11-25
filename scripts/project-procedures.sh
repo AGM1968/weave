@@ -1,5 +1,28 @@
 #!/usr/bin/env bash
 # Project canonical procedure contracts into managed adapter surfaces.
+# wv bash guard (wv-7257a8): bash >= 4 or a clear refusal. Identical in every executed entry point; master: scripts/lib/wv-bash-guard.sh.
+_wv_bash_guard() {
+    if [ -n "${WV_TEST_BASH_TOO_OLD:-}" ] && [ "${WV_TEST_MODE:-}" != 1 ]; then echo "wv: WV_TEST_BASH_TOO_OLD needs WV_TEST_MODE=1; ignoring it." >&2; fi
+    if [ "${BASH_VERSINFO[0]:-0}" -ge 4 ] && ! { [ "${WV_TEST_MODE:-}" = 1 ] && [ "${WV_TEST_BASH_TOO_OLD:-}" = 1 ]; }; then
+        unset WV_BASH_REEXEC
+        return 0
+    fi
+    local b
+    if [ -z "${WV_BASH_REEXEC:-}" ] && [ -f "$0" ]; then
+        for b in ${WV_BASH:-} /opt/homebrew/bin/bash /usr/local/bin/bash /usr/bin/bash /bin/bash; do
+            # shellcheck disable=SC2016  # the child bash expands it
+            if [ -x "$b" ] && [ "$("$b" -c 'echo "${BASH_VERSINFO[0]}"' 2>/dev/null)" -ge 4 ] 2>/dev/null; then
+                WV_BASH_REEXEC=1 WV_TEST_BASH_TOO_OLD='' exec "$b" "$0" "$@"
+            fi
+        done
+    fi
+    echo "wv: $0 needs bash 4 or newer but is running under bash ${BASH_VERSION:-unknown}." >&2
+    echo "    On macOS /bin/bash is 3.2: install a newer one (brew install bash) or set WV_BASH to it." >&2
+    exit 1
+}
+_wv_bash_guard "$@"
+# end wv bash guard
+
 set -euo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
@@ -69,7 +92,8 @@ for arg in "$@"; do
         --out=*) OUT="${arg#*=}" ;;
         # A comma list is what wv init-repo passes through (--agent=claude,codex).
         --agent=*) AGENT="${arg#*=}" ;;
-        *) echo "Usage: $0 [--source=<dir>] [--repo=<dir>] [--out=<dir>] [--agent=claude|codex|copilot|all[,...]]" >&2; exit 2 ;;
+        --present) PRESENT=1 ;;
+        *) echo "Usage: $0 [--source=<dir>] [--repo=<dir>] [--out=<dir>] [--agent=claude|codex|copilot|all[,...]] [--present]" >&2; exit 2 ;;
     esac
 done
 _agent_tokens=$(printf '%s' "$AGENT" | tr ',' '\n')
@@ -85,10 +109,22 @@ agent_selects() { grep -qxE -- "all|$1" <<< "$_agent_tokens"; }
 # projects into a scratch copy of them and compares, so the projection format
 # lives here only (wv-fc71f0).
 OUT="${OUT:-$REPO}"
+# --present (wv init-repo --update, wv-82bd03): also refresh every harness whose
+# managed surface is already here, whatever --agent names, so one update clears
+# every stale projection. It adds no surface: only --agent adopts one.
+_explicit_tokens=$_agent_tokens
+if [ "${PRESENT:-0}" = 1 ]; then
+    grep -rqsF -- 'WEAVE-MANAGED-SKILL' "$OUT/.claude/skills" && _agent_tokens+=$'\nclaude'
+    grep -qsF 'BEGIN WEAVE PROCEDURES' "$OUT/.github/copilot-instructions.md" && _agent_tokens+=$'\ncopilot'
+    [ -f "$OUT/.codex/weave.json" ] \
+        && jq -se 'length == 1 and (.[0] | [.procedures[]? | select(.managed == true)] | length > 0)' "$OUT/.codex/weave.json" >/dev/null 2>&1 \
+        && _agent_tokens+=$'\ncodex'
+fi
 # NEUTRAL: whether this run owns .agents/skills (see NEUTRAL_SKILLS above).
 # Decided once, before any write, so a prune cannot erase the opt-in mid-run.
+# A codex surface found by --present refreshes it only if already adopted.
 NEUTRAL=false
-if agent_selects codex || grep -rqsF -- 'WEAVE-MANAGED-SKILL' "$OUT/.agents/skills"; then
+if grep -qxE -- 'all|codex' <<< "$_explicit_tokens" || grep -rqsF -- 'WEAVE-MANAGED-SKILL' "$OUT/.agents/skills"; then
     NEUTRAL=true
 fi
 
@@ -319,7 +355,9 @@ write_copilot_projection() {
     if [ ! -f "$copilot" ]; then
         printf '%s\n' "$block" > "$copilot"
     elif grep -q 'BEGIN WEAVE PROCEDURES' "$copilot"; then
-        awk -v block="$block" '
+        # Through ENVIRON: BSD awk refuses a newline in a -v value (wv-27b2f5).
+        WV_AWK_BLOCK="$block" awk '
+            BEGIN { block = ENVIRON["WV_AWK_BLOCK"] }
             /BEGIN WEAVE PROCEDURES/ { print block; skip=1; next }
             /END WEAVE PROCEDURES/ && skip { skip=0; next }
             !skip { print }
@@ -338,7 +376,8 @@ write_agents_projection() {
     local agents="$OUT/AGENTS.md" block
     [ -f "$agents" ] && grep -q 'BEGIN WEAVE PROCEDURES' "$agents" && grep -q 'END WEAVE PROCEDURES' "$agents" || return 0
     block=$(printf '%s\n' '<!-- BEGIN WEAVE PROCEDURES -->' "${AGENTS_LINES[@]}" '<!-- END WEAVE PROCEDURES -->')
-    awk -v block="$block" '
+    WV_AWK_BLOCK="$block" awk '
+        BEGIN { block = ENVIRON["WV_AWK_BLOCK"] }
         /BEGIN WEAVE PROCEDURES/ { print block; skip=1; next }
         /END WEAVE PROCEDURES/ && skip { skip=0; next }
         !skip { print }

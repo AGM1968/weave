@@ -14,6 +14,12 @@ export WV_CALL_SOURCE=test
 set -uo pipefail
 export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# The product's md5sum (wv-resolve-runtime.sh, side-effect free): the repo hash a
+# product path is keyed on, the same on macOS, which has no md5sum(1) (wv-ef5621).
+# shellcheck disable=SC1091  # resolved at run time
+source "$ROOT/scripts/lib/wv-resolve-runtime.sh"
+# shellcheck disable=SC1091  # resolved at run time
+source "$ROOT/scripts/lib/wv-lock.sh"  # flock(1) is util-linux; macOS has none (wv-412db3)
 WV="$ROOT/scripts/wv"
 HOOKS="$ROOT/.claude/hooks"
 run=0; pass=0
@@ -21,8 +27,11 @@ ok()  { run=$((run+1)); pass=$((pass+1)); echo "  ✓ $1"; }
 bad() { run=$((run+1)); echo "  ✗ $1"; [ -n "${2:-}" ] && echo "      $2"; }
 TMP=$(cd "$(mktemp -d /tmp/wv-policy-hooks-XXXXXX)" && pwd -P)
 P="$TMP/project"
-LOCKS="/tmp/weave-bash-locks-$(id -u)/$(echo "$P" | md5sum | cut -c1-8)"
-trap 'rm -rf "$TMP" "$LOCKS"' EXIT
+# The hooks' own lock directory for $P, set once $P is a repository (wv-b3cb72).
+# shellcheck source=tests/lib/dedup-locks.sh
+. "$ROOT/tests/lib/dedup-locks.sh"
+LOCKS=""
+trap 'rm -rf "$TMP"; [ -z "$LOCKS" ] || rm -rf "$LOCKS"' EXIT
 # POLICY_HOOKS_OBSERVATIONS keeps the observations past this suite's exit, for
 # the totality check.
 export WV_HOOK_OBSERVATIONS="${POLICY_HOOKS_OBSERVATIONS:-$TMP/observations.jsonl}"
@@ -36,6 +45,7 @@ export WV_REQUIRE_LEARNING=0 WV_REQUIRE_QUALITY=0
 mkdir -p "$P/src" "$WV_HOT_ZONE" "$WV_CONFIG_DIR"
 cd "$P" || exit 1
 git init -q . && git config user.email t@t && git config user.name t && git config commit.gpgsign false
+LOCKS=$(dedup_lock_dir "$P") || { echo "fixture: no dedup lock directory for $P"; exit 1; }
 "$WV" init >/dev/null 2>&1
 echo "print('ok')" > src/app.py
 git add -A && git commit -q -m "initial"
@@ -63,7 +73,7 @@ bash_of() { jq -cn --arg c "$1" --arg cwd "$P" '{tool_name:"Bash",tool_input:{co
 # bypass, carrying no call identity, and the hook itself must decide as expected.
 hookcell() {
     local label="$1" rule="$2" decision="$3" bypass="$4" expect="$5" hook="$6" payload="$7" before rc
-    before=$(wc -l < "$WV_HOOK_OBSERVATIONS")
+    before=$(( $(wc -l < "$WV_HOOK_OBSERVATIONS") ))
     printf '%s' "$payload" | bash "$HOOKS/$hook" > "$TMP/hook.out" 2> "$TMP/hook.err"
     rc=$?
     local decided=false
@@ -121,7 +131,7 @@ sqlite3 "$WV_DB" "DELETE FROM edges WHERE type='blocks';"
 # guard's wv list waits past its budget (wv-3a8c06).
 claim "$work"
 rm -rf "$WV_HOT_ZONE/run_cache"
-( exec 9>"$WV_HOT_ZONE/.schema.lock"; flock -x 9; exec sleep 30 ) &
+( exec 9>"$WV_HOT_ZONE/.schema.lock"; wv_lock_fd 9 -x 10; exec sleep 30 ) &
 lock_holder=$!
 sleep 0.3
 rm -f "$WV_DB.ensured"
@@ -234,12 +244,12 @@ for line in open(sys.argv[1]):
     bad += bool(errors)
 sys.exit(1 if bad else 0)
 PY
-then ok "all $(wc -l < "$WV_HOOK_OBSERVATIONS") observations validate against the hook-observation schema"
+then ok "all $(( $(wc -l < "$WV_HOOK_OBSERVATIONS") )) observations validate against the hook-observation schema"
 else bad "all observations validate against the hook-observation schema"; fi
 unset WV_HOOK_OBSERVATIONS
-before=$(find "$TMP" -name '*.jsonl' -newer "$P/src/app.py" | wc -l)
+before=$(( $(find "$TMP" -name '*.jsonl' -newer "$P/src/app.py" | wc -l) ))
 printf '%s' "$(edit_of "$HOME/.local/bin/wv")" | bash "$HOOKS/pre-action.sh" >/dev/null 2>&1
-[ "$(find "$TMP" -name '*.jsonl' -newer "$P/src/app.py" | wc -l)" = "$before" ] &&
+[ "$(( $(find "$TMP" -name '*.jsonl' -newer "$P/src/app.py" | wc -l) ))" = "$before" ] &&
     ok "with WV_HOOK_OBSERVATIONS unset a hook writes nothing" ||
     bad "with WV_HOOK_OBSERVATIONS unset a hook writes nothing"
 

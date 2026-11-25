@@ -187,6 +187,7 @@ _h_orphan_nodes=0 _h_orphan_ids="[]" _h_intentional_standalones=0
 _h_intentional_standalone_ids="[]" _h_ghost_edges=0 _h_empty_edge_ctx=0
 _h_gh_duplicates=0 _h_gh_duplicate_issues="[]"
 _h_stale_active=0 _h_contradictions=0 _h_invalid_statuses=0
+_h_stale_blocked=0 _h_stale_blocked_ids="[]" _h_fixed_stale_blocked=0
 _h_health_score=100 _h_issues="" _h_fixed_edge_ctx=0
 _h_status_icon="" _h_status_text=""
 _h_quality_available="false" _h_quality_score=0 _h_quality_hotspots=0 _h_quality_baseline_note=""
@@ -201,7 +202,7 @@ _health_show_history() {
         return 0
     fi
     local total
-    total=$(wc -l < "$log_file")
+    total=$(( $(wc -l < "$log_file") ))
     if [ "$format" = "json" ]; then
         tail -n "$count" "$log_file" | awk -F'\t' '{
             printf "{\"timestamp\":\"%s\",\"score\":%s,\"nodes\":%s,\"edges\":%s,\"orphans\":%s,\"ghost_edges\":%s}\n", $1, $2, $3, $4, $5, $6
@@ -233,6 +234,21 @@ _health_collect_metrics() {
     _h_blocked="${_h_blocked:-0}"
     _h_blocked_ext=$(db_query "SELECT COUNT(*) FROM nodes WHERE status='blocked-external';" 2>/dev/null)
     _h_blocked_ext="${_h_blocked_ext:-0}"
+    # Blocked with no open blocker (wv-3259b3): every local edge-removal path
+    # recomputes (wv-81338c), but a stale status already in the graph, or one
+    # replayed from an older client, was visible only to wv preflight, one node
+    # at a time. Same predicate as preflight's has_blockers.
+    _h_stale_blocked_ids=$(db_query "
+        SELECT json_group_array(id) FROM (
+            SELECT n.id FROM nodes n
+            WHERE n.status = 'blocked'
+            AND NOT EXISTS (
+                SELECT 1 FROM edges e JOIN nodes b ON e.source = b.id
+                WHERE e.target = n.id AND e.type = 'blocks' AND b.status != 'done')
+            ORDER BY n.id);
+    " 2>/dev/null)
+    _h_stale_blocked_ids="${_h_stale_blocked_ids:-[]}"
+    _h_stale_blocked=$(jq 'length' <<< "$_h_stale_blocked_ids" 2>/dev/null) || _h_stale_blocked=0
     _h_done_count=$(db_query "SELECT COUNT(*) FROM nodes WHERE status='done';" 2>/dev/null)
     _h_done_count="${_h_done_count:-0}"
     _h_pending=$(db_query "SELECT COUNT(*) FROM nodes WHERE status='pending';" 2>/dev/null)
@@ -435,6 +451,12 @@ _health_compute_score() {
         _h_health_score=$((_h_health_score - orphan_penalty))
         _h_issues="${_h_issues}orphan_nodes:$_h_orphan_nodes,"
     fi
+    if [ "${_h_stale_blocked:-0}" -gt 0 ] 2>/dev/null; then
+        local sb_penalty=$(( _h_stale_blocked * 5 ))
+        if [ "$sb_penalty" -gt 15 ]; then sb_penalty=15; fi
+        _h_health_score=$((_h_health_score - sb_penalty))
+        _h_issues="${_h_issues}stale_blocked:$_h_stale_blocked,"
+    fi
     if [ "${_h_gh_duplicates:-0}" -gt 0 ] 2>/dev/null; then
         local dup_penalty=$(( _h_gh_duplicates * 5 ))
         if [ "$dup_penalty" -gt 15 ]; then dup_penalty=15; fi
@@ -510,6 +532,7 @@ _health_cache_summary() {
     proj_slug=$(pwd | tr '/' '-')
     projects_dir="$HOME/.claude/projects"
     # Pick most recent JSONL for this project
+    # shellcheck disable=SC2012  # newest by mtime; session file names are uuids
     jsonl=$(ls -t "$projects_dir/${proj_slug}"/*.jsonl 2>/dev/null | head -1 || true)
     if [ -z "$jsonl" ]; then
         echo "  no session data (run 'wv cache' to diagnose)"
@@ -550,6 +573,25 @@ PYEOF
 }
 
 # Backfill empty edge context. Sets _h_fixed_edge_ctx count.
+# _health_fix_stale_blocked — return stale-blocked nodes to todo through the
+# recompute every edge-removal path uses (wv-81338c), so only a node that held
+# a blocks edge moves; a blocked status set by hand on an edgeless node stays.
+_health_fix_stale_blocked() {
+    _h_fixed_stale_blocked=0
+    [ "${_h_stale_blocked:-0}" -gt 0 ] 2>/dev/null || return 0
+    declare -F _recompute_blocked_targets >/dev/null || _wv_autoload core
+    local ids moved
+    ids=$(db_query "
+        SELECT n.id FROM nodes n, json_each('$(sql_escape "$_h_stale_blocked_ids")') j
+        WHERE n.id = j.value
+        AND EXISTS (SELECT 1 FROM edges e WHERE e.target = n.id AND e.type = 'blocks');
+    " 2>/dev/null) || return 1
+    [ -n "$ids" ] || return 0
+    # shellcheck disable=SC2086  # one argument per id
+    moved=$(_recompute_blocked_targets $ids) || return 1
+    _h_fixed_stale_blocked=$(printf '%s' "$moved" | grep -c . || true)
+}
+
 _health_fix_edges() {
     _h_fixed_edge_ctx=0
     if [ "${_h_empty_edge_ctx:-0}" -eq 0 ]; then
@@ -618,6 +660,9 @@ _health_format_json() {
         --slurpfile intentional_standalone_ids <(printf '%s' "$_h_intentional_standalone_ids") \
         --argjson ghost_edges "$_h_ghost_edges" \
         --argjson stale_active "$_h_stale_active" \
+        --arg stale_blocked "$_h_stale_blocked" \
+        --slurpfile stale_blocked_ids <(printf '%s' "$_h_stale_blocked_ids") \
+        --arg fixed_stale_blocked "$_h_fixed_stale_blocked" \
         --argjson contradictions "$_h_contradictions" \
         --argjson invalid_statuses "$_h_invalid_statuses" \
         --argjson empty_edge_context "$_h_empty_edge_ctx" \
@@ -635,6 +680,7 @@ _health_format_json() {
         $orphan_ids[0] as $orphan_ids
         | $intentional_standalone_ids[0] as $intentional_standalone_ids
         | $gh_duplicate_issues[0] as $gh_duplicate_issues
+        | $stale_blocked_ids[0] as $stale_blocked_ids
         | {
             status: $status,
             fts_integrity: $fts_integrity,
@@ -664,6 +710,9 @@ _health_format_json() {
                 intentional_standalone_ids: $intentional_standalone_ids,
                 ghost_edges: $ghost_edges,
                 stale_active: $stale_active,
+                stale_blocked: ($stale_blocked | tonumber),
+                stale_blocked_ids: $stale_blocked_ids,
+                fixed_stale_blocked: ($fixed_stale_blocked | tonumber),
                 unresolved_contradictions: $contradictions,
                 invalid_statuses: $invalid_statuses,
                 empty_edge_context: $empty_edge_context,
@@ -736,6 +785,7 @@ _health_format_text() {
         echo "  Intentional standalones: $_h_intentional_standalones (excluded from orphan count)"
         echo "  Ghost edges: $_h_ghost_edges"
         echo "  Stale active (>7d): $_h_stale_active"
+        echo "  Blocked with no open blocker: $_h_stale_blocked"
         echo "  Unresolved contradictions: $_h_contradictions"
         echo "  Invalid statuses: $_h_invalid_statuses"
         echo "  Empty edge context: $_h_empty_edge_ctx"
@@ -754,6 +804,8 @@ _health_format_text() {
         echo -e "${YELLOW}Issues:${NC}"
         if [ "$_h_unaddressed_pitfalls" -gt 0 ]; then echo -e "  ${YELLOW}⚠${NC} $_h_unaddressed_pitfalls unaddressed pitfall(s) - run 'wv audit-pitfalls'"; fi
         if [ "$_h_stale_active" -gt 0 ]; then echo -e "  ${YELLOW}⚠${NC} $_h_stale_active node(s) active >7 days - consider completing or closing"; fi
+        if [ "$_h_stale_blocked" -gt 0 ]; then echo -e "  ${YELLOW}⚠${NC} $_h_stale_blocked node(s) blocked with no open blocker ($(jq -r 'join(", ")' <<< "$_h_stale_blocked_ids")) - run 'wv health --fix' to return those with a blocks edge to todo"; fi
+        if [ "$_h_fixed_stale_blocked" -gt 0 ]; then echo -e "  ${GREEN}✓${NC} Fixed: returned $_h_fixed_stale_blocked stale-blocked node(s) to todo"; fi
         if [ "$_h_contradictions" -gt 0 ]; then echo -e "  ${YELLOW}⚠${NC} $_h_contradictions unresolved contradiction(s) - run 'wv edges <id>' to inspect"; fi
         if [ "$_h_ghost_edges" -gt 0 ]; then echo -e "  ${YELLOW}⚠${NC} $_h_ghost_edges ghost edge(s) referencing deleted nodes - run 'wv clean-ghosts'"; fi
         if [ "$_h_orphan_nodes" -gt 5 ]; then echo -e "  ${YELLOW}⚠${NC} $_h_orphan_nodes orphan node(s) with no edges - consider linking or pruning"; fi
@@ -828,7 +880,7 @@ cmd_health() {
         if [ -f "$cache_file" ]; then
             local _hf_now _hf_mtime _hf_age _hf_fresh=true
             _hf_now=$(date +%s)
-            _hf_mtime=$(stat -c %Y "$cache_file" 2>/dev/null || stat -f %m "$cache_file" 2>/dev/null || echo 0)
+            _hf_mtime=$(wv_stat mtime "$cache_file" || echo 0)
             _hf_age=$((_hf_now - _hf_mtime))
             [ "$_hf_age" -le "$fast_ttl" ] || _hf_fresh=false
             # Strictly newer than the write sentinel, as the run cache (wv-228099).
@@ -880,8 +932,9 @@ cmd_health() {
             canonical|preinit|unknown) ;;
             *)
                 _hf_score=0
-                # shellcheck disable=SC2016  # a recovery command printed for the user to run, literal by design
-                _hf_recovery='rm -rf "$WV_HOT_ZONE" && wv load'
+                # Moved aside, never deleted: the zone may hold writes no
+                # repository has yet (wv-4ccc98).
+                _hf_recovery=$(hot_zone_rebuild_advice)
                 ;;
         esac
         if [ "$_h_fts_integrity" = failed ]; then
@@ -944,6 +997,7 @@ cmd_health() {
     # Backfill empty edge context if --fix
     if [ "$fix" = "true" ]; then
         _health_fix_edges
+        _health_fix_stale_blocked || echo "wv health: could not recompute the stale-blocked nodes" >&2
     fi
 
     # Format output

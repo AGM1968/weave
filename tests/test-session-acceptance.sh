@@ -77,13 +77,17 @@ edit_as() {
         | as "$@" -- hook dispatch --event=PreToolUse --format=host 2>&1
 }
 # mcp_call <tool> <args-json> <env...>: one tools/call to a fresh MCP server.
+# bounded, not timeout(1): GNU coreutils, absent on macOS, where the server
+# never started (wv-f8e26d). bounded execs env, env execs node.
+# shellcheck source=tests/lib/bounded.sh
+source "$ROOT/tests/lib/bounded.sh"
 mcp_call() {
     local tool="$1" args="$2"; shift 2
     printf '%s\n%s\n%s\n' \
         '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"s3","version":"0"}}}' \
         '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
         "$(jq -cn --arg t "$tool" --argjson a "$args" '{jsonrpc:"2.0",id:2,method:"tools/call",params:{name:$t,arguments:$a}}')" \
-        | (cd "$R" && env "${IDVARS[@]}" "$@" "${FIXENV[@]}" WV_PATH="$WV" timeout 30 node "$MCP_DIST" --scope=all 2>/dev/null) \
+        | (cd "$R" && bounded 30 env "${IDVARS[@]}" "$@" "${FIXENV[@]}" WV_PATH="$WV" node "$MCP_DIST" --scope=all 2>/dev/null) \
         | jq -rs '[.[] | select(.id==2)][0].result.content[0].text // empty'
 }
 sq() { sqlite3 -cmd ".timeout 5000" "$HOT/brain.db" "$1"; }

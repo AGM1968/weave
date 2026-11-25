@@ -491,7 +491,7 @@ test_learnings_filters() {
     output=$($WV learnings --recent=2 2>/dev/null)
     # Should show at most 2 results (exact content depends on order)
     local line_count
-    line_count=$(echo "$output" | grep -c '─\|━\|ID:' || true)
+    line_count=$(echo "$output" | grep -cE '─|━|ID:' || true)
     # Just check it doesn't error and produces output
     assert_success "learnings --recent=2 succeeds" "$WV" learnings --recent=2
 
@@ -686,8 +686,10 @@ POETRYFAKE
 
     local resolved output expected_system_python marker="$TEST_DIR/poetry-invoked"
     expected_system_python=$(PATH="$TEST_DIR/fake-bin:/usr/bin:/bin" command -v python3)
+    # The PATH is narrowed to test python resolution; "$BASH" keeps the suite's own
+    # shell, since bash found on that PATH is macOS's /bin/bash 3.2 (wv-586cc3).
     resolved=$(REPO_ROOT="$TEST_DIR" PATH="$TEST_DIR/fake-bin:/usr/bin:/bin" \
-        bash -c 'source "$1"; source "$2"; _bootstrap_python_command' _ \
+        "$BASH" -c 'source "$1"; source "$2"; _bootstrap_python_command' _ \
         "$PROJECT_ROOT/scripts/lib/wv-resolve-runtime.sh" \
         "$PROJECT_ROOT/scripts/cmd/wv-cmd-python.sh")
     assert_equals "$expected_system_python" "$resolved" \
@@ -695,7 +697,7 @@ POETRYFAKE
 
     output=$(REPO_ROOT="$TEST_DIR" POETRY_WAS_INVOKED="$marker" \
         PATH="$TEST_DIR/fake-bin:/usr/bin:/bin" \
-        bash -c 'source "$1"; source "$2"; _wv_agent_python_exec_module resolver_probe "$3"' _ \
+        "$BASH" -c 'source "$1"; source "$2"; _wv_agent_python_exec_module resolver_probe "$3"' _ \
         "$PROJECT_ROOT/scripts/lib/wv-resolve-runtime.sh" \
         "$PROJECT_ROOT/scripts/cmd/wv-cmd-python.sh" "$TEST_DIR/modules")
     assert_equals "module ran" "$output" \
@@ -711,7 +713,7 @@ exec /usr/bin/python3 "$@"
 PYTHONFAKE
     chmod +x .venv/bin/python3
     resolved=$(REPO_ROOT="$TEST_DIR" PATH="$TEST_DIR/fake-bin:/usr/bin:/bin" \
-        bash -c 'source "$1"; source "$2"; _bootstrap_python_command' _ \
+        "$BASH" -c 'source "$1"; source "$2"; _bootstrap_python_command' _ \
         "$PROJECT_ROOT/scripts/lib/wv-resolve-runtime.sh" \
         "$PROJECT_ROOT/scripts/cmd/wv-cmd-python.sh")
     assert_equals "$TEST_DIR/.venv/bin/python3" "$resolved" \

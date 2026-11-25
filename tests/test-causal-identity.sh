@@ -185,7 +185,10 @@ mkdir -p "$TEST_DIR/fresh-zone" && chmod 700 "$TEST_DIR/fresh-zone"
 # The database stays where it is, so the identity is computed and its caches
 # are written while the zone directory does not exist yet.
 ( umask 002; WV_HOT_ZONE="$fresh_zone" WV_DB="$db" "$WV" status >/dev/null 2>&1 )
-loose=$(find "$TEST_DIR/fresh-zone" -type d -perm /022 -printf '%m %P\n' 2>/dev/null)
+# Portable form (wv-8ea297): GNU -perm /022 and -printf fail on BSD find, and
+# with the error discarded the empty result read as a pass.
+loose=$(find "$TEST_DIR/fresh-zone" -type d \( -perm -020 -o -perm -002 \) -print 2>&1) \
+    || loose="find failed: $loose"
 check "a call under umask 002 creates no group- or world-writable directory in its zone" "" "$loose"
 
 # GRAPH-ROWS CACHE (wv-78e154). The row dump is reused while the database file

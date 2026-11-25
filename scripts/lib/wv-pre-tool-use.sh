@@ -116,6 +116,169 @@ _ptu_edit_repo() {
     return 0
 }
 
+# _ptu_command_repo <payload-cwd> <command> <verb-regex> -- the Weave checkout a
+# terminal command's wv verb runs in (wv-7ab9d4). A harness pinned to one
+# checkout sends every call with that checkout as .cwd and reaches a linked
+# worktree only by `cd <dir> && wv ...` inside the command, so the close and
+# claim guards judged a worktree's wv done against the first checkout's graph
+# and git history: a worktree commit read as unattributed and the worktree's
+# own uncommitted files went unchecked.
+#
+# The command before the verb is read as the shell would run it, without
+# evaluating anything: simple commands split at ; & | ( ) { } and newlines
+# outside quotes; each `cd <dir>` or `pushd <dir>` moves the directory,
+# relative to the one before (the payload cwd first); a subshell's `cd` ends
+# with it. The verb's own simple command may carry assignments, `env` (whose
+# -C/--chdir moves the directory), or a wrapper that keeps the directory
+# (time, timeout, nohup, nice, command, exec), and may name wv by a path.
+# Prints the checkout's top level. Returns 1, printing the reason instead, when
+# the directory cannot be known without evaluating the command (a $var or
+# backtick, `cd -`, popd, any other wrapper such as ssh, sudo or bash -c) or
+# does not exist: the caller refuses, it never guesses the session cwd.
+# Returns 2, with the reason, when the directory is in no Weave checkout:
+# nothing to enforce there, as for an edit. Returns 3, printing nothing, when
+# nothing before the verb moves the directory: the caller keeps its own
+# resolution (payload cwd, WV_PROJECT_DIR), as before wv-7ab9d4.
+_ptu_command_repo() {
+    local cwd="$1" cmd="$2" verb="$3" head seg="" q="" c i top
+    local -a stack=()
+    [[ "$cmd" =~ $verb ]] || return 1
+    head="${cmd%%"${BASH_REMATCH[0]}"*}"
+    _PTU_CR_DIR="${cwd:-$PWD}" _PTU_CR_WHY="" _PTU_CR_MOVED=""
+    for ((i = 0; i < ${#head}; i++)); do
+        c="${head:i:1}"
+        if [ -n "$q" ]; then
+            seg+="$c"; [ "$c" = "$q" ] && q=""
+            continue
+        fi
+        case "$c" in
+            \'|\") q="$c"; seg+="$c" ;;
+            ';'|'&'|'|'|'{'|'}'|$'\n') _ptu_cr_step "$seg"; seg="" ;;
+            '(') _ptu_cr_step "$seg"; seg=""; stack+=("$_PTU_CR_DIR"$'\x1f'"$_PTU_CR_WHY") ;;
+            ')') _ptu_cr_step "$seg"; seg=""
+                 if [ "${#stack[@]}" -gt 0 ]; then
+                     _PTU_CR_DIR="${stack[-1]%%$'\x1f'*}"; _PTU_CR_WHY="${stack[-1]#*$'\x1f'}"
+                     unset 'stack[-1]'
+                 fi ;;
+            *) seg+="$c" ;;
+        esac
+    done
+    # An open quote: the verb is inside a string some other program runs.
+    [ -z "$q" ] || _PTU_CR_WHY="wv runs inside a quoted string"
+    [ -n "$_PTU_CR_WHY" ] || _ptu_cr_prefix "$seg"
+    if [ -n "$_PTU_CR_WHY" ]; then
+        echo "cannot tell which checkout wv runs in: $_PTU_CR_WHY"
+        return 1
+    fi
+    [ -n "$_PTU_CR_MOVED" ] || return 3
+    if [ ! -d "$_PTU_CR_DIR" ]; then
+        echo "the directory the command runs in ('$_PTU_CR_DIR') does not exist"
+        return 1
+    fi
+    top=$(git -C "$_PTU_CR_DIR" rev-parse --show-toplevel 2>/dev/null) || top=""
+    if [ -z "$top" ] || [ ! -d "$top/.weave" ]; then
+        echo "$_PTU_CR_DIR is in no Weave checkout"
+        return 2
+    fi
+    printf '%s\n' "$top"
+}
+
+# _ptu_cr_move <dir-word> -- move _PTU_CR_DIR to a cd/pushd/env -C argument,
+# or set _PTU_CR_WHY when it cannot be known without evaluating it.
+_ptu_cr_move() {
+    local d="$1"
+    _PTU_CR_MOVED=1
+    case "$d" in
+        \"*\"|\'*\') d="${d:1:${#d}-2}" ;;
+    esac
+    case "$d" in
+        *'$'*|*'`'*|-) _PTU_CR_WHY="'$d' is not a literal directory" ;;
+        \~) _PTU_CR_DIR="$HOME" ;;
+        \~/*) _PTU_CR_DIR="$HOME/${d#\~/}" ;;
+        /*) _PTU_CR_DIR="$d" ;;
+        *) _PTU_CR_DIR="$_PTU_CR_DIR/$d" ;;
+    esac
+}
+
+# _ptu_cr_step <simple-command> -- apply one simple command before the verb.
+_ptu_cr_step() {
+    local s="$1" w
+    s="${s#"${s%%[![:space:]]*}"}"
+    w="${s%%[[:space:]]*}"
+    case "$w" in
+        cd|pushd)
+            s="${s#"$w"}"; s="${s#"${s%%[![:space:]]*}"}"
+            if [ -z "$s" ]; then
+                _PTU_CR_MOVED=1
+                [ "$w" = cd ] && _PTU_CR_DIR="$HOME" || _PTU_CR_WHY="pushd with no directory"
+            elif [[ "$s" =~ ^(\"[^\"]*\"|\'[^\']*\'|[^[:space:]]+) ]]; then
+                _ptu_cr_move "${BASH_REMATCH[1]}"
+            fi ;;
+        popd) _PTU_CR_WHY="popd" ;;
+    esac
+}
+
+# _ptu_cr_prefix <text> -- the verb's own simple command up to wv: assignments,
+# env (with -C/--chdir), and wrappers that keep the directory are understood;
+# a path naming wv (./scripts/wv) is part of the verb.
+_ptu_cr_prefix() {
+    local s="$1" w want=""
+    [[ "$s" =~ ^(.*[[:space:]])?[^[:space:]]*/$ ]] && s="${BASH_REMATCH[1]}"
+    # shellcheck disable=SC2086  # word splitting is the point
+    set -- $s
+    for w in "$@"; do
+        if [ -n "$want" ]; then
+            case "$want" in
+                chdir) _ptu_cr_move "$w" ;;
+            esac
+            want=""
+            continue
+        fi
+        case "$w" in
+            *=*) [[ "$w" == --chdir=* ]] && _ptu_cr_move "${w#--chdir=}" ;;
+            env|time|nohup|command|exec|nice|timeout|-i|-u|--unset|-s|-k|--signal|--kill-after|-n|--adjustment) 
+                case "$w" in -u|--unset|-s|-k|--signal|--kill-after|-n|--adjustment) want=skip ;; esac ;;
+            -C|--chdir) want=chdir ;;
+            -*) ;;
+            [0-9]*) ;;
+            *) _PTU_CR_WHY="wv runs under '$w'"; return ;;
+        esac
+    done
+}
+
+# _ptu_enter_command_repo <payload-cwd> <command> <verb-regex> -- run the rest
+# of the guard from the command's checkout (_ptu_command_repo), resolving
+# project and hot zone afresh when it is not the payload cwd's, as the edit
+# guard does for a file (wv-455739). A command that moves nowhere changes
+# nothing: the guard keeps its own resolution. Returns _ptu_command_repo's 1
+# (refuse) or 2 (no Weave checkout: nothing to enforce), reason in _PTU_WHY.
+_ptu_enter_command_repo() {
+    local top here rc=0
+    _PTU_WHY=""
+    top=$(_ptu_command_repo "$@") || rc=$?
+    [ "$rc" -eq 3 ] && return 0
+    if [ "$rc" -ne 0 ]; then _PTU_WHY="$top"; return "$rc"; fi
+    # The project the guard would otherwise judge: WV_PROJECT_DIR, else the
+    # payload cwd's checkout.
+    here="${WV_PROJECT_DIR:-}"
+    [ -n "$here" ] || { [ -n "$1" ] && [ -d "$1" ] && here=$(git -C "$1" rev-parse --show-toplevel 2>/dev/null); } || true
+    [ -n "$here" ] && [ -d "$here" ] && here=$(cd "$here" && pwd -P)
+    top=$(cd "$top" && pwd -P) || { _PTU_WHY="cannot enter $top"; return 1; }
+    cd "$top" || { _PTU_WHY="cannot enter $top"; return 1; }
+    if [ "$top" != "$here" ]; then
+        unset WV_PROJECT_DIR WV_HOT_ZONE WV_DB WV
+    fi
+    export CLAUDE_PROJECT_DIR="$top"
+}
+
+# _ptu_checkout_unknown_deny <reason> -- refuse a close or claim whose checkout
+# cannot be known (wv-7ab9d4): the guard could not evaluate it, so no rule was
+# applied (policy contract: infrastructure_failure, not a rule's decision).
+_ptu_checkout_unknown_deny() {
+    jq -n --arg detail "$1" \
+        '{hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: $detail}}'
+}
+
 # _ptu_fail_closed <reason> -- the edit guard could not run. It used to exit 0
 # with a warning, so a half-installed library or a missing graph database
 # admitted every edit with no claim (wv-187945). Owner ruling 2026-11-03: an
@@ -215,6 +378,22 @@ wv_ptu_edit_guard() (
     [ "${_HC_BYPASS_CMD:-false}" = true ] && exit 0
     [ "${_HC_SHOULD_CHECK:-false}" = false ] && exit 0
 
+    # A tool call whose every file is in no Weave checkout has no claim to
+    # enforce (wv-7ab9d4). It was judged by the session checkout's phase and
+    # claim instead, so a scratch file outside every repository was refused
+    # for want of a claim there. The installed-copy guard and the payload check
+    # above still apply.
+    _ptu_any_path="" _ptu_weave_path=""
+    while IFS= read -r _path; do
+        [ -n "$_path" ] || continue
+        _ptu_any_path=1
+        if [ -n "$(_ptu_edit_repo Edit "$(jq -cn --arg p "$_path" '{file_path:$p}')")" ]; then
+            _ptu_weave_path=1
+            break
+        fi
+    done < <(_ptu_input_paths "$TOOL" "$TOOL_INPUT")
+    [ -n "$_ptu_any_path" ] && [ -z "$_ptu_weave_path" ] && exit 0
+
     # No Weave project here is a decision, not a failure: nothing to enforce.
     if [ -z "${WV_PROJECT_DIR:-}" ] || [ ! -d "${WV_PROJECT_DIR}/.weave" ]; then exit 0; fi
     # A Weave project the guard cannot judge fails closed for an edit (wv-187945).
@@ -280,7 +459,17 @@ wv_ptu_claim_guard() (
     if [[ "$COMMAND" =~ wv[[:space:]]update[[:space:]]wv-[0-9a-f]{4,6}.*--status=active ]] || \
        [[ "$COMMAND" =~ wv[[:space:]]work[[:space:]]wv-[0-9a-f]{4,6} ]]; then
         # Extract the node ID
-        NODE_ID=$(echo "$COMMAND" | grep -oP 'wv-[0-9a-f]{4,6}')
+        NODE_ID=$(echo "$COMMAND" | grep -oE 'wv-[0-9a-f]{4,6}')
+
+        # Read the node from the checkout the command runs in (wv-7ab9d4): a
+        # worktree's claim was judged against the session checkout's graph.
+        _PAYLOAD_CWD=$(echo "$INPUT" | jq -r '.cwd // empty' 2>/dev/null || echo "")
+        _ptu_enter_command_repo "$_PAYLOAD_CWD" "$COMMAND" \
+            'wv[[:space:]]+(work|update)[[:space:]]+wv-[0-9a-f]{4,6}' || {
+            [ "$?" -eq 2 ] && exit 0
+            _ptu_checkout_unknown_deny "Cannot check this claim: $_PTU_WHY. Run it from the node's checkout, either as the session cwd or after a literal cd <path> &&."
+            exit 0
+        }
 
         # Get node details
         _ptu_source wv-resolve-project || exit 0
@@ -395,10 +584,17 @@ _agent_hook_run() {
     if _agent_hook_mode && [ "${WV_AGENT_TEST_TIMEOUT_STAGE:-}" = "$stage" ]; then
         return 124
     fi
-    if command -v timeout >/dev/null 2>&1; then
-        timeout --foreground "${WV_AGENT_HOOK_TIMEOUT:-15s}" "$@"
+    # The stage deadline is Weave's on every host (wv-ea88cd): wv_bound is
+    # the one mechanism, perl-backed, with --foreground semantics (the stage
+    # keeps the terminal's signals). Before, a host without timeout(1)
+    # (macOS) ran the stage unbounded, up to the harness's own hook limit.
+    declare -F wv_bound >/dev/null 2>&1 || _ptu_source wv-resolve-runtime || true
+    if declare -F wv_bound >/dev/null 2>&1; then
+        wv_bound "${WV_AGENT_HOOK_TIMEOUT:-15s}" "$@"
     else
-        "$@"
+        # The library did not load: refuse the stage as a timeout would,
+        # rather than run it without a deadline.
+        return 124
     fi
 }
 
@@ -425,15 +621,25 @@ wv_ptu_close_guard() (
     # Check if this is a wv done/ship/ship-agent command
     if [[ "$COMMAND" =~ wv[[:space:]](done|ship|ship-agent)[[:space:]]wv-[0-9a-f]{4,6} ]]; then
         # Extract the node ID
-        NODE_ID=$(echo "$COMMAND" | grep -oP 'wv-[0-9a-f]{4,6}')
+        NODE_ID=$(echo "$COMMAND" | grep -oE 'wv-[0-9a-f]{4,6}')
 
-        # Anchor project resolution to the session cwd — prevents hot zone race when
-        # the hook subshell's cwd doesn't match the project dir.
+        # Judge the close in the checkout the command runs in: the payload cwd,
+        # or the `cd <dir>` before the verb (wv-7ab9d4). One that cannot be
+        # known is refused: guessing the session cwd judged a worktree's close
+        # against another checkout's history and uncommitted files.
         _PAYLOAD_CWD=$(echo "$INPUT" | jq -r '.cwd // empty' 2>/dev/null || echo "")
+        # Anchor project resolution to the session cwd -- prevents a hot zone
+        # race when the hook subshell's cwd is not the project dir.
         if [[ -n "$_PAYLOAD_CWD" ]] && [[ -d "$_PAYLOAD_CWD" ]]; then
             export CLAUDE_PROJECT_DIR="$_PAYLOAD_CWD"
             cd "$_PAYLOAD_CWD" 2>/dev/null || true
         fi
+        _ptu_enter_command_repo "$_PAYLOAD_CWD" "$COMMAND" \
+            'wv[[:space:]]+(done|ship|ship-agent)[[:space:]]+wv-[0-9a-f]{4,6}' || {
+            [ "$?" -eq 2 ] && exit 0
+            _ptu_checkout_unknown_deny "Cannot verify this close: $_PTU_WHY. Run wv done from the node's checkout, either as the session cwd or after a literal cd <path> &&."
+            exit 0
+        }
         _ptu_source wv-resolve-project || exit 0
         _ptu_source wv-validate || true
         # wv-822bea/wv-37e2e0: node_files (uncapped) is the authoritative
@@ -796,21 +1002,26 @@ wv_ptu_dedup_guard() (
     # A normal command with no lock key and not a poller: nothing to do.
     [[ -z "$LOCK_KEY" && "$IS_POLLER" != "true" ]] && exit 0
 
-    # ── Portable repo hash (md5sum → md5 → sha256sum → fallback) ─────────────
-
+    # ── Repo hash ─────────────────────────────────────────────────────────────
+    # md5sum is wv-resolve-runtime's portable stand-in (wv-7d7d41); the old
+    # md5sum || md5 || sha256sum chain never fell through, since a pipeline's
+    # status is cut's.
+    # Per-uid and created through the hot-zone base guard (wv-80be32).
+    _ptu_source wv-resolve-runtime || exit 0
     REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
     # Use echo (not printf) to match the newline convention used by all other hooks
     # and wv-config.sh — they all hash "$REPO_ROOT\n". Diverging here causes a
     # different hash and a different lock directory from the rest of the system.
-    REPO_HASH=$(
-        echo "$REPO_ROOT" | md5sum    2>/dev/null | cut -c1-8 ||
-        echo "$REPO_ROOT" | md5       2>/dev/null | cut -c1-8 ||
-        echo "$REPO_ROOT" | sha256sum 2>/dev/null | cut -c1-8 ||
-        echo "default"
-    )
-    # Per-uid and created through the hot-zone base guard (wv-80be32).
-    _ptu_source wv-resolve-runtime || exit 0
-    LOCK_DIR=$(resolve_bash_lock_dir "$REPO_HASH")
+    REPO_HASH=$(echo "$REPO_ROOT" | md5sum 2>/dev/null | cut -c1-8)
+    REPO_HASH=${REPO_HASH:-default}
+    # Keyed by session as well (wv-da7c28): another session's command never
+    # denies this one. A call naming no session shares the repository's lock,
+    # and its deny says so, since the holder may be a session whose
+    # notification never reaches this one.
+    _dd_session=$(hook_session_lock_key "$INPUT")
+    LOCK_DIR=$(resolve_bash_lock_dir "$REPO_HASH" "$_dd_session")
+    _dd_wait="wait for the task-notification"
+    [ -n "$_dd_session" ] || _dd_wait="this call names no session, so the lock is shared by every session on this repository: wait for the task-notification if the previous command is yours, else for the lock to lapse"
     hot_zone_ensure "$LOCK_DIR" || exit 0
 
     # Name the rule when denying (wv-664b7f). Loaded only past the fast exits, so
@@ -909,7 +1120,7 @@ wv_ptu_dedup_guard() (
         # before either process exists; a different command is checked at once, so
         # a retry corrected after a refusal is not denied for 10s (wv-5362e2).
         # ps is captured first so the search cannot match its own grep.
-        _dd_reason="already running — wait for the task-notification before re-issuing"
+        _dd_reason="already running — ${_dd_wait} before re-issuing"
         if [[ "$LOCK_PHASE" == "pending" ]] && { [[ "$LOCK_AGE" -ge "$SPAWN_WINDOW" ]] || [[ "$PREV_CMD" != "$CMD_LINE1" ]]; }; then
             _dd_needle=${PREV_CMD%%$'\n'*}
             _dd_needle=${_dd_needle:0:80}
@@ -958,7 +1169,7 @@ ${CMD_LINE1}"
     # Race: another invocation just acquired the lock between our check and write
     PREV_CMD=$(sed -n '3p' "$LOCK_FILE" 2>/dev/null || echo "(unknown)")
     _hc_observe no_duplicate_inflight_command deny
-    jq -n --arg key "$LOCK_KEY" --arg prev "$PREV_CMD" \
-        '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":("Duplicate command blocked [\($key)]: just acquired by concurrent call — wait for the task-notification. Previous: \($prev)")}}'
+    jq -n --arg key "$LOCK_KEY" --arg prev "$PREV_CMD" --arg wait "$_dd_wait" \
+        '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":("Duplicate command blocked [\($key)]: just acquired by concurrent call — \($wait). Previous: \($prev)")}}'
     exit 0
 )

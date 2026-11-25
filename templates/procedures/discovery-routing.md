@@ -13,15 +13,15 @@ claude_skill: wv-discovery-routing
 Start with the smallest question that can resolve the uncertainty. Do not turn routine work into a
 broad scan; branch into richer inspection only when scope, unfamiliarity, or risk warrants it.
 
-| Need                                    | Route                                                                    |
-| --------------------------------------- | ------------------------------------------------------------------------ |
-| Locate related work or prior decisions  | `wv search "<topic>"` → `wv query <exact predicates>`                    |
-| Understand uncertain or cross-node work | `wv context <id> --json` → `wv discover <id> --json` → `wv impact <id>`  |
-| Locate unfamiliar implementation        | `wv search --code "<concept>" --graph`                                   |
-| Edit broad or cross-module targets      | `wv impact --files=<targets>`                                            |
-| Touch a hotspot or complex path         | `wv quality functions <file>` then `wv quality patterns scan <scope>`    |
-| Know what a prose rule matches          | `wv quality patterns show <rule-id>` (or `--all --json`)                 |
-| Read the graph DB directly              | `DB=$(wv hotzone db)` then `sqlite3 -readonly "$DB"`; never a built path |
+| Need                                    | Route                                                                                                  |
+| --------------------------------------- | ------------------------------------------------------------------------------------------------------ |
+| Locate related work or prior decisions  | `wv search "<topic>"` → `wv query <exact predicates>`                                                  |
+| Understand uncertain or cross-node work | `wv context <id> --json` → `wv discover <id> --json` → `wv impact <id>`                                |
+| Locate unfamiliar implementation        | `wv search --code "<concept>" --graph`                                                                 |
+| Edit broad or cross-module targets      | `wv impact --files=<targets>`                                                                          |
+| Touch a hotspot or complex path         | `wv quality functions <file>` then `wv quality patterns scan <scope>`                                  |
+| Know what a prose rule matches          | `wv quality patterns show <rule-id>` (or `--all --json`)                                               |
+| Read the graph DB directly              | `DB=$(wv hotzone db)` then `sqlite3 -cmd "PRAGMA query_only=1" "file:$DB?mode=rw"`; never a built path |
 
 `bootstrap` and `context` already include bounded discovery. Run direct `discover` when their result
 shows a material unknown, cross-node relationship, prior learning, or candidate blind spot that must

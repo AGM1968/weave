@@ -4,6 +4,12 @@
 # Sourced by: wv entry point
 # Dependencies: None
 
+# python >= 3.11 first on PATH before anything wv or the pre-commit hook starts
+# runs python3 (wv-892318). Beside this file; an install without it refuses.
+# shellcheck source=scripts/lib/wv-python-floor.sh
+source "${BASH_SOURCE[0]%/*}/wv-python-floor.sh" || { echo "wv: ${BASH_SOURCE[0]%/*}/wv-python-floor.sh is missing; reinstall Weave." >&2; exit 1; }
+_wv_python_floor
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Version and Paths
 # ═══════════════════════════════════════════════════════════════════════════
@@ -418,10 +424,9 @@ wv_set_phase() {
 # every source class (ultrareview #4574), so a change to how drift is judged
 # cannot reach some classes and not others.
 _wv_drift_cmp() {
-    local sm im
-    sm=$(md5sum "$1" 2>/dev/null | awk '{print $1}')
-    im=$(md5sum "$2" 2>/dev/null | awk '{print $1}')
-    [ -f "$2" ] && [ "$sm" = "$im" ] || drifted="${drifted:+$drifted }$(basename "$1")"
+    # cmp, not two md5sum digests: with no md5sum both were empty, so every
+    # stale copy read as current (wv-7d7d41).
+    [ -f "$2" ] && cmp -s -- "$1" "$2" || drifted="${drifted:+$drifted }$(basename "$1")"
 }
 
 _wv_source_drift() {
@@ -466,16 +471,88 @@ _wv_source_drift() {
 # was deleted twice in one session this way. .weave/ has cross-agent guards
 # (wv-b767ff, wv-66aa00); the working tree itself does not.
 #
-# Linux-only (/proc); silently no-ops elsewhere (return 1) since this is
-# advisory, not a blocking gate. Excludes the caller's own ancestor chain —
-# the harness driving THIS session (e.g. a "claude" process) commonly has its
-# own cwd inside the repo too, and is not a distinct concurrent session.
-# Echoes a description and returns 0 on a hit; returns 1 when clean.
+# Two backends, one rule (wv-655a34): /proc where the kernel has it (Linux),
+# else ps and lsof, which macOS ships. Before, a host without /proc returned
+# 1, so a second session there read a live peer's per-session sentinel and
+# heartbeat as an ended session's and removed them (the hazard wv-9a867a fixed
+# on Linux). Only when neither is available does it return 1 unjudged.
+# Excludes the caller's own ancestor chain: the harness driving THIS session
+# (e.g. a "claude" process) commonly has its own cwd inside the repo too, and
+# is not a distinct concurrent session.
+# Echoes a description and returns 0 on a hit; returns 1 when clean, 2 on a
+# bad WV_TEST_PEER_SCAN.
 _wv_concurrent_session() {
-    local repo_root="$1"
-    [ -d /proc ] || return 1
+    local repo_root="$1" backend
     [ -n "$repo_root" ] || return 1
+    backend=$(_wv_peer_scan_backend) || return 2
+    case "$backend" in
+        proc) _wv_concurrent_session_proc "$repo_root" ;;
+        ps) _wv_concurrent_session_ps "$repo_root" ;;
+        *) return 1 ;;
+    esac
+}
 
+# _wv_peer_scan_backend — proc, ps or none. Under WV_TEST_MODE=1,
+# WV_TEST_PEER_SCAN=ps forces the ps/lsof backend so Linux runs it too; set
+# without WV_TEST_MODE=1 it is ignored with a warning, and any other value is
+# an error (tests/wv-test-hooks.registry).
+_wv_peer_scan_backend() {
+    local forced="${WV_TEST_PEER_SCAN:-}"
+    if [ -n "$forced" ]; then
+        if [ "${WV_TEST_MODE:-}" != "1" ]; then
+            echo "wv: WV_TEST_PEER_SCAN is set but WV_TEST_MODE=1 is not; ignoring it." >&2
+            forced=""
+        elif [ "$forced" != ps ]; then
+            echo "wv: WV_TEST_PEER_SCAN='$forced' is not a backend (only 'ps')." >&2
+            return 1
+        fi
+    fi
+    if [ "$forced" = ps ]; then
+        echo ps
+    elif [ -d /proc/self ]; then
+        echo proc
+    elif command -v ps >/dev/null 2>&1 && command -v lsof >/dev/null 2>&1; then
+        echo ps
+    else
+        echo none
+    fi
+}
+
+# _wv_concurrent_session_ps <repo-root> — the scan through ps and lsof: the
+# same agent-name rule on each process's command basename (macOS ps prints
+# the executable path), then, for a match only, its cwd from lsof, compared
+# canonically (macOS /tmp and /var are links into /private).
+_wv_concurrent_session_ps() {
+    local repo_root self_chain=" $$ " walk="$$" hops=0 pid comm name cwd cmd
+    repo_root=$(cd "$1" 2>/dev/null && pwd -P) || repo_root="$1"
+    while [ -n "$walk" ] && [ "$walk" != "1" ] && [ "$hops" -lt 30 ]; do
+        walk=$(ps -o ppid= -p "$walk" 2>/dev/null) || walk=""
+        walk="${walk//[[:space:]]/}"
+        [ -n "$walk" ] || break
+        self_chain="${self_chain}${walk} "
+        hops=$((hops + 1))
+    done
+    while read -r pid comm; do
+        [ -n "$pid" ] || continue
+        case "$self_chain" in *" $pid "*) continue ;; esac
+        name="${comm##*/}"
+        _wv_agent_name_match "$name" || continue
+        cwd=$(lsof -a -d cwd -Fn -p "$pid" 2>/dev/null | sed -n 's/^n//p' | head -n 1)
+        [ -n "$cwd" ] || continue
+        cwd=$(cd "$cwd" 2>/dev/null && pwd -P) || continue
+        case "$cwd" in "$repo_root") ;; "$repo_root"/*) ;; *) continue ;; esac
+        cmd=$(ps -o args= -p "$pid" 2>/dev/null) || cmd=""
+        [ -n "$cmd" ] || cmd="$name"
+        printf 'another live agent process (pid %s: %s) has a working directory inside this repo -- working-tree edits are not coordinated between sessions (wv-fa566a)' \
+            "$pid" "$(printf '%s' "$cmd" | cut -c1-80)"
+        return 0
+    done < <(ps -A -o pid= -o comm= 2>/dev/null)
+    _wv_copilot_lock_peer "$1" "$self_chain"
+}
+
+# _wv_concurrent_session_proc <repo-root> — the /proc scan (Linux).
+_wv_concurrent_session_proc() {
+    local repo_root="$1"
     local self_chain=" $$ " walk="$$" hops=0
     while [ -n "$walk" ] && [ "$walk" != "1" ] && [ "$hops" -lt 30 ]; do
         walk=$(awk -F: '/^PPid:/{gsub(/[ \t]/,"",$2); print $2}' "/proc/$walk/status" 2>/dev/null)
@@ -566,7 +643,7 @@ _wv_copilot_lock_peer() {
         # ") "; field 22 is then the 20th.
         start=$(sed 's/^.*) //' "/proc/$pid/stat" 2>/dev/null | awk '{print $20}')
         [ -n "$start" ] || continue
-        [ "$(stat -c %Y "$lock" 2>/dev/null || echo 0)" -ge $((btime + start / tck)) ] || continue
+        [ "$(wv_stat mtime "$lock" || echo 0)" -ge $((btime + start / tck)) ] || continue
         ws="${lock%/*}/workspace.yaml"
         [ -f "$ws" ] || continue
         client=$(awk -F': *' '$1=="client_name"{print $2; exit}' "$ws" 2>/dev/null)

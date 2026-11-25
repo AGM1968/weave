@@ -7,6 +7,8 @@
 # warns naming the untrusted events otherwise, and never writes the config.
 # An entry edited after trust warns until Codex's trusted_hash moves (a person
 # trusted it again), from doctor's own baseline (wv-d9f789).
+# shellcheck source=tests/lib/sed-inplace.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/sed-inplace.sh"  # sed -i is GNU-only (wv-076a98)
 set -euo pipefail
 export WV_TEST_SUITE=1  # the user's config.env cannot log this suite's wv calls (wv-6b0f57)
 export WV_CALL_SOURCE=test
@@ -66,7 +68,7 @@ trust pre_tool_use:1:0
 check "an entry for every hook passes" pass "trust entry for all 6 hook(s)"
 check "the pass says each entry is unchanged since first seen trusted" pass "each unchanged since first seen trusted"
 TESTS=$((TESTS + 1))
-if [ "$(wc -l < "$WV_CODEX_TRUST_BASELINE")" -eq 6 ]; then PASSED=$((PASSED + 1)); echo "  ✓ the baseline records one row per trusted hook"
+if [ "$(( $(wc -l < "$WV_CODEX_TRUST_BASELINE") ))" -eq 6 ]; then PASSED=$((PASSED + 1)); echo "  ✓ the baseline records one row per trusted hook"
 else echo "  ✗ the baseline does not hold 6 rows"; fi
 
 # Editing a hook's entry after trust: Codex skips it silently (wv-514488).
@@ -75,7 +77,7 @@ jq '.hooks.PreToolUse[0].hooks[0].command += " --edited"' "$TMP/hooks.orig" > .c
 check "an entry edited after trust warns, naming the event" warn "changed since Codex trusted them: PreToolUse"
 check "the edit keeps warning on the next run" warn "review them again in the Codex TUI"
 # A person trusts it again: Codex writes a new trusted_hash for that key.
-sed -i "/hooks.json:pre_tool_use:0:0\"\]/{n;s/sha256:0*/sha256:$(printf '%064d' 1)/}" "$CODEX_HOME/config.toml"
+sed_inplace "/hooks.json:pre_tool_use:0:0\"\]/{n;s/sha256:0*/sha256:$(printf '%064d' 1)/}" "$CODEX_HOME/config.toml"
 check "trusting the edited hook again passes" pass "each unchanged since first seen trusted"
 # The script a hook runs is outside its entry; Codex kept such a hook trusted.
 mkdir -p scripts && echo 'echo v2' > scripts/wv
@@ -98,7 +100,7 @@ TESTS=$((TESTS + 1))
 if [ "$(sha256sum "$CODEX_HOME/config.toml")" = "$before" ]; then PASSED=$((PASSED + 1)); echo "  ✓ doctor leaves the Codex config unchanged"
 else echo "  ✗ doctor wrote the Codex config"; fi
 
-sed -i "s#$REPO/.codex/hooks.json:stop:0:0#/elsewhere/.codex/hooks.json:stop:0:0#" "$CODEX_HOME/config.toml"
+sed_inplace "s#$REPO/.codex/hooks.json:stop:0:0#/elsewhere/.codex/hooks.json:stop:0:0#" "$CODEX_HOME/config.toml"
 check "an entry for another checkout path does not count" warn "pending trust for: Stop"
 
 echo "Results: $PASSED/$TESTS passed"

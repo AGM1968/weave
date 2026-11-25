@@ -87,6 +87,7 @@ declare -a FAST_SUITES=(
     "test-hook-stale-copy.sh:Git Hook Stale-Copy Guard"
     "test-hook-duration.sh:Git Hook Duration Helper"
     "test-hook-body-ratchet.sh:The Pre-commit Hook Body Only Shrinks"
+    "test-test-line-ratchet.sh:Net Test Lines Are Reported, Never Refused"
     "test-init-repo.sh:Init-Repo Tests"
     "test-install-ast-grep.sh:Install ast-grep Opt-in Tests"
     "test-install-file.sh:Install File Atomic-Replace Tests"
@@ -117,6 +118,10 @@ declare -a FAST_SUITES=(
     "test-hot-zone-base.sh:Hot-zone Bases Another User Could Control Are Refused"
     "test-session-index-trigger.sh:Session Start Rebuilds An Empty Code Index"
     "test-hot-zone-placement.sh:Hot-zone Placement Adopts the Zone Holding the Database"
+    "test-hot-zone-migrate.sh:Hot-zone Migrate Relocates the /tmp Zone Behind a Fence"
+    "test-hot-zone-gc.sh:Hot-zone GC Deletes Only Zones Whose Repository Is Known Gone"
+    "test-bash-guard.sh:Executed Entry Points Run Under Bash 4 or Refuse"
+    "test-fts5-required.sh:A sqlite3 Without FTS5 Is Refused, Never Half-Initialised"
     "test-hot-zone-reconcile.sh:Divergent Copies of One Graph Are Reconciled Before Removal"
     "test-gate-zone-guard.sh:The Gate Fails a Suite That Leaks Into the Live Hot Zone"
     "test-cli-guards.sh:CLI Guards the Routed Suites Missed"
@@ -161,6 +166,12 @@ declare -a FAST_SUITES=(
     "test-status-authority.sh:status Authority"
     "test-node-kind.sh:Node Kind Authority"
     "test-edge-invariants.sh:Edge Invariants"
+    "test-unblock-recompute.sh:Unblock Recompute on Edge Removal"
+    "test-worktree-hook-checkout.sh:Hooks Judge the Command Checkout"
+    "test-suite-cost-identity.sh:One Suite Cost Keyed by Repository"
+    "test-bash-lock-session.sh:Duplicate-Command Lock per Session"
+    "test-mcp-version-handshake.sh:MCP Rebuild and Version Handshake"
+    "test-merge-driver-fresh-clone.sh:Merge Drivers in a Fresh Clone"
     "test-self-host-markers.sh:Committed Gate and Installer Markers"
     "test-db-size-guard.sh:DB Size Guard"
     "test-quick-commit-hook.sh:Quick Commit Under Hook"
@@ -286,8 +297,12 @@ UNCOUNTED_SUITES=()
 # _suite_counts <clean-output>: set PARSED_PASSED/PARSED_TESTS from a suite's
 # own summary; return 1 when it printed none. Two formats are in use:
 # "Results: X/Y passed" and "Tests: N | Passed: P | Failed: F".
+# Suite output is bytes, not text: a suite may print non-UTF-8 (wv-ab04dd), and
+# macOS grep/sed/awk then error or read it as binary under a UTF-8 locale. Every
+# reader of suite output in this file runs under LC_ALL=C; the suites do not.
 _suite_counts() {
     local out="$1" line numbers
+    local -x LC_ALL=C
     if grep -qE "[0-9]+/[0-9]+ passed" <<<"$out"; then
         line=$(grep -E "[0-9]+/[0-9]+ passed" <<<"$out" | tail -1)
         numbers=$(grep -oE '[0-9]+' <<<"$line")
@@ -305,7 +320,6 @@ _suite_counts() {
     PARSED_TESTS=0
     return 1
 }
-declare -A TIMES
 TOTAL_PASSED=0
 TOTAL_TESTS=0
 FAILED_SUITES=()
@@ -347,7 +361,7 @@ run_suite() {
     # Prefer "Results: X/Y passed" over "Tests: X | Passed: X | Failed: Y" —
     # tail -1 on the latter picks up "Failed: 0" as the test count.
     local clean_output
-    clean_output=$(printf '%s' "$output" | sed 's/\x1b\[[0-9;]*m//g')
+    clean_output=$(printf '%s' "$output" | LC_ALL=C sed $'s/\e\\[[0-9;]*m//g')
     local counted=true
     _suite_counts "$clean_output" || { counted=false; UNCOUNTED_SUITES+=("$script"); }
     passed=$PARSED_PASSED
@@ -356,7 +370,6 @@ run_suite() {
     [ "$counted" = true ] || count_label="no test count"
 
     RESULTS["$script"]="$passed/$tests"
-    TIMES["$script"]="$duration"
     TOTAL_PASSED=$((TOTAL_PASSED + passed))
     TOTAL_TESTS=$((TOTAL_TESTS + tests))
     
@@ -368,7 +381,7 @@ run_suite() {
             # lines and the SIGPIPE that kills grep is this runner's own status
             # under `set -euo pipefail`, so reporting a failure could abort the
             # run that was reporting it.
-            awk '/✗|FAIL|Error/ && shown < 10 { print "    " $0; shown++ }' <<<"$clean_output"
+            LC_ALL=C awk '/✗|FAIL|Error/ && shown < 10 { print "    " $0; shown++ }' <<<"$clean_output"
         fi
     else
         echo -e "  ${GREEN}✓${NC} $name: $count_label (${duration}s)"
@@ -447,7 +460,7 @@ if [ "$PARALLEL" = true ]; then
             # on herestrings: `echo "$x" | grep -q` lets grep leave at its first
             # match while the writer is still writing, and the SIGPIPE that
             # follows becomes the pipeline's status under `set -o pipefail`.
-            clean_output=$(printf '%s' "$output" | sed 's/\x1b\[[0-9;]*m//g')
+            clean_output=$(printf '%s' "$output" | LC_ALL=C sed $'s/\e\\[[0-9;]*m//g')
             count_label=""
             if ! _suite_counts "$clean_output"; then
                 UNCOUNTED_SUITES+=("$script")
@@ -471,7 +484,7 @@ if [ "$PARALLEL" = true ]; then
                 # are shown here as the serial path already does. awk rather than
                 # `grep | head`, because a reader that leaves early is the bug
                 # this whole change is about.
-                awk '/✗|FAIL|Error/ && shown < 10 { print "    " $0; shown++ }' <<<"$clean_output"
+                LC_ALL=C awk '/✗|FAIL|Error/ && shown < 10 { print "    " $0; shown++ }' <<<"$clean_output"
                 failed_log="${WV_TEST_FAILED_LOG_DIR:-$(dirname "$RUN_SCRATCH")}/wv-test-failed-${run_id}-$script.out"
                 if mv "$suite_log" "$failed_log" 2>/dev/null; then
                     echo "    full output: $failed_log"
@@ -495,22 +508,6 @@ fi
 
 END_TIME=$(date +%s)
 TOTAL_TIME=$((END_TIME - START_TIME))
-
-# Persist per-suite timing to .weave/test-times.json (serial mode only — parallel skips TIMES[])
-if [ "$PARALLEL" = false ] && [ ${#TIMES[@]} -gt 0 ]; then
-    _times_file="$(dirname "$SCRIPT_DIR")/.weave/test-times.json"
-    _existing='{}'
-    [ -f "$_times_file" ] && _existing=$(cat "$_times_file" 2>/dev/null || echo '{}')
-    _updates=''
-    for _script in "${!TIMES[@]}"; do
-        _name=$(basename "$_script")
-        _dur="${TIMES[$_script]}"
-        _updates+=$(printf ',"%s":%s' "$_name" "$_dur")
-    done
-    # Merge: existing + updates (updates win on collision)
-    printf '%s' "$_existing" | jq -r --argjson u "{${_updates#,}}" '. + $u' \
-        > "$_times_file" 2>/dev/null || true
-fi
 
 # Summary
 echo ""

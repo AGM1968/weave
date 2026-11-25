@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Suite-driven wv calls are tagged test so call-stats retro reads can exclude them.
+# shellcheck source=tests/lib/sed-inplace.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/sed-inplace.sh"  # sed -i is GNU-only (wv-076a98)
 export WV_CALL_SOURCE=test
 # test-graph.sh — Test Weave graph commands
 #
@@ -802,7 +804,9 @@ EOF
     # Adding an exact row must not remove a suite inherited from a broader
     # prefix. VERSION lost its E6 route this way before explicit matches were
     # unioned with patterns.
-    sed -i '/scripts\/cmd\/wv-cmd-graph.sh/c\scripts/cmd/wv-cmd-graph.sh = tests/test-exact.sh\nscripts/cmd/ = tests/test-broad.sh' \
+    sed_inplace '/scripts\/cmd\/wv-cmd-graph.sh/c\
+scripts/cmd/wv-cmd-graph.sh = tests/test-exact.sh\
+scripts/cmd/ = tests/test-broad.sh' \
         "$TEST_DIR/.weave/test-map.conf"
     out=$("$WV" impact --suites --files=scripts/cmd/wv-cmd-graph.sh 2>&1)
     assert_contains "$out" "test-exact.sh" "suites: exact mapping remains selected"

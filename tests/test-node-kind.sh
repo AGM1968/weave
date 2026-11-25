@@ -23,17 +23,17 @@ trap 'rm -rf "$TMP"' EXIT
 echo "=== one authority ==="
 lib() { bash -c '. "$1/scripts/lib/wv-validate.sh" >/dev/null 2>&1; eval "$2"' _ "$ROOT" "$1"; }
 contract=$(jq -r '.kinds | sort | join(" ")' "$CONTRACT")
-cli=$(lib 'printf "%s\n" $VALID_NODE_KINDS' | sort | paste -sd' ')
+cli=$(lib 'printf "%s\n" $VALID_NODE_KINDS' | sort | paste -sd' ' -)
 check "the CLI kind enum is the contract's" "$cli" "$contract"
 contract=$(jq -r '.command_writable | sort | join(" ")' "$CONTRACT")
-cli=$(lib 'printf "%s\n" $WRITABLE_NODE_KINDS' | sort | paste -sd' ')
+cli=$(lib 'printf "%s\n" $WRITABLE_NODE_KINDS' | sort | paste -sd' ' -)
 check "the kinds a command may write are the contract's" "$cli" "$contract"
 check "unknown is not command-writable" "$(jq -r '.command_writable | index("unknown")' "$CONTRACT")" "null"
-mcp=$(sed -n '/^const NODE_KIND_SCHEMA_VALUES = \[/,/\] as const;/p' "$ROOT/mcp/src/index.ts" | grep -oE '"[a-z_]+"' | tr -d '"' | sort | paste -sd' ')
+mcp=$(sed -n '/^const NODE_KIND_SCHEMA_VALUES = \[/,/\] as const;/p' "$ROOT/mcp/src/index.ts" | grep -oE '"[a-z_]+"' | tr -d '"' | sort | paste -sd' ' -)
 check "the MCP kind enum is the contract's" "$mcp" "$contract"
-cli=$(lib 'jq -nr "$WV_KIND_JQ_DEFS wv_kinds[]"' | sort | paste -sd' ')
+cli=$(lib 'jq -nr "$WV_KIND_JQ_DEFS wv_kinds[]"' | sort | paste -sd' ' -)
 check "the backfill's kind list is the contract's" "$cli" "$(jq -r '.kinds | sort | join(" ")' "$CONTRACT")"
-gh=$(grep -A2 '^NODE_KINDS = frozenset' "$ROOT/scripts/weave_gh/models.py" | grep -oE '"[a-z_]+"' | tr -d '"' | sort | paste -sd' ')
+gh=$(grep -A2 '^NODE_KINDS = frozenset' "$ROOT/scripts/weave_gh/models.py" | grep -oE '"[a-z_]+"' | tr -d '"' | sort | paste -sd' ' -)
 check "the weave_gh kind set is the contract's" "$gh" "$(jq -r '.command_writable | sort | join(" ")' "$CONTRACT")"
 contract=$(jq -cS '.backfill.text_prefix' "$CONTRACT")
 cli=$(lib 'jq -ncS "$WV_KIND_JQ_DEFS wv_kind_prefix_map"')
@@ -143,7 +143,7 @@ out=$(w2 add "another parentless task" 2>&1); rc=$?
     bad "a task( node typed epic arms the orphan guard" "rc=$rc $out"
 listed=$(w2 add "finding(x): actionable" --standalone 2>/dev/null | id2)
 hidden=$(w2 add "plain words" --kind=finding --standalone 2>/dev/null | id2)
-ready2=$(w2 ready --all --json 2>/dev/null | jq -r '.[].id' | paste -sd' ')
+ready2=$(w2 ready --all --json 2>/dev/null | jq -r '.[].id' | paste -sd' ' -)
 [[ " $ready2 " == *" $listed "* ]] && [[ " $ready2 " != *" $hidden "* ]] &&
     ok "wv ready lists a finding( task and hides a finding-kind node with plain text" ||
     bad "wv ready lists a finding( task and hides a finding-kind node with plain text" "ready=[$ready2] listed=$listed hidden=$hidden"
@@ -151,10 +151,10 @@ ready2=$(w2 ready --all --json 2>/dev/null | jq -r '.[].id' | paste -sd' ')
 sqlite3 "$TMP/hot2/brain.db" "INSERT INTO nodes (id, text, status, metadata) VALUES
     ('wv-0000c1', 'plain words', 'todo', '{\"node_kind\":\"finding\",\"type\":\"task\"}'),
     ('wv-0000c2', 'plain words', 'todo', '{\"node_kind\":\"task\",\"type\":\"memory\"}');"
-ready2=$(w2 ready --all --json 2>/dev/null | jq -r '.[].id' | paste -sd' ')
+ready2=$(w2 ready --all --json 2>/dev/null | jq -r '.[].id' | paste -sd' ' -)
 [[ " $ready2 " != *" wv-0000c1 "* ]] && [[ " $ready2 " == *" wv-0000c2 "* ]] &&
     ok "wv ready reads node_kind over a disagreeing type" || bad "wv ready reads node_kind over a disagreeing type" "ready=[$ready2]"
-check "wv query type=finding reads node_kind" "$(w2 query type=finding --format=json 2>/dev/null | jq -r '[.[].id] | sort | join(" ")')" "$(printf '%s\n' "$hidden" wv-0000c1 | sort | paste -sd' ')"
+check "wv query type=finding reads node_kind" "$(w2 query type=finding --format=json 2>/dev/null | jq -r '[.[].id] | sort | join(" ")')" "$(printf '%s\n' "$hidden" wv-0000c1 | sort | paste -sd' ' -)"
 check "wv query type=epic selects by kind" "$(w2 query type=epic --format=json 2>/dev/null | jq -r '[.[].id] | join(" ")')" "$real_epic"
 check "wv list --type=epic selects by kind" "$(w2 list --all --type=epic --json 2>/dev/null | jq -r '[.[].id] | join(" ")')" "$real_epic"
 
@@ -168,7 +168,7 @@ legacy wv-0000a4 'typed bug' 'done' '{"type":"bug"}'
 legacy wv-0000a5 'a memory' 'done' '{"type":"memory","kind":"project","mem_status":"active"}'
 legacy wv-0000a6 'decide: which way' todo '{"priority":2}'
 legacy wv-0000a7 'retyped by an older wv' 'done' '{"node_kind":"epic","type":"task"}'
-ready_ids() { w ready --all --json 2>/dev/null | jq -r '.[].id' | sort | paste -sd' '; }
+ready_ids() { w ready --all --json 2>/dev/null | jq -r '.[].id' | sort | paste -sd' ' -; }
 ready_before=$(ready_ids)
 out=$(w kind backfill --json 2>&1); rc=$?
 [ "$rc" = 0 ] && [ "$(kind_of wv-0000a1)" = "-/-" ] && ok "a dry run writes nothing" || bad "a dry run writes nothing" "rc=$rc $(kind_of wv-0000a1)"

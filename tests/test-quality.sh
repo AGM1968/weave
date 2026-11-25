@@ -26,6 +26,7 @@ TESTS_FAILED=0
 
 # Paths
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/lib/bounded.sh"  # timeout(1) is GNU-only; macOS has none (wv-f8e26d)
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 WV="$PROJECT_ROOT/scripts/wv"
 
@@ -148,7 +149,7 @@ assert_equals() {
 }
 
 strip_ansi() {
-    sed 's/\x1b\[[0-9;]*m//g'
+    LC_ALL=C sed $'s/\e\\[[0-9;]*m//g'
 }
 
 assert_contains() {
@@ -868,7 +869,7 @@ test_every_quality_help_prints_usage_and_does_no_work() {
         rm -f "$WV_HOT_ZONE/quality.db"
         rc=0
         # shellcheck disable=SC2086  # a subcommand line, split on purpose
-        out=$(timeout 20 "$WV" quality $line --help 2>&1) || rc=$?
+        out=$(bounded 20 "$WV" quality $line --help 2>&1) || rc=$?
         assert_equals "0" "$rc" "wv quality $line --help exits 0"
         assert_contains "$out" "Usage:" "...and prints its usage"
         assert_equals "no" "$([ -e "$WV_HOT_ZONE/quality.db" ] && echo yes || echo no)" "...and leaves no scan in quality.db"

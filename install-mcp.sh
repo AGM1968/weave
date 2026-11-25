@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Standalone MCP server installer for Weave
 #
 # Usage:
@@ -6,6 +6,28 @@
 #   ./install-mcp.sh --verify     Build, install, and verify with wv mcp-status
 #
 # Requires: Node.js 20+, npm
+# wv bash guard (wv-7257a8): bash >= 4 or a clear refusal. Identical in every executed entry point; master: scripts/lib/wv-bash-guard.sh.
+_wv_bash_guard() {
+    if [ -n "${WV_TEST_BASH_TOO_OLD:-}" ] && [ "${WV_TEST_MODE:-}" != 1 ]; then echo "wv: WV_TEST_BASH_TOO_OLD needs WV_TEST_MODE=1; ignoring it." >&2; fi
+    if [ "${BASH_VERSINFO[0]:-0}" -ge 4 ] && ! { [ "${WV_TEST_MODE:-}" = 1 ] && [ "${WV_TEST_BASH_TOO_OLD:-}" = 1 ]; }; then
+        unset WV_BASH_REEXEC
+        return 0
+    fi
+    local b
+    if [ -z "${WV_BASH_REEXEC:-}" ] && [ -f "$0" ]; then
+        for b in ${WV_BASH:-} /opt/homebrew/bin/bash /usr/local/bin/bash /usr/bin/bash /bin/bash; do
+            # shellcheck disable=SC2016  # the child bash expands it
+            if [ -x "$b" ] && [ "$("$b" -c 'echo "${BASH_VERSINFO[0]}"' 2>/dev/null)" -ge 4 ] 2>/dev/null; then
+                WV_BASH_REEXEC=1 WV_TEST_BASH_TOO_OLD='' exec "$b" "$0" "$@"
+            fi
+        done
+    fi
+    echo "wv: $0 needs bash 4 or newer but is running under bash ${BASH_VERSION:-unknown}." >&2
+    echo "    On macOS /bin/bash is 3.2: install a newer one (brew install bash) or set WV_BASH to it." >&2
+    exit 1
+}
+_wv_bash_guard "$@"
+# end wv bash guard
 
 set -e
 
@@ -92,7 +114,7 @@ fi
 # Show IDE config instructions
 echo ""
 echo "To register with your IDE:"
-echo "  wv-init-repo --agent=copilot   # VS Code → .vscode/mcp.json (+ legacy .mcp.json) + copilot-instructions.md"
+echo "  wv-init-repo --agent=copilot   # VS Code → .vscode/mcp.json + copilot-instructions.md"
 echo "  wv-init-repo --agent=claude    # Claude Code → .claude/settings.local.json"
 echo "  wv-init-repo --agent=all       # Claude, Copilot, and Codex in same repo"
 echo ""
